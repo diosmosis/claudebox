@@ -1,0 +1,203 @@
+name: claudebox
+
+services:
+  claude:
+    container_name: claudebox
+    hostname: claudebox
+    image: claudebox:latest
+    build:
+      context: .
+      args:
+        USERNAME: ${BOX_USER:-dizzy}
+        UID: ${BOX_UID:-1000}
+        GID: ${BOX_GID:-1000}
+    init: true
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+    working_dir: ${BOX_WORKSPACE:-/home/dizzy/Projects}
+    depends_on:
+      proxy:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+    environment:
+      BOX_USER: ${BOX_USER:-dizzy}
+
+      # "docker" in the box drives the sidecar daemon, never the host's.
+      DOCKER_HOST: tcp://dind:2375
+
+      # The box is on an internal network with no route off it, so these are
+      # not the enforcement mechanism -- they just tell well-behaved clients
+      # where the only exit is. Anything ignoring them simply fails to connect.
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      http_proxy: http://proxy:3128
+      https_proxy: http://proxy:3128
+      NO_PROXY: localhost,127.0.0.1,dind,proxy,ddev-relay
+      no_proxy: localhost,127.0.0.1,dind,proxy,ddev-relay
+
+      # Node ignores the proxy variables by default -- fetch() and the http/https
+      # core clients both do -- so ordinary node code fails with EAI_AGAIN in a
+      # box that has no resolver. Node 22.23 honours them, and NO_PROXY with
+      # them, when this is set. Verified: without it fetch() and https.get()
+      # fail; with it both work and dind is still reached directly.
+      NODE_USE_ENV_PROXY: "1"
+
+      # A DNS-preflight shim for libraries that call dns.resolve() to decide
+      # whether they are online. Baked into the image, so it must exist in any
+      # image built from this Dockerfile -- if this path is ever changed, the
+      # image needs rebuilding or EVERY node process in the box dies on a
+      # missing module.
+      # --disable-warning silences only undici's "EnvHttpProxyAgent is
+      # experimental" notice, which NODE_USE_ENV_PROXY prints on stderr in every
+      # single node process. NODE_NO_WARNINGS would have hidden the shim's own
+      # diagnostics along with it.
+      NODE_OPTIONS: --disable-warning=UNDICI-EHPA --require /usr/local/lib/claudebox/proxy-bootstrap.cjs
+
+      # The Datadog telemetry hosts are not on the allowlist; suppress the
+      # requests rather than letting them fail against the proxy.
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+      # Where the `ddev` shim (baked into the image) sends `ddev exec` requests.
+      # ddev-relay is in NO_PROXY above, so this goes direct, not via squid.
+      CLAUDEBOX_DDEV_RELAY: http://ddev-relay:7999
+
+    volumes:
+      # Container-only HOME. Keeps the box's Claude state, npm cache and shell
+      # history out of the host home directory.
+      - box-home:/home/${BOX_USER:-dizzy}
+
+      # The shared source tree, mounted at the same absolute path it has on the
+      # host so every path Claude reports is directly clickable outside the box.
+      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+
+      # Read-only host inputs, copied in once by entrypoint.sh.
+      - ${BOX_MKCERT_CA:-/home/dizzy/.local/share/mkcert/rootCA.pem}:/host/mkcert/rootCA.pem:ro
+      - ${BOX_HOST_HOME:-/home/dizzy}/.claude:/host/claude:ro
+      - ${BOX_HOST_HOME:-/home/dizzy}/.claude.json:/host/claude.json:ro
+
+    networks:
+      - inner
+
+  # The only container with a route to the internet. Everything the box and the
+  # dind sidecar send outward passes through here and is checked against
+  # allowlist.conf; anything not listed is refused.
+  proxy:
+    container_name: claudebox-proxy
+    image: claudebox-proxy:latest
+    build:
+      context: ./proxy
+    init: true
+    volumes:
+      - ./allowlist.conf:/etc/squid/allowlist.conf:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/3128"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      # inner: reachable by the box. edge: the actual egress path.
+      # ddev_default: lets it resolve and reach ddev-router on the box's behalf.
+      - inner
+      - edge
+      - ddev_default
+
+  # A rootless Docker daemon private to the box. Claude can build and run
+  # whatever it likes in here; it cannot see or touch the host's containers,
+  # images or DDEV projects, and it has no route to the internet except the
+  # proxy (which dockerd uses for registry pulls).
+  dind:
+    container_name: claudebox-dind
+    image: docker:dind-rootless
+    depends_on:
+      proxy:
+        condition: service_healthy
+    # No --privileged. These four are the minimum that lets a rootless daemon
+    # start nested containers: systempaths=unconfined unmasks /proc (otherwise
+    # runc cannot mount procfs in the nested userns), fuse backs the overlay
+    # snapshotter, and tun is needed by slirp4netns for the daemon's network.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    devices:
+      - /dev/fuse
+      - /dev/net/tun
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      NO_PROXY: localhost,127.0.0.1
+    command: ["--host=tcp://0.0.0.0:2375"]
+    volumes:
+      - dind-data:/home/rootless/.local/share/docker
+      # The source tree at its host path again: "-v" sources in a nested
+      # "docker run" are resolved by THIS daemon, not by the box, so the paths
+      # only line up if the daemon sees the tree at the same location.
+      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks:
+      - inner
+
+  # The one bridge from the isolated box to the host's DDEV projects. It holds
+  # the host Docker socket -- which the box itself never can -- and exposes a
+  # single constrained operation over the internal network: run a command in a
+  # DDEV project's service container (`ddev exec`). Its code is the trust
+  # boundary; see ddev-relay/relay.mjs. On `inner` only, so it grants the box no
+  # new egress: the box can send it an exec request and nothing else.
+  ddev-relay:
+    container_name: claudebox-ddev-relay
+    image: claudebox-ddev-relay:latest
+    build:
+      context: ./ddev-relay
+    init: true
+    environment:
+      CLAUDEBOX_WORKSPACE: ${BOX_WORKSPACE:-/home/dizzy/Projects}
+    volumes:
+      # The host Docker socket -- the relay's entire reason to exist. Only this
+      # container gets it; the box does not.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only workspace, so the relay can find each project's
+      # .ddev/config.yaml and confirm a requested workdir is inside it. Builds
+      # write through the web container, not this mount, so it stays read-only.
+      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:7999/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    networks:
+      - inner
+
+volumes:
+  box-home:
+    name: claudebox-home
+  dind-data:
+    name: claudebox-dind-data
+
+networks:
+  # internal: true means Docker installs no default route and no NAT. Containers
+  # here can talk to each other and to nothing else -- this is what makes the
+  # deny-by-default real rather than a matter of client cooperation.
+  inner:
+    name: claudebox_inner
+    internal: true
+
+  edge:
+    name: claudebox_edge
+
+  # Created by DDEV on first project start; the launcher creates it up front so
+  # the box can come up before any project does. Joining it is what lets the
+  # proxy reach ddev-router directly, which matters because
+  # router_bind_all_interfaces is false and the host ports are loopback only.
+  ddev_default:
+    name: ddev_default
+    external: true

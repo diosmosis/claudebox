@@ -1,0 +1,136 @@
+#!/usr/bin/env node
+// claudebox `ddev` shim (baked into the box image as /usr/local/bin/ddev).
+//
+// The box has no host Docker daemon and no `ddev` binary. This shim gives it the
+// one DDEV capability that needs the host -- running commands in a project's
+// service container -- by forwarding to the ddev-relay over the internal
+// network. Everything else about `ddev` (start/stop/config/...) stays on the
+// host by design; those subcommands print a pointer rather than pretending.
+//
+// Supported:
+//   ddev exec [-s <service>] <cmd...>     run <cmd> in the service container (web)
+//   ddev composer|npm|yarn|pnpm|php|node|wp|bash|sh <args...>
+//                                         shorthand for `ddev exec <that> <args>`
+'use strict';
+
+const http = require('node:http');
+
+const RELAY = process.env.CLAUDEBOX_DDEV_RELAY || 'http://ddev-relay:7999';
+const SHORTHANDS = new Set([
+	'composer',
+	'npm',
+	'yarn',
+	'pnpm',
+	'php',
+	'node',
+	'wp',
+	'bash',
+	'sh',
+]);
+
+function die(msg, code) {
+	process.stderr.write('claudebox: ' + msg + '\n');
+	process.exit(code == null ? 1 : code);
+}
+
+const args = process.argv.slice(2);
+if (args.length === 0) {
+	die(
+		"inside the box only `ddev exec` runs (forwarded to the DDEV web container). " +
+			'Usage: ddev exec [-s service] <cmd...>',
+		2
+	);
+}
+
+let service = 'web';
+let command;
+
+const sub = args[0];
+if (sub === 'exec') {
+	// Pull an optional -s/--service out of the remaining args; the rest is the
+	// command, joined the way `ddev exec` joins it.
+	const rest = [];
+	const tail = args.slice(1);
+	for (let i = 0; i < tail.length; i++) {
+		const a = tail[i];
+		if (a === '-s' || a === '--service') {
+			service = tail[++i];
+			if (service === undefined) die('missing value for ' + a, 2);
+		} else if (a.startsWith('--service=')) {
+			service = a.slice('--service='.length);
+		} else {
+			rest.push(a);
+		}
+	}
+	if (rest.length === 0) die('usage: ddev exec [-s service] <cmd...>', 2);
+	command = rest.join(' ');
+} else if (SHORTHANDS.has(sub)) {
+	command = [sub, ...args.slice(1)].join(' ');
+} else {
+	die(
+		`'ddev ${sub}' is not available inside the box. Forwarded to the web ` +
+			`container: 'ddev exec' and ${[...SHORTHANDS].join(', ')}. ` +
+			'Run other ddev commands on the host.',
+		2
+	);
+}
+
+const body = JSON.stringify({ workdir: process.cwd(), service, command });
+const u = new URL(RELAY + '/exec');
+
+// Plain http.request to a NO_PROXY host -> goes direct, not through the squid
+// egress proxy.
+const req = http.request(
+	{
+		host: u.hostname,
+		port: u.port,
+		path: u.pathname,
+		method: 'POST',
+		headers: {
+			'content-type': 'application/json',
+			'content-length': Buffer.byteLength(body),
+		},
+	},
+	(res) => {
+		if (res.statusCode !== 200) {
+			let t = '';
+			res.setEncoding('utf8');
+			res.on('data', (d) => (t += d));
+			res.on('end', () => die(t.trim() || 'relay error ' + res.statusCode, 1));
+			return;
+		}
+		// Decode [1 byte channel][4 byte BE length][payload] frames.
+		let buf = Buffer.alloc(0);
+		let exitCode = null;
+		res.on('data', (chunk) => {
+			buf = Buffer.concat([buf, chunk]);
+			while (buf.length >= 5) {
+				const channel = buf[0];
+				const len = buf.readUInt32BE(1);
+				if (buf.length < 5 + len) break;
+				const payload = buf.subarray(5, 5 + len);
+				buf = buf.subarray(5 + len);
+				if (channel === 1) process.stdout.write(payload);
+				else if (channel === 2) process.stderr.write(payload);
+				else if (channel === 3) {
+					try {
+						exitCode = JSON.parse(payload.toString()).exit;
+					} catch {
+						exitCode = 1;
+					}
+				}
+			}
+		});
+		res.on('end', () => process.exit(exitCode == null ? 0 : exitCode));
+	}
+);
+
+req.on('error', (e) =>
+	die(
+		`ddev relay unreachable at ${RELAY} (${e.message}). ` +
+			'If the box was just updated, relaunch claudebox.',
+		1
+	)
+);
+req.write(body);
+req.end();

@@ -1,0 +1,4 @@
+services:
+  claude:
+    volumes:
+      - /home/dizzy/.claudebox/plans:/home/dizzy/.claude/plans

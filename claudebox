@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+#
+# Run Claude Code inside the isolated claudebox container.
+#
+#   claudebox                 start an interactive session in the current directory
+#   claudebox -p 'summarise'  pass any flags/prompt straight through to claude
+#   claudebox shell           drop into bash inside the box instead
+#   claudebox rebuild         rebuild the image after editing the Dockerfile
+#   claudebox stop            stop the box (state in the home volume survives)
+#
+#   claudebox allow <domain>  permit a domain and reload the proxy
+#   claudebox reload          re-apply allowlist.conf after a manual edit
+#   claudebox allowed         show the egress allowlist
+#   claudebox denied          show requests the proxy has blocked
+#
+# Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+set -euo pipefail
+
+# Resolve symlinks first: this script is normally invoked via ~/.local/bin, and
+# ${BASH_SOURCE[0]} is the path as invoked, not the real file. Without
+# readlink -f, BOX_DIR points at the symlink's directory and every path built
+# from it (compose file, allowlist) is wrong.
+BOX_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+CONTAINER=claudebox
+PROXY=claudebox-proxy
+ALLOWLIST="${BOX_DIR}/allowlist.conf"
+# Both compose files, named explicitly. Passing -f at all turns OFF Compose's
+# automatic discovery of docker-compose.override.yaml, so it has to be listed by
+# hand -- otherwise the launcher-generated mounts (plans, optional gitconfig) are
+# written to a file nothing ever reads.
+COMPOSE=(docker compose \
+    -f "${BOX_DIR}/docker-compose.yaml" \
+    -f "${BOX_DIR}/docker-compose.override.yaml")
+
+export BOX_WORKSPACE="${BOX_WORKSPACE:-${HOME}/Projects}"
+export BOX_HOST_HOME="${BOX_HOST_HOME:-${HOME}}"
+export BOX_USER="${BOX_USER:-$(id -un)}"
+export BOX_UID="${BOX_UID:-$(id -u)}"
+export BOX_GID="${BOX_GID:-$(id -g)}"
+export BOX_MKCERT_CA="${BOX_MKCERT_CA:-$(mkcert -CAROOT 2>/dev/null || echo "${HOME}/.local/share/mkcert")/rootCA.pem}"
+
+# Regenerate the compose override before any command runs, so "stop"/"rebuild"
+# and the launch path below all act on the same, present file. It always carries
+# the plans bind; optional host files are added only when they exist -- binding a
+# missing path would make Docker create a directory in the host home directory.
+mounts=()
+
+# Expose the box's plans directory on the host. The rest of the box's ~/.claude
+# stays on the private home volume; plans are the one part shared out, so
+# plan-mode output written inside the box can be read and edited on the host.
+# ~/.claude/plans is where Claude writes plans; the host side sits in the
+# project dir, keeping box state out of the host's own ~/.claude. This bind is
+# nested deeper than the home volume, so Docker layers it on top. mkdir first
+# for the same reason the file mounts are guarded: a missing path is created
+# root-owned.
+mkdir -p "${BOX_DIR}/plans"
+mounts+=("${BOX_DIR}/plans:/home/${BOX_USER}/.claude/plans")
+
+if [ -f "${BOX_HOST_HOME}/.gitconfig" ]; then
+    mounts+=("${BOX_HOST_HOME}/.gitconfig:/host/gitconfig:ro")
+fi
+{
+    printf 'services:\n  claude:\n    volumes:\n'
+    printf '      - %s\n' "${mounts[@]}"
+} > "${BOX_DIR}/docker-compose.override.yaml"
+
+# ---------------------------------------------------------------------------
+# Point DDEV hostnames at ddev-router
+#
+# *.ddev.site resolves to 127.0.0.1 in public DNS, which inside a container is
+# the container itself. These entries go in the PROXY, not the box: the box has
+# no resolver of its own, so it sends "CONNECT matomo.ddev.site:443" and the
+# proxy is what has to turn that name into an address. Rewritten on every launch
+# so the box tracks projects as they start and stop -- and again after any
+# restart of the proxy, which wipes them along with the rest of its /etc/hosts.
+# ---------------------------------------------------------------------------
+write_ddev_hosts() {
+    local quiet="${1:-}"
+    local router_ip names hosts_line=""
+
+    router_ip="$(docker inspect -f \
+        '{{ with index .NetworkSettings.Networks "ddev_default" }}{{ .IPAddress }}{{ end }}' \
+        ddev-router 2>/dev/null || true)"
+
+    if [ -n "${router_ip}" ] && command -v ddev >/dev/null 2>&1; then
+        names="$(ddev list -j 2>/dev/null \
+            | jq -r '[.raw[]? | select((.status // "") == "running")
+                     | (.name + "." + (.project_tld // "ddev.site")),
+                       (.httpsurl // empty), (.httpurl // empty), (.urls[]? // empty)]
+                     | .[]' 2>/dev/null \
+            | sed -E 's#^https?://##; s#[:/].*$##' \
+            | grep -E '^[A-Za-z0-9.-]+\.[A-Za-z]+$' \
+            | sort -u | tr '\n' ' ' || true)"
+        # ddev-router outlives the last project it served, so an existing router
+        # IP does not imply there is anything to map.
+        if [ -n "${names% }" ]; then
+            hosts_line="${router_ip} ${names}"
+        fi
+    fi
+
+    # /etc/hosts is a bind mount inside the container, so "sed -i" (which renames
+    # a temp file over the target) fails with EBUSY. Read it, then truncate in
+    # place.
+    docker exec -u 0 "${PROXY}" bash -c '
+        kept="$(grep -v "# claudebox$" /etc/hosts || true)"
+        {
+            printf "%s\n" "$kept"
+            [ -n "$1" ] && printf "%s # claudebox\n" "$1"
+        } > /etc/hosts
+        exit 0
+    ' _ "${hosts_line}" 2>/dev/null || true
+
+    if [ "${quiet}" = "quiet" ]; then
+        return 0
+    fi
+    if [ -n "${hosts_line}" ]; then
+        echo "claudebox: reachable DDEV sites -> ${hosts_line#* }" >&2
+    else
+        echo "claudebox: no running DDEV projects detected" >&2
+    fi
+}
+
+wait_for_proxy() {
+    local i
+    for i in $(seq 1 60); do
+        if [ "$(docker inspect -f '{{ .State.Health.Status }}' "${PROXY}" 2>/dev/null)" = "healthy" ]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# The allowlist is a single bind-mounted FILE, and an in-place edit on the host
+# does not reliably reach the container: Docker Desktop's file-sharing layer can
+# keep serving the old contents. Reloading does not help, because a reload
+# re-reads the file from inside the container, which is where the stale copy is.
+# Observed for real: the host file was 35 bytes longer than the container's view
+# of the same inode, and "claudebox allow" reported success while the domain
+# stayed blocked.
+#
+# Compare the two views by content. Only a restart remounts the file.
+allowlist_in_sync() {
+    local host_sum box_sum
+    host_sum="$(md5sum < "${ALLOWLIST}" 2>/dev/null | cut -d' ' -f1)"
+    box_sum="$(docker exec "${PROXY}" md5sum /etc/squid/allowlist.conf 2>/dev/null | cut -d' ' -f1)"
+    # Proxy down or file unreadable: nothing to compare, let the caller carry on.
+    if [ -z "${host_sum}" ] || [ -z "${box_sum}" ]; then
+        return 0
+    fi
+    [ "${host_sum}" = "${box_sum}" ]
+}
+
+# Remount a stale allowlist. Returns non-zero only if the container still
+# disagrees with the host afterwards.
+resync_allowlist() {
+    echo "claudebox: the proxy is holding a stale allowlist.conf; remounting" >&2
+    if ! docker restart "${PROXY}" >/dev/null 2>&1; then
+        echo "claudebox: could not restart the proxy" >&2
+        return 1
+    fi
+    wait_for_proxy || true
+    # A restart resets the proxy's /etc/hosts along with everything else.
+    write_ddev_hosts quiet
+    if allowlist_in_sync; then
+        return 0
+    fi
+    echo "claudebox: the proxy still sees a different allowlist.conf than the host." >&2
+    echo "claudebox: recreate it with 'claudebox rebuild' to remount the file." >&2
+    return 1
+}
+
+# Re-expand allowlist.conf into the ACL files squid reads and apply them. The
+# allowlist is bind-mounted, so this never needs a rebuild.
+#
+# "allowlist reload" exits 3 when the new list would not parse: it has already
+# rolled back to the previous one, and restarting the proxy at that point would
+# rebuild from the same bad source and leave the box with no egress at all. So
+# only fall back to a restart for other failures.
+reload_proxy() {
+    local rc=0
+
+    # Do this first: reloading a stale file just re-applies the old list and
+    # reports success, which is worse than failing.
+    if ! allowlist_in_sync; then
+        if ! resync_allowlist; then
+            return 1
+        fi
+        # The container's start-up build can read the mount before the refresh
+        # lands, so always re-expand after a remount rather than trusting it.
+    fi
+
+    docker exec "${PROXY}" allowlist reload || rc=$?
+    case "${rc}" in
+        0)
+            echo "claudebox: proxy reloaded" >&2
+            ;;
+        3)
+            echo "claudebox: allowlist rejected; the previous one is still in force" >&2
+            return 1
+            ;;
+        *)
+            if docker restart "${PROXY}" >/dev/null 2>&1; then
+                wait_for_proxy || true
+                write_ddev_hosts quiet
+                echo "claudebox: proxy restarted" >&2
+            else
+                echo "claudebox: proxy not running; the change applies at next start" >&2
+            fi
+            ;;
+    esac
+    return 0
+}
+
+case "${1:-}" in
+    help|-h|--help)
+        cat >&2 <<'USAGE'
+claudebox -- run Claude Code in an isolated container over ~/Projects
+
+  claudebox                  interactive session in the current directory
+  claudebox <args...>        args are passed straight through to claude
+  claudebox shell [args]     bash in the box instead
+
+  claudebox allow <domain>   permit a domain and reload the egress proxy
+                             wildcards work, but quote them:
+                               claudebox allow '*.example.com'
+  claudebox reload           re-apply allowlist.conf after editing it by hand
+  claudebox allowed          show the egress allowlist
+  claudebox denied           show requests the proxy has blocked
+
+  claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
+  claudebox stop             stop the stack (volumes survive)
+
+Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+For Claude Code's own help:  claudebox shell -c 'claude --help'
+USAGE
+        exit 0
+        ;;
+
+    stop)     exec "${COMPOSE[@]}" down ;;
+    rebuild)  "${COMPOSE[@]}" build --no-cache && exec "${COMPOSE[@]}" up -d --force-recreate ;;
+
+    allowed)  exec grep -vE '^\s*(#|$)' "${ALLOWLIST}" ;;
+
+    denied)
+        # TCP_DENIED is what Squid logs for a request the allowlist refused.
+        # -a because the log picks up stray bytes from tunnelled traffic and
+        # grep then reports "binary file matches" instead of the lines.
+        docker exec "${PROXY}" \
+            grep -a TCP_DENIED /var/log/squid/access.log 2>/dev/null \
+            | awk '{print $4, $5}' | sort -u \
+            || echo "claudebox: nothing blocked yet" >&2
+        exit 0
+        ;;
+
+    allow)
+        domain="${2:-}"
+        if [ -z "${domain}" ]; then
+            echo "usage: claudebox allow <domain>    (quote wildcards: '*.example.com')" >&2
+            exit 2
+        fi
+        # Compare literally, not as a regex: entries may contain "*", which
+        # grep -E reads as a repetition operator and rejects outright at the
+        # start of a pattern.
+        entries="$(sed 's/#.*//' "${ALLOWLIST}" | tr -s '[:space:]' '\n' | grep -v '^$' || true)"
+        if printf '%s\n' "${entries}" | grep -qxF -- "${domain}"; then
+            echo "claudebox: ${domain} is already allowed" >&2
+        else
+            printf '%s\n' "${domain}" >> "${ALLOWLIST}"
+            echo "claudebox: allowed ${domain}" >&2
+        fi
+        reload_proxy
+        exit $?
+        ;;
+
+    reload)
+        # For edits made directly to allowlist.conf.
+        reload_proxy
+        exit $?
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Bring the box up
+# ---------------------------------------------------------------------------
+
+# DDEV creates this network when the first project starts. Create it ahead of
+# time so the box doesn't depend on a project being up; DDEV reuses it as-is.
+docker network inspect ddev_default >/dev/null 2>&1 \
+    || docker network create ddev_default >/dev/null
+
+# The override (plans bind + optional gitconfig) is generated up front, near the
+# COMPOSE definition, so it is already in place here.
+"${COMPOSE[@]}" up -d >/dev/null
+
+# "up -d" returns once the container is started, not once entrypoint.sh has
+# finished seeding config -- exec'ing in too early lands in a half-built HOME.
+for _ in $(seq 1 120); do
+    if docker exec "${CONTAINER}" test -f /run/claudebox.ready 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+
+# The proxy holds a stale copy often enough to be worth checking on every
+# launch, not just when the allowlist is edited -- a session that starts against
+# an old list fails in a way nothing explains. Do this before the hostnames are
+# written below, since remounting restarts the proxy and clears them.
+if ! allowlist_in_sync; then
+    if resync_allowlist; then
+        docker exec "${PROXY}" allowlist reload >/dev/null 2>&1 || true
+    fi
+fi
+
+write_ddev_hosts
+
+# ---------------------------------------------------------------------------
+# Attach
+# ---------------------------------------------------------------------------
+
+# The workspace is mounted at its host path, so the current directory maps 1:1.
+workdir="${BOX_WORKSPACE}"
+case "${PWD}" in
+    "${BOX_WORKSPACE}"|"${BOX_WORKSPACE}"/*) workdir="${PWD}" ;;
+esac
+
+exec_flags=(-i -u "${BOX_UID}:${BOX_GID}" -w "${workdir}")
+if [ -t 0 ] && [ -t 1 ]; then
+    exec_flags+=(-t)
+fi
+
+# Nested containers route out through the dind sidecar's network namespace, so
+# they can reach the proxy but can't resolve its name (dind's embedded DNS
+# doesn't know about it). Hand the box the address so it can pass the proxy to
+# "docker run" when a nested container needs egress:
+#   docker run -e HTTPS_PROXY=$CLAUDEBOX_PROXY ...
+proxy_ip="$(docker inspect -f \
+    '{{ with index .NetworkSettings.Networks "claudebox_inner" }}{{ .IPAddress }}{{ end }}' \
+    "${PROXY}" 2>/dev/null || true)"
+if [ -n "${proxy_ip}" ]; then
+    exec_flags+=(-e "CLAUDEBOX_PROXY=http://${proxy_ip}:3128")
+fi
+
+if [ "${1:-}" = "shell" ]; then
+    shift
+    exec docker exec "${exec_flags[@]}" "${CONTAINER}" bash "$@"
+fi
+
+exec docker exec "${exec_flags[@]}" "${CONTAINER}" claude "$@"
