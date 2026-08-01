@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         rsync \
         unzip \
         wget \
+        zip \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI only -- no daemon. It talks to the rootless dind sidecar over TCP,
@@ -68,6 +69,17 @@ RUN chmod 0644 /usr/local/lib/claudebox/proxy-bootstrap.cjs
 # ddev. Baked in (not bind-mounted) so it is always on PATH ahead of anything.
 COPY ddev-shim /usr/local/bin/ddev
 RUN chmod 0755 /usr/local/bin/ddev
+
+# Claude Code's managed-policy memory location on Linux. Loaded at the start of
+# every session in every directory in the box, and not excludable by settings --
+# so the box's Claude always knows it is in a container, that egress is
+# allowlisted, and what its opaque proxy errors actually mean.
+#
+# Baked in rather than written to ~/.claude/CLAUDE.md: HOME is a persistent
+# volume that entrypoint.sh seeds only once, so a copy there would never pick up
+# edits. Rebuild after changing box-CLAUDE.md.
+COPY box-CLAUDE.md /etc/claude-code/CLAUDE.md
+RUN chmod 0644 /etc/claude-code/CLAUDE.md
 
 # Node has its own CA bundle and ignores the system store, so point it at the
 # DDEV root CA that entrypoint.sh installs.

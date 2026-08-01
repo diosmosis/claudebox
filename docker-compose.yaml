@@ -72,6 +72,11 @@ services:
       # host so every path Claude reports is directly clickable outside the box.
       - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}
 
+      # Read-only so the box can see what egress is permitted without being able
+      # to widen it -- the proxy reads its own copy, and only the host launcher
+      # can reload it. /etc/claude-code/CLAUDE.md points here.
+      - ./allowlist.conf:/etc/claudebox/allowlist.conf:ro
+
       # Read-only host inputs, copied in once by entrypoint.sh.
       - ${BOX_MKCERT_CA:-/home/dizzy/.local/share/mkcert/rootCA.pem}:/host/mkcert/rootCA.pem:ro
       - ${BOX_HOST_HOME:-/home/dizzy}/.claude:/host/claude:ro
@@ -114,6 +119,18 @@ services:
     depends_on:
       proxy:
         condition: service_healthy
+    # XDG_RUNTIME_DIR holds the daemon's pid files, its socket, the exec root
+    # and runc's state -- all of it runtime state that is supposed to vanish
+    # with the process. Nothing mounts over it here, so it lives in the
+    # writable layer and survives a restart instead. A dockerd killed rather
+    # than stopped (a host or daemon restart) leaves containerd.pid behind, the
+    # fresh PID namespace hands that same PID to something else, and dockerd
+    # refuses to start: "failed to save daemon pid to disk: process with PID
+    # 171 is still running". A container that is starting has no daemon in it,
+    # so everything here can only be stale. Cleared rather than made a tmpfs to
+    # keep this container's mount and permission setup exactly as upstream
+    # ships it. "$$" is Compose's escape for a literal "$".
+    entrypoint: ["sh", "-c", "rm -rf $${XDG_RUNTIME_DIR:-/run/user/1000}/*; exec dockerd-entrypoint.sh \"$$@\"", "--"]
     # No --privileged. These four are the minimum that lets a rootless daemon
     # start nested containers: systempaths=unconfined unmasks /proc (otherwise
     # runc cannot mount procfs in the nested userns), fuse backs the overlay
