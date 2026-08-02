@@ -33,15 +33,24 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 
 ```
                     claudebox_inner  (internal: true)
-                    ┌─────────────────────────────────────────────┐
-                    │  claudebox    claudebox-dind    ddev-relay   │
-                    │      │              │               │        │
-                    │      └──── proxy ───┘               │        │
-                    └────────────│────────────────────────┼───────┘
-                                 │        host docker.sock ┘ → docker exec
-                                 │                             ddev-<project>-<svc>
-                                 ├── claudebox_edge ──→ internet (allowlist)
-                                 └── ddev_default ────→ ddev-router
+                    ┌───────────────────────────────────────────────────────────────┐
+                    │  claudebox   claudebox-dind   ddev-relay   ddev-db  ddev-http  │
+                    │      │             │              │           │          │     │
+                    │      └─── proxy ───┘              │           │          │     │
+                    └───────────│───────────────────────┼───────────┼──────────┼────┘
+                                │       host docker.sock ┘ → docker exec
+                                │                            ddev-<project>-<svc>
+                                ├── claudebox_edge ──→ internet (allowlist)
+                                └── ddev_default ────→ ddev-router
+                                                            │
+                    ddev-db  ─── ddev_default ───────────────→ ddev-<project>-db:3306
+                    ddev-http ── ddev_default ───────────────→ ddev-<project>-web:80
+                                                                (Host + client IP rewritten;
+                                                                 NOT via ddev-router, which
+                                                                 would overwrite the latter.
+                                                                 Reached as
+                                                                 host.docker.internal, both
+                                                                 in dind and in the box)
 ```
 
 | Container | Image | Role |
@@ -50,12 +59,14 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 | `claudebox-proxy` | built from `proxy/Dockerfile` | Squid forward proxy. The only container with egress. Also the only one that can reach `ddev-router`. |
 | `claudebox-dind` | `docker:dind-rootless` | Private rootless Docker daemon on `tcp://dind:2375`. |
 | `claudebox-ddev-relay` | built from `ddev-relay/Dockerfile` | Holds the host Docker socket; runs `ddev exec` in DDEV containers on the box's behalf. On `inner` only — no egress. See below. |
+| `claudebox-ddev-db` | `alpine/socat` | One fixed TCP forward: `db:3306` on `inner` → `ddev-<project>-db:3306` on `ddev_default`. Lets PHP in the box use a DDEV project's database. See below. |
+| `claudebox-ddev-http` | built from `ddev-http/Dockerfile` | nginx on a fixed address: sets `Host` to the project's hostname, presents the client as `127.0.0.1`, and proxies to the project's web container. This is what `host.docker.internal` resolves to, in dind and in the box. See below. |
 
 | Network | Kind | Members |
 |---|---|---|
-| `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay |
+| `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay, ddev-db, ddev-http (`10.99.1.10`) |
 | `claudebox_edge` | bridge | proxy only |
-| `ddev_default` | external (DDEV's) | proxy only |
+| `ddev_default` | external (DDEV's) | proxy, ddev-db, ddev-http |
 
 | Volume | Contents |
 |---|---|
@@ -106,7 +117,9 @@ Each of these is doing real work. Changing one breaks something specific.
 
 - **Squid tunnels HTTPS with `CONNECT` and never intercepts it.** No MITM CA is
   involved, so end-to-end TLS is untouched and DDEV's mkcert certificates still
-  validate inside the box.
+  validate inside the box. The corollary is that an HTTPS client must be able to
+  issue `CONNECT`; one that cannot is refused rather than accommodated, since
+  accommodating it means decrypting. See *What can and cannot use the proxy*.
 
 - **`ddev exec` works in the box via a scoped relay, not host-daemon access.**
   The box has no `ddev` and no host Docker daemon (its `docker` is dind), so it
@@ -125,6 +138,32 @@ Each of these is doing real work. Changing one breaks something specific.
   relay's own ~200 lines: keep it small and allowlist-driven. The box side is a
   `ddev` shim baked into the image; it forwards `ddev exec` (and `composer`/`npm`/
   … shorthands) and points everything else back at the host.
+
+- **A DDEV project's database is reachable in the box as `db:3306`, via one
+  fixed forward.** `claudebox-ddev-db` is a socat sitting on both `inner` and
+  `ddev_default`, aliased `db` on `inner`. The alias is the whole trick: Matomo's
+  `config.ini.php` already says `host = "db"`, which is how the project's own web
+  container reaches it too, so one config file works on both sides with nothing
+  to switch and no test-only variant to maintain.
+
+  It exists because a Matomo UI-test fixture is one PHP process that needs the
+  database *and* Docker at once — it seeds the database directly, then shells out
+  to wp-env to start containers. The web container has the database but no
+  Docker; the box has Docker but no route to the database. Running that PHP
+  inside DDEV through the relay cannot work, because wp-env would then have no
+  daemon to start anything on.
+
+  It grants the box nothing new — `ddev exec -s db` through the relay already
+  runs arbitrary commands in that container. What keeps it narrow is that socat
+  has one hard-coded destination. It is a single forward, not a general TCP
+  proxy; making it general would be a hole straight through the allowlist, since
+  `ddev_default` has real egress. Keep the destination fixed.
+
+  Which project it points at comes from `BOX_DDEV_PROJECT`. The launcher
+  auto-detects it when exactly one project is running and otherwise leaves it
+  `none`, which resolves to nothing — with several projects up there is no
+  defensible guess, and quietly bridging the wrong database is worse than
+  bridging none.
 
 - **`~/.claude/plans` is bind-mounted out to `~/.claudebox/plans` on the host.**
   The box writes plan-mode output to `~/.claude/plans`, which otherwise lives on
@@ -147,6 +186,74 @@ Each of these is doing real work. Changing one breaks something specific.
   `mount -t proc` inside the nested user namespace. Without it, nested
   containers fail with `error mounting "proc" ... operation not permitted`.
 
+- **Nested containers are handed the proxy by the Docker client, not by the
+  person running the command.** `entrypoint.sh` writes a `proxies.default` block
+  into the box's `~/.docker/config.json`, and the Docker CLI injects those
+  variables into every container it creates — `docker run` and `docker compose
+  up` alike. That second one is the point: wp-env drives Compose, and no flag
+  could have been threaded through it. The proxy's *address* has to be used
+  rather than its name, because dind's embedded DNS knows nothing about
+  `claudebox_inner`. Rewritten on every start, since that address changes with
+  every recreation of the proxy container. Nothing is widened: those containers
+  land on the same allowlist, and a denied host is still denied.
+
+- **Two small forwarders make the box's URLs match a single-host CI runner's.**
+  Screenshot baselines bake URLs into the pixels, so a suite whose baselines
+  were generated on a runner only compares if the same names work here. Two
+  structural gaps had to close, and both are naming, not reachability — the box
+  could already reach everything involved:
+
+  - *`localhost:<port>` for ports published inside dind.* A nested container
+    publishes onto **dind's** interface, so wp-env's WordPress is at `dind:8888`
+    and nothing expecting `localhost:8888` finds it. `entrypoint.sh` runs a
+    loopback-bound socat per port in `CLAUDEBOX_DIND_PORTS` (8888/8889, wp-env's
+    development and tests ports). Bound to `127.0.0.1` deliberately: it is a
+    convenience for processes in the box, not a service for the network.
+  - *`host.docker.internal`, at both levels.* wp-env attaches
+    `host.docker.internal:host-gateway` to everything it starts, and Matomo's UI
+    tests use that name to reach Matomo from inside WordPress. On a runner it
+    lands on the host; here there is no such host, and dind's real gateway has
+    nothing listening. dind is given `--host-gateway-ip=10.99.1.10`, the fixed
+    address of `ddev-http`, which rewrites `Host` to the project's own hostname —
+    the only thing `ddev-router` routes on — and proxies to it.
+
+    `ddev-http` proxies to the project's **web container**, not to
+    `ddev-router`, and presents the client as `127.0.0.1`. Both halves of that
+    are load-bearing. On a single-host runner the browser and Matomo share a
+    host, so every visit is recorded from `127.0.0.1`, and that address is baked
+    into the baselines. Going through `ddev-router` cannot reproduce it: traefik
+    *replaces* `X-Forwarded-For` with the peer it received the connection from
+    unless that peer is in its trusted list, so anything nginx sets is discarded
+    and Matomo records this container's address instead. Talking to the web
+    container directly leaves the header ours. Verified by tracking a real hit
+    through it and reading `log_visit.location_ip` back: `127.0.0.1`.
+
+    The box needs the same name for itself, which is easy to miss because the
+    nested half looks like the whole problem. Chromium runs *in the box* and
+    loads Matomo's tracker from that URL, so without it the JS pageviews never
+    fire and a visits-log screenshot comes out with one action instead of five.
+    `ddev-http` therefore carries `host.docker.internal` as a network alias on
+    `inner` (an alias, not `extra_hosts` on the box, so the address stays
+    declared once), and the name is in the box's own `NO_PROXY`.
+
+  Neither widens anything. Nested containers could already reach that network
+  and that project through the proxy; these only put them at the addresses CI's
+  URLs assume. Verified afterwards that a nested container which can reach
+  `host.docker.internal` still cannot reach `example.com`. Keep `ddev-http`
+  pointed at one fixed destination for the same reason as `ddev-db`: a forwarder
+  that took its target from the request would be an open relay onto
+  `ddev_default`, which unlike `claudebox_inner` has real egress.
+
+- **`claudebox_inner` has a pinned subnet outside Docker's default address
+  pool** (`10.99.1.0/24`). dockerd inside dind allocates bridges for nested
+  containers from the same `172.16.0.0/12` pool the host daemon used for this
+  network, and the two collide by chance — after which dind's own route for that
+  range wins over its default route and the proxy becomes unreachable *from
+  inside dind only*. See the trap below. dind also gets
+  `--default-address-pool=base=172.28.0.0/14,size=24` so its allocations stay in
+  a known band. Any replacement subnet has to be clear of `172.16.0.0/12`,
+  `192.168.0.0/16` and the host LAN.
+
 ## Technologies
 
 | Component | Version at build | Notes |
@@ -157,17 +264,20 @@ Each of these is doing real work. Changing one breaks something specific.
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
 | Host Docker | Docker Desktop on Linux, 29.6.2 | socket at `~/.docker/desktop/docker.sock` |
 | DDEV | v1.25.3 | `performance_mode: none`, so plain bind mounts |
-| Also in the box | git, ripgrep, jq, curl, php-cli 8.2, composer, docker CLI + compose plugin | |
+| Also in the box | git, ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
+| Fonts | DejaVu / Liberation / Noto Color Emoji taken from `ubuntu:24.04`, plus CI's Arial, Verdana and Courier New | matched to the `ubuntu-24.04` runners so screenshot baselines compare; see the traps |
 
 ## Files
 
 | Path | Purpose |
 |---|---|
-| `docker-compose.yaml` | The three services, three networks, two volumes |
+| `docker-compose.yaml` | The six services, three networks, two volumes |
 | `Dockerfile` | The claudebox image |
 | `entrypoint.sh` | Runs as root at start: installs the mkcert CA, seeds `~/.claude`, signals readiness |
 | `ddev-shim` | The box's `ddev` (baked to `/usr/local/bin/ddev`); forwards `ddev exec` to the relay |
 | `ddev-relay/Dockerfile`, `ddev-relay/relay.mjs` | The scoped `ddev exec` relay image and server |
+| `ddev-http/Dockerfile`, `ddev-http/default.conf.template` | The `host.docker.internal` front door for nested containers |
+| `ddev-fixups`, `ddev-realip.conf` | Baked in as `claudebox-ddev-fixups`; prepares a DDEV web container for UI tests (client IP, path alias) |
 | `node-proxy-bootstrap.cjs` | Preloaded into every Node process via `NODE_OPTIONS`; DNS-preflight shim |
 | `box-CLAUDE.md` | Baked to `/etc/claude-code/CLAUDE.md`; what the box's Claude is told about its own environment |
 | `proxy/Dockerfile` | Squid image |
@@ -193,7 +303,8 @@ claudebox allowed          show the allowlist
 claudebox denied           show what the proxy has blocked
 ```
 
-Env overrides: `BOX_WORKSPACE`, `BOX_USER`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`.
+Env overrides: `BOX_WORKSPACE`, `BOX_USER`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`,
+`BOX_DDEV_PROJECT`.
 
 ### What the launcher does on each run
 
@@ -266,7 +377,7 @@ Currently allowed: `api.anthropic.com`, `claude.ai`, `claude.com`,
 `.ddev.site`, `.docker.io`, `production.cloudflare.docker.com`,
 `production.cloudfront.docker.com`, `*.github.com`, `*.githubusercontent.com`,
 `*.github.io`, `*.debian.org`, `*.alpinelinux.org`, `*.wordpress.org`,
-`*.packagist.org`, `getcomposer.org`.
+`*.woocommerce.com`, `*.packagist.org`, `getcomposer.org`.
 
 The `*.` entries were already written in the file before wildcards were
 supported, where they matched nothing. They take effect now — that widening is
@@ -320,6 +431,43 @@ rather than letting requests fail as phantom DNS errors.
 every Node process. `NODE_NO_WARNINGS` would have hidden the shim's own
 diagnostics too.
 
+## What can and cannot use the proxy
+
+Squid here is a `CONNECT` proxy and nothing else, so an HTTPS client has to do
+two things: read the proxy variables, and open a tunnel. Most do. The ones that
+do not fail in ways that look like a blocked domain, so they are worth knowing.
+
+| Client | HTTPS through the proxy | Notes |
+|---|---|---|
+| `curl`, GNU `wget`, `git`, `apt`, `apk`, `composer`, `npm` | yes | read the env vars, issue `CONNECT` |
+| PHP's `curl` extension | yes | libcurl reads the env vars itself; this is what WordPress's HTTP API uses |
+| Node | yes in the box | needs `NODE_USE_ENV_PROXY=1`, set in `docker-compose.yaml` |
+| PHP stream wrappers (`file_get_contents('https://…')`) | **no** | ignore the env entirely; see below |
+| busybox `wget` (most alpine images) | **no** | cannot `CONNECT` at all; `apk add wget` fixes it |
+
+PHP's stream wrappers can tunnel perfectly well — they just never look at
+`https_proxy`. Passing a context works, and Squid logs a normal
+`TCP_TUNNEL/200 CONNECT`:
+
+```php
+// CLAUDEBOX_PROXY is "http://<ip>:3128"; a stream context wants a tcp:// URI.
+$ctx = stream_context_create(['http' => [
+    'proxy' => str_replace('http://', 'tcp://', getenv('CLAUDEBOX_PROXY')),
+]]);
+file_get_contents('https://example.com/', false, $ctx);
+```
+
+This is deliberately *not* fixed globally with an `auto_prepend_file` calling
+`stream_context_set_default()`. That would work, but a stream context has no
+`NO_PROXY` equivalent, so it would also send `http://dind:8888`,
+`http://localhost` and sibling-container requests to Squid, which denies them —
+trading a rare failure for a common one. Matomo's own `Piwik\Http` prefers curl,
+so this seldom comes up in practice.
+
+Nested containers get the standard proxy variables injected and nothing else
+(that is all `proxies.default` carries), so a Node process in one will ignore
+them unless its image or command sets `NODE_USE_ENV_PROXY` too.
+
 ## Known issues and caveats
 
 ### Design consequences (working as intended, but surprising)
@@ -331,12 +479,28 @@ diagnostics too.
   with `EAI_AGAIN`, which reads as a DNS fault rather than a configuration one.
   That is handled now; see *Node in the box* below. A library that builds its
   own agent still bypasses all of it and fails, as it should.
-- **Nested containers have no egress by default.** Deliberate — otherwise
-  `docker run alpine wget evil.com` is a trivial bypass. When one genuinely
-  needs network: `docker run -e https_proxy=$CLAUDEBOX_PROXY ...`, which lands
-  on the same allowlist. Nested containers cannot resolve the name `proxy`
-  (dind's embedded DNS doesn't know it), which is why the launcher injects the
-  IP-based `CLAUDEBOX_PROXY`.
+- **Nested containers get the proxy automatically, and are still held to the
+  allowlist.** `entrypoint.sh` writes `proxies.default` into the box's
+  `~/.docker/config.json`, so the Docker CLI injects the proxy variables into
+  everything it creates — `docker compose up` included, which is what made
+  wp-env work without patching wp-env. They reach exactly what the box reaches:
+  `example.com` is refused inside a nested container just as it is in the box.
+  `CLAUDEBOX_PROXY` is still exported for anything that wants the address
+  explicitly, and is still an address rather than a name because dind's embedded
+  DNS has never heard of `proxy`.
+
+  The trap this introduces: HTTP *between* two nested containers now goes to the
+  proxy too, and is denied, since a Compose service name is not on the allowlist
+  and cannot sensibly be put there. Database traffic is unaffected — it is not
+  HTTP — which is why wp-env is fine. If some nested stack does talk HTTP to its
+  own service names, add those names to `noProxy` in `entrypoint.sh` rather than
+  switching the injection off.
+
+- **The `db:3306` bridge serves one project at a time.** `BOX_DDEV_PROJECT`
+  picks it; the launcher auto-detects only when exactly one project is running,
+  and otherwise prints that `db` is unmapped. Starting a second project does not
+  change an already-running bridge — the launcher re-evaluates on the next
+  launch, and Compose recreates the container when the target changes.
 - **No `ddev` CLI or Docker socket in the box, and that stays true even with the
   relay.** Giving the box either would be root-equivalent on the host. Worse,
   DDEV's `hooks:` support `exec-host:`, which runs **on the host** — and Claude
@@ -386,6 +550,129 @@ Do not re-introduce these.
   `node-proxy-bootstrap.cjs`, or `proxy/squid.conf`.** `compose up -d` reuses the existing image and the
   edit silently has no effect. `allowlist.conf` is the exception — it is
   bind-mounted, so `claudebox allow` reloads it live.
+
+- **A network created inside dind can shadow `claudebox_inner` and cut the
+  daemon off from the proxy.** Every registry pull failed with
+  `proxyconnect tcp: dial tcp 172.21.0.2:3128: connect: connection refused`,
+  while `curl` to that same address from the box worked and the allowlist was
+  not involved. `claudebox_inner` had been assigned `172.21.0.0/16` by the host
+  daemon; a nested `docker compose up` (wp-env) then asked *dind's* daemon for a
+  network and it allocated `172.21.0.0/16` as well, from the identical default
+  pool. dockerd runs inside RootlessKit's network namespace, where that range is
+  now a directly attached bridge, so packets for the proxy went to the local
+  bridge instead of out through slirp4netns. Nothing logs a conflict: the two
+  daemons cannot see each other's allocations, which is the whole point of the
+  sidecar.
+
+  Diagnosing it: `docker run --rm --network host alpine ip route` **inside the
+  box** prints dind's namespace, and the proxy's subnet appears there as a `br-*`
+  device. The fix is the pinned subnet above — do not "fix" it by giving dind
+  host networking or by putting the box and dind on the same bridge.
+
+  The failure is also asymmetric in a way that misleads: `docker exec
+  claudebox-dind nc -z <proxy> 3128` succeeds, because that lands in the
+  *container's* namespace, one layer above the daemon's.
+- **Two settings inside the DDEV web container make it a stand-in for a
+  single-host CI runner**, and claudebox owns both — `ddev-realip.conf` and
+  `ddev-fixups` here, applied by `claudebox-ddev-fixups` in the box. Nothing is
+  added to the project.
+
+  - *Client IP.* Matomo's UI-test tracker proxy records the visitor from
+    `REMOTE_ADDR`, which on a runner is `127.0.0.1` and is baked into every
+    visits-log baseline. `ddev-http` sends the real client in `X-Real-IP` and
+    Apache is told to take `REMOTE_ADDR` from it. **`mod_remoteip` does not work
+    here** — enabled and configured at both server and vhost scope, PHP still
+    saw the peer address, because it never reaches the FastCGI environment. Do
+    not retry it; override the variable php-fpm is handed
+    (`ProxyFCGISetEnvIf`).
+  - *Path alias.* The runner is in the box, where the project sits at its host
+    path, while Matomo is served from `/var/www/html`, and
+    `TestsSetupFixture::createSymbolicLinksForUITests()` writes
+    `tests/PHPUnit/proxy/{matomo.js,plugins,libs,…}` as *absolute* symlinks. They
+    all dangle in the web container: `matomo.js` 404s, the JS tracker never
+    runs, and the visits log is empty with broken icons throughout. Symlinking
+    the host path to `/var/www/html` there fixes it whichever way the links were
+    written; relative symlinks are the alternative, but they need
+    `--keep-symlinks` on every run to survive.
+
+  Both are applied over `ddev exec` — writing a config file and reloading Apache
+  is squarely inside what the relay already permits, so this needed no new
+  capability, no container in the project's namespace, and no long-running
+  process. An earlier attempt did use a forwarder sharing the web container's
+  network namespace; it works (that is how the loopback origin was proved) but
+  it needs a tool the image may not ship, leaves a process behind, and opens a
+  port on `ddev_default` that anything could use to arrive as `127.0.0.1`. The
+  config file has none of those properties.
+
+  **Both live in that container's filesystem, so `ddev restart` discards them.**
+  The launcher re-applies on every run, so any session it starts is correct.
+  Anything else is repaired by running `claudebox-ddev-fixups` in the box —
+  deliberately the same code path, so the launcher exercises it every time.
+
+  The failure mode is what makes this worth documenting rather than automating
+  further: nothing errors. The suite runs and produces wrong pixels, which looks
+  finished. `box-CLAUDE.md` therefore tells the box's Claude to run
+  `claudebox-ddev-fixups --check` *before* regenerating any baseline, not just
+  after noticing a diff. A poller was considered and rejected — it would add a
+  container that can itself fail silently, to notice something the agent looking
+  at the diff notices anyway.
+
+- **Screenshot tests can fail on fonts while using exactly the right font.**
+  Matomo's UI baselines are rendered on `ubuntu-24.04` runners. Debian and
+  Ubuntu ship the same *upstream* font versions from different package
+  revisions — `fonts-dejavu-core` 2.37-6 against 2.37-8 — and those files are
+  not byte-identical. Same font, same metrics, same layout, every glyph a pixel
+  off, which is what the comparison fails on.
+
+  It reads exactly like a wrong-font problem, and chasing that wastes the day:
+  the tempting fix is to install more fonts. What settled it was overlaying a
+  failing screenshot on its baseline — **word positions and widths were
+  identical and only the glyph interiors differed**. Different font selection
+  reflows text; different rasterisation does not. If positions match, stop
+  looking at which font and start looking at which *build* of it.
+
+  The image therefore lifts DejaVu, Liberation and Noto Color Emoji out of an
+  `ubuntu:24.04` build stage, and enables the two fontconfig rules Ubuntu has
+  and Debian lacks (`10-sub-pixel-rgb`, `70-no-bitmaps-except-emoji` — Debian's
+  `70-no-bitmaps` silently discards the emoji font). Separately, CI's own
+  Arial/Verdana/Courier New come from `matomo-org/github-action-tests`. Verify
+  with the md5 check under *Verifying a change*.
+
+  Note what does **not** matter here: the box's FreeType version. Chromium
+  bundles its own, and asks fontconfig only for the font file and the hinting
+  preferences — which is why aligning those two things is enough.
+
+- **Root-owned files inside `$HOME` surface as an `EACCES` nowhere near the
+  cause.** The image sets `HOME=/home/<user>` for *every* user, so one
+  `docker exec -u 0 …` that happens to run npm writes root-owned entries deep
+  inside `~/.npm/_cacache`. Later npm runs as the box user then fail with
+  `EACCES` on a path several directories from anything obviously root-related,
+  while `~/.npm` itself still looks correctly owned — so a top-level check
+  clears it. `entrypoint.sh` sweeps for this on every start and reports what it
+  reclaimed. Do not widen that sweep to `~/Projects` or `~/.claude/plans`: both
+  are host binds, and plans files can legitimately read as uid 0 in the box
+  while being correctly owned on the host.
+
+- **Busybox `wget` cannot issue `CONNECT`, and the failure reads as a blocked
+  host.** `docker run --rm alpine wget https://…` fails for an *allowed* domain,
+  with or without `--no-check-certificate` and even after adding
+  `ca-certificates`. It is not TLS: the access log shows
+  `GET https://woocommerce.com/` — busybox put the whole URL in a plain request
+  line instead of opening a tunnel. Plain `http://` through the same busybox
+  works, which makes the allowlist look guilty.
+
+  `squid.conf` now denies non-CONNECT `https://` requests outright, so the client
+  gets a printable `403` instead of `error getting response`, and the attempt
+  appears in `claudebox denied` (unhandled it ended as `TCP_MISS_ABORTED`, which
+  that command does not grep for — the one command meant to explain blocks stayed
+  silent). `claudebox denied` calls the two cases apart in its output.
+
+  Fix it at the client, not the proxy: use `curl`, or `apk add wget` for a GNU
+  wget that can tunnel — verified working. Serving those requests properly would
+  mean Squid terminating TLS itself, which this build cannot do (`--with-gnutls`,
+  no OpenSSL client) and which would put the client→proxy leg in cleartext even
+  if it could.
+
 - **A bind-mounted single FILE can go stale in the container, and a reload will
   not fix it.** An in-place append to `allowlist.conf` on the host did not reach
   the proxy: the host file was 3954 bytes, the container's view of the same
@@ -495,8 +782,11 @@ claudebox shell -c 'for c in claudebox claudebox-proxy ddev-router; do
     docker inspect "$c" >/dev/null 2>&1 && echo "BAD: $c visible"
 done; echo ok'
 
-# No route, no external DNS — both must fail
-claudebox shell -c 'ip route show default | grep -q . && echo BAD || echo ok'
+# No route, no external DNS — both must fail. Read /proc/net/route rather than
+# using "ip": iproute2 is not installed in the box, so "ip route show default"
+# fails with "command not found" and the check passes for the wrong reason.
+# A default route is the line whose Destination field is 00000000.
+claudebox shell -c 'awk "NR>1 && \$2==\"00000000\"" /proc/net/route | grep -q . && echo BAD || echo ok'
 claudebox shell -c 'getent hosts example.com >/dev/null && echo BAD || echo ok'
 
 # Allowlist: first reachable, second refused
@@ -514,6 +804,80 @@ docker exec claudebox-proxy bash -c '
   printf "https://scheme.example\n*\n*.example.com\napi-*.example.com\n" > /tmp/t.conf
   ALLOWLIST_SRC=/tmp/t.conf ALLOWLIST_DOMAINS=/tmp/t.dom ALLOWLIST_REGEX=/tmp/t.re allowlist build
   cat /tmp/t.dom /tmp/t.re'
+
+# The dind DAEMON can reach the proxy, not just the dind container. A pull is
+# the only honest test -- it is dockerd itself, inside RootlessKit's netns, that
+# has to get out. Also check that nothing in dind's namespace has claimed the
+# proxy's subnet.
+claudebox shell -c 'docker pull hello-world >/dev/null && echo ok'
+claudebox shell -c 'docker run --rm --network host alpine:3.20 ip route'
+
+# A Puppeteer-downloaded Chromium starts. The image ships the shared libraries,
+# not the browser, so this also exercises the storage.googleapis.com allowance.
+# Cleans up after itself; it costs ~120MB of the home volume while it runs.
+claudebox shell -lc 'mkdir -p ~/.chromium-smoke && cd ~/.chromium-smoke &&
+  npm i puppeteer@8 >/dev/null 2>&1 &&
+  node -e "require(\"puppeteer\").launch({args:[\"--no-sandbox\"]})
+      .then(async b => { console.log(await b.version()); await b.close(); })
+      .catch(e => { console.error(e.message.split(\"\\n\")[1]); process.exit(1); })";
+  rm -rf ~/.chromium-smoke'
+
+# Nested containers reach the allowlist with no flags, and only the allowlist.
+# The second one is the important half: injection must not have become a bypass.
+claudebox shell -c 'docker run --rm alpine:3.20 wget -q -T 10 -O /dev/null http://matomo.ddev.site/ && echo ok'
+claudebox shell -c 'docker run --rm alpine:3.20 wget -q -T 10 -O /dev/null http://example.com/ && echo BAD || echo ok'
+
+# HTTPS from a nested container needs a client that can tunnel -- busybox wget
+# cannot, and fails identically to a blocked host. Use curl.
+claudebox shell -c 'docker run --rm php:8.3-cli curl -s -o /dev/null -w "%{http_code}\n" --max-time 20 https://woocommerce.com/'
+
+# Screenshot assertions need both of these; "compare" alone is not enough.
+claudebox shell -c 'compare --version | head -1; identify --version | head -1'
+
+# Font parity with the ubuntu-24.04 runners Matomo renders its baselines on.
+# Both md5s must match, and rgba must be 1 -- not "a font by that name exists".
+claudebox shell -c '
+  md5sum /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+         /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf
+  fc-match -v sans-serif | grep -E "rgba|hintstyle"
+  docker run --rm ubuntu:24.04 sh -c "
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq fonts-dejavu-core fonts-liberation >/dev/null 2>&1
+    md5sum /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+           /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"'
+
+# The two CI-shaped names. The second must serve the DDEV project, and the
+# third must still fail -- reaching host.docker.internal is not a way out.
+claudebox shell -c 'docker run --rm -d -p 8888:80 alpine:3.20 sleep 30 >/dev/null;
+  sleep 2; nc -z 127.0.0.1 8888 && echo "localhost:8888 ok"'
+# The box itself must resolve and reach the same name -- Chromium runs here.
+# curl agreeing is not sufficient evidence that Chromium will; check both.
+claudebox shell -c 'getent hosts host.docker.internal &&
+    curl -s -o /dev/null -w "box -> host.docker.internal: %{http_code}\n" \
+    --max-time 25 http://host.docker.internal/matomo.js'
+
+# The client IP the project sees through it must be 127.0.0.1, matching what a
+# single-host runner records. Drop a probe in the docroot, read it, remove it:
+claudebox shell -c 'p=~/Projects/<project>/hdr-probe.php
+  printf "<?php foreach (\$_SERVER as \$k=>\$v) if (strpos(\$k,\"HTTP_X_\")===0) echo \"\$k=\$v\\n\";" > "$p"
+  curl -s --max-time 20 http://host.docker.internal/hdr-probe.php; rm -f "$p"'
+
+# NOTE: no --noproxy here, on purpose. Passing it makes this pass even when the
+# injected NO_PROXY is missing host.docker.internal, which is the one thing this
+# check exists to catch -- Squid answers 403 for that name.
+claudebox shell -c 'docker run --rm --add-host host.docker.internal:host-gateway php:8.3-cli \
+  curl -s -o /dev/null -w "host.docker.internal -> %{http_code}\n" --max-time 25 \
+  http://host.docker.internal/'
+claudebox shell -c 'docker run --rm --add-host host.docker.internal:host-gateway php:8.3-cli \
+  curl -s --max-time 12 -o /dev/null https://example.com/ && echo BAD || echo ok'
+
+# Arial/Verdana/Courier New, which CI copies in from its own repo
+claudebox shell -c 'fc-list : family | tr "," "\n" | sort -u | grep -E "^(Arial|Verdana|Courier New)$"'
+
+# The DDEV database is reachable under the name Matomo's config already uses.
+# Needs a running project; "claudebox" prints which one it bridged at startup.
+claudebox shell -c 'php -r "\$c=@mysqli_connect(\"db\",\"db\",\"db\",\"db\",3306);
+    echo \$c ? \"ok\" : \"FAILED: \".mysqli_connect_error(); echo PHP_EOL;"'
 
 # Bypass attempt must fail even for an allowed host
 claudebox shell -c 'curl -s --noproxy "*" --max-time 8 https://api.anthropic.com/ && echo BAD || echo ok'
@@ -555,6 +919,14 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   reload. Never disable the allowlist wholesale to "make something work"; find
   the host with `claudebox denied`.
 - **Add a tool to the box** → `Dockerfile`, then `claudebox rebuild`.
+- **A browser fails to start with `error while loading shared libraries`** → the
+  published dependency lists for headless Chromium are all incomplete in some
+  direction; derive the real one instead of guessing. Run
+  `ldd <chrome-binary> | grep "not found"` in the box, add the owning packages to
+  the Chromium block in the `Dockerfile`, rebuild, repeat until it is empty. That
+  is how `libxshmfence1` got there — it is absent from every list upstream
+  publishes. `ldd` cannot see libraries opened with `dlopen` at runtime, so
+  finish by actually launching the browser.
 - **Change what the box's Claude knows about its environment** → `box-CLAUDE.md`,
   then `claudebox rebuild`. It lands at `/etc/claude-code/CLAUDE.md`, Claude
   Code's managed-policy memory path: loaded in every session in every directory
@@ -568,6 +940,10 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   consequence to the user before doing it. It is their call, but it should be an
   informed one. Note that `ddev exec` is already handled by the scoped relay
   (`ddev-relay/`) without either — extend that before widening box access.
+- **Reach another host/port on `ddev_default` from the box** → add a second
+  fixed forward to `ddev-db`, or a sibling service modelled on it. Do not
+  generalise it into a destination-taking TCP proxy: `ddev_default` has real
+  egress, so a general forwarder is an allowlist bypass with extra steps.
 - **Extend what the box can do with DDEV** → the relay (`ddev-relay/relay.mjs`)
   is the trust boundary; keep it small and allowlist-driven. It runs `docker
   exec` only, never the `ddev` binary (which would fire `exec-host:` hooks on the

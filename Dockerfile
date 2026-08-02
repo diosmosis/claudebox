@@ -3,6 +3,28 @@
 # An isolated container for running Claude Code against everything under
 # ~/Projects, with network access to DDEV projects via ddev-router.
 
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04's font binaries, for screenshot testing.
+#
+# Matomo's UI baselines are rendered on ubuntu-24.04 runners. Debian and Ubuntu
+# ship the same UPSTREAM font versions from different package revisions --
+# fonts-dejavu-core 2.37-6 here against 2.37-8 there -- and the files are not
+# byte-identical. Identical text then rasterises differently: same font, same
+# metrics, same layout, every glyph a pixel off. That is precisely what a
+# screenshot comparison fails on, and precisely what it looks like when you
+# conclude the wrong font is being used. The font selection is fine; the hinting
+# is not. Liberation differs between the two distros as well.
+#
+# So take the font binaries from the distro CI actually renders on.
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS cifonts
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM node:22-bookworm-slim
 
 ARG USERNAME=dizzy
@@ -17,18 +39,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         gnupg \
+        imagemagick \
         jq \
         less \
         nano \
         openssh-client \
         php-cli \
         php-curl \
+        php-gd \
         php-mbstring \
+        php-mysql \
         php-xml \
         php-zip \
         procps \
         ripgrep \
         rsync \
+        socat \
         unzip \
         wget \
         zip \
@@ -44,6 +70,115 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && apt-get update \
  && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin \
  && rm -rf /var/lib/apt/lists/*
+
+# Shared libraries a headless Chromium needs, for Puppeteer-driven test suites
+# (Matomo's tests/UI). The browser itself is NOT installed: Puppeteer downloads
+# its own pinned build into the project's node_modules from
+# storage.googleapis.com, which is on the allowlist. Only the runtime
+# dependencies of that download are baked in here, plus one font family so text
+# renders as glyphs rather than boxes.
+#
+# Chromium still needs --no-sandbox in this container (no user namespaces for it
+# to drop into); Matomo already sets that in tests/UI/config.dist.js.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libatspi2.0-0 \
+        libcairo2 \
+        libcups2 \
+        libdbus-1-3 \
+        libdrm2 \
+        libexpat1 \
+        libgbm1 \
+        libglib2.0-0 \
+        libgtk-3-0 \
+        libnspr4 \
+        libnss3 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxi6 \
+        libxkbcommon0 \
+        libxrandr2 \
+        libxrender1 \
+        libxshmfence1 \
+        libxss1 \
+        libxtst6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The fonts Matomo's UI tests run against in CI.
+#
+# The baselines under tests/UI/expected-screenshots are produced by
+# matomo-org/github-action-tests, whose prepare.sh copies these exact TTFs into
+# $HOME/.fonts and runs fc-cache before the suite. Without them every screenshot
+# assertion fails on glyph differences that no amount of retrying will settle.
+#
+# Taken from the same repo and ref the workflow pins (@main), rather than
+# vendored here, so a rebuild tracks what CI is actually using -- and so a set of
+# proprietary Microsoft fonts does not end up committed to this repo. The
+# tradeoff is that a rebuild needs GitHub, and that CI changing these fonts
+# changes the box's rendering too, which is the point.
+#
+# System-wide rather than ~/.fonts as CI does it: HOME is a volume that
+# entrypoint.sh seeds only once, so a copy there would not survive a change.
+RUN set -eux; \
+    tmp="$(mktemp -d)"; \
+    git clone --depth 1 https://github.com/matomo-org/github-action-tests.git "${tmp}"; \
+    install -d /usr/local/share/fonts/matomo-ci; \
+    cp "${tmp}"/artifacts/fonts/*.ttf /usr/local/share/fonts/matomo-ci/; \
+    chmod 0644 /usr/local/share/fonts/matomo-ci/*.ttf; \
+    rm -rf "${tmp}"; \
+    fc-cache -f >/dev/null
+
+# Ubuntu's builds of those same font packages, laid over Debian's, plus the two
+# fontconfig rules Ubuntu enables and Debian does not:
+#
+#   10-sub-pixel-rgb            Ubuntu resolves rgba=rgb; Debian leaves it unset,
+#                               and Chromium asks fontconfig for that setting.
+#   70-no-bitmaps-except-emoji  Debian's 70-no-bitmaps rejects EVERY bitmap font,
+#                               which silently discards Noto Color Emoji. Ubuntu
+#                               keeps the emoji one.
+#
+# The Debian font packages stay installed so dpkg's dependency graph is intact;
+# only the files they own are replaced. Ubuntu ships two DejaVu Mono obliques
+# Debian does not, so this adds files rather than leaving stale ones behind.
+COPY --from=cifonts /usr/share/fonts/truetype/dejavu/     /usr/share/fonts/truetype/dejavu/
+COPY --from=cifonts /usr/share/fonts/truetype/liberation/ /usr/share/fonts/truetype/liberation/
+COPY --from=cifonts /usr/share/fonts/truetype/noto/       /usr/share/fonts/truetype/noto/
+COPY --from=cifonts /usr/share/fontconfig/conf.avail/70-no-bitmaps-except-emoji.conf \
+                    /usr/share/fontconfig/conf.avail/70-no-bitmaps-except-emoji.conf
+RUN set -eux; \
+    rm -f /etc/fonts/conf.d/70-no-bitmaps.conf; \
+    ln -sf /usr/share/fontconfig/conf.avail/10-sub-pixel-rgb.conf \
+           /etc/fonts/conf.d/10-sub-pixel-rgb.conf; \
+    ln -sf /usr/share/fontconfig/conf.avail/70-no-bitmaps-except-emoji.conf \
+           /etc/fonts/conf.d/70-no-bitmaps-except-emoji.conf; \
+    fc-cache -f >/dev/null
+
+# ImageMagick's Debian defaults (256MiB memory, 16KP dimensions, 128MP area) are
+# well below what comparing full-page screenshots needs. CI raises exactly these
+# in prepare.sh, so match it. Note prepare.sh's last line has a typo -- it
+# rewrites the "disk" policy's NAME to "area" -- which is clearly not intended;
+# the disk limit is set properly here. These are resource ceilings only and
+# cannot affect how anything renders.
+RUN sed -i -E \
+        -e 's/name="memory" value="[^"]+"/name="memory" value="2GiB"/' \
+        -e 's/name="width" value="[^"]+"/name="width" value="64KP"/' \
+        -e 's/name="height" value="[^"]+"/name="height" value="64KP"/' \
+        -e 's/name="area" value="[^"]+"/name="area" value="1GiB"/' \
+        -e 's/name="disk" value="[^"]+"/name="disk" value="4GiB"/' \
+        /etc/ImageMagick-6/policy.xml
 
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -69,6 +204,16 @@ RUN chmod 0644 /usr/local/lib/claudebox/proxy-bootstrap.cjs
 # ddev. Baked in (not bind-mounted) so it is always on PATH ahead of anything.
 COPY ddev-shim /usr/local/bin/ddev
 RUN chmod 0755 /usr/local/bin/ddev
+
+# Prepares a DDEV project's web container to behave like the single-host CI
+# runner Matomo's UI-test baselines came from: client IP and path alias. Both
+# live in that container's filesystem and are discarded by `ddev restart`, so
+# this has to be re-runnable -- the launcher calls it on every run, and the
+# box's Claude can call it after a mid-session restart. See CLAUDEBOX.md.
+COPY ddev-fixups /usr/local/bin/claudebox-ddev-fixups
+COPY ddev-realip.conf /usr/local/share/claudebox/ddev-realip.conf
+RUN chmod 0755 /usr/local/bin/claudebox-ddev-fixups \
+ && chmod 0644 /usr/local/share/claudebox/ddev-realip.conf
 
 # Claude Code's managed-policy memory location on Linux. Loaded at the start of
 # every session in every directory in the box, and not excludable by settings --

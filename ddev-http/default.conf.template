@@ -1,0 +1,51 @@
+# Plain-HTTP front door to one DDEV project, for containers nested inside dind.
+#
+# They reach this at "host.docker.internal" (dind is started with
+# --host-gateway-ip pointing here), and the box reaches it under the same name
+# via a network alias -- the address a normal single-host CI runner gives them.
+# The work is setting the Host header the project answers to, and presenting the
+# client as 127.0.0.1 the way a single-host runner would.
+#
+# ${DDEV_HOST} and ${DDEV_WEB} are substituted at container start from the compose
+# environment.
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    # Docker's embedded DNS, consulted per request rather than at startup:
+    # naming the upstream directly in proxy_pass would make nginx refuse to boot
+    # whenever no DDEV project is running, which must not take the box down.
+    resolver 127.0.0.11 ipv6=off valid=10s;
+
+    location / {
+        # Straight to the project's web container, NOT through ddev-router.
+        #
+        # ddev-router is traefik, and traefik REPLACES X-Forwarded-For with the
+        # address it received the connection from unless that peer is in its
+        # trusted list -- which this container is not. Anything set here would
+        # be discarded, and Matomo (which reads the last entry, per
+        # proxy_ip_read_last_in_list = 1) would record this container's address
+        # as the visitor IP. Talking to the web container directly leaves the
+        # header ours to set. Same shape as the ddev-db forward.
+        set $ddev_upstream http://${DDEV_WEB};
+        proxy_pass $ddev_upstream$request_uri;
+
+        proxy_set_header Host              ${DDEV_HOST};
+
+        # On a CI runner the browser and Matomo share a host, so every visit is
+        # recorded from 127.0.0.1. Reproduce that: it is what the baselines
+        # contain, and this forwarder exists precisely to stand in for "same
+        # host". Matomo trusts X-Forwarded-For (proxy_client_headers in
+        # config.ini.php) and takes the last entry, so this single value wins.
+        proxy_set_header X-Real-IP         127.0.0.1;
+        proxy_set_header X-Forwarded-For   127.0.0.1;
+        proxy_set_header X-Forwarded-Proto http;
+
+        proxy_http_version 1.1;
+        # Tracking requests are small; fixture setup and plugin installs are not.
+        client_max_body_size 64m;
+        proxy_read_timeout  300s;
+        proxy_send_timeout  300s;
+    }
+}

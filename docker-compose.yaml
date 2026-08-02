@@ -34,8 +34,14 @@ services:
       HTTPS_PROXY: http://proxy:3128
       http_proxy: http://proxy:3128
       https_proxy: http://proxy:3128
-      NO_PROXY: localhost,127.0.0.1,dind,proxy,ddev-relay
-      no_proxy: localhost,127.0.0.1,dind,proxy,ddev-relay
+      # host.docker.internal is here for the same reason it is in the list
+      # entrypoint.sh injects into nested containers: it is an address on this
+      # network reached directly, and sending it to Squid returns 403. Chromium
+      # runs in this container and loads Matomo's tracker from that URL, so
+      # without it the JS pageviews never fire and screenshots of visit data
+      # come out short. Kept identical to the nested list on purpose.
+      NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay
+      no_proxy: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay
 
       # Node ignores the proxy variables by default -- fetch() and the http/https
       # core clients both do -- so ordinary node code fails with EAI_AGAIN in a
@@ -62,6 +68,15 @@ services:
       # Where the `ddev` shim (baked into the image) sends `ddev exec` requests.
       # ddev-relay is in NO_PROXY above, so this goes direct, not via squid.
       CLAUDEBOX_DDEV_RELAY: http://ddev-relay:7999
+
+      # Ports to republish from dind onto this container's loopback, so
+      # "localhost:<port>" means here what it means on a single-host CI runner.
+      # A container started inside dind publishes to DIND's interface, not this
+      # one, so without this wp-env's WordPress is at dind:8888 and nothing that
+      # expects localhost:8888 -- Puppeteer, or a screenshot baseline generated
+      # on a runner -- can reach it. 8888/8889 are wp-env's development and
+      # tests ports; comma-separated, empty disables.
+      CLAUDEBOX_DIND_PORTS: "8888,8889"
 
     volumes:
       # Container-only HOME. Keeps the box's Claude state, npm cache and shell
@@ -147,7 +162,21 @@ services:
       HTTP_PROXY: http://proxy:3128
       HTTPS_PROXY: http://proxy:3128
       NO_PROXY: localhost,127.0.0.1
-    command: ["--host=tcp://0.0.0.0:2375"]
+    # --default-address-pool keeps the networks this daemon hands out inside a
+    # narrow band. On its own it is only half the fix -- see the "inner" network
+    # below, which is what actually has to stay out of the way -- but it stops a
+    # nested "docker compose up" from wandering across the whole 172.16/12
+    # default pool and shadowing something the box needs to reach.
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --default-address-pool=base=172.28.0.0/14,size=24
+      # wp-env gives every container it starts
+      # "extra_hosts: [host.docker.internal:host-gateway]", and Matomo's UI
+      # tests rely on that name to reach Matomo from inside WordPress. Left
+      # alone it resolves to dind's own bridge gateway, where nothing listens.
+      # Point it at the ddev-http service instead, whose fixed address on
+      # claudebox_inner nested containers can reach.
+      - --host-gateway-ip=10.99.1.10
     volumes:
       - dind-data:/home/rootless/.local/share/docker
       # The source tree at its host path again: "-v" sources in a nested
@@ -194,6 +223,92 @@ services:
     networks:
       - inner
 
+  # One fixed TCP forward, from the box to a running DDEV project's database.
+  #
+  # It exists because a Matomo UI-test fixture is a single PHP process that needs
+  # the Matomo database AND Docker at the same time: it seeds the database
+  # directly and then shells out to wp-env to start containers. The DDEV web
+  # container has the database but no Docker; the box has Docker but, being on an
+  # internal network, no route to the database. Nothing else closes that gap --
+  # running the fixture's PHP inside DDEV via the relay cannot work, because
+  # wp-env would have no daemon to start containers on.
+  #
+  # The alias is what makes this cheap: Matomo's config.ini.php already says
+  # host = "db", which is also how the project's own web container reaches it, so
+  # the identical config file works on both sides with nothing to switch.
+  #
+  # This grants the box no access it did not already have -- `ddev exec -s db`
+  # through the relay already runs arbitrary commands in that same container.
+  # What keeps it narrow is that socat has ONE hard-coded destination: it is a
+  # single forward, not a general TCP proxy, and turning it into one would be a
+  # hole straight through the egress allowlist. Keep the destination fixed.
+  ddev-db:
+    container_name: claudebox-ddev-db
+    image: alpine/socat:latest
+    init: true
+    # "none" when the launcher found no single running project to bridge, which
+    # simply never resolves. socat resolves per connection, so the service still
+    # starts and starts working the moment the project comes up.
+    command: >-
+      tcp-listen:3306,fork,reuseaddr
+      tcp-connect:ddev-${BOX_DDEV_PROJECT:-none}-db:3306
+    networks:
+      # inner: where the box reaches it, under the name Matomo's config expects.
+      # ddev_default: where the project's database actually is.
+      inner:
+        aliases:
+          - db
+      ddev_default: {}
+
+  # The "host.docker.internal" that containers nested inside dind expect.
+  #
+  # wp-env attaches "host.docker.internal:host-gateway" to everything it starts,
+  # and Matomo's UI tests use that name to reach Matomo from inside WordPress --
+  # on a CI runner it lands on the host, where Matomo is served. Here there is no
+  # such host: Matomo is a DDEV project the box only reaches through the proxy,
+  # and dind's real gateway has nothing listening on it.
+  #
+  # So this stands in for it. dind's --host-gateway-ip points at the fixed
+  # address below, and nginx rewrites the Host header to the project's own
+  # hostname, which is the only thing ddev-router routes on. Nested containers
+  # can already reach this network (that is how they reach the proxy), so no new
+  # path is created -- the same project, at the address CI's URLs assume.
+  #
+  # Like ddev-db, this is deliberately a single fixed destination. A forwarder
+  # that took its target from the request would be an open relay onto
+  # ddev_default, which unlike claudebox_inner has real egress.
+  ddev-http:
+    container_name: claudebox-ddev-http
+    image: claudebox-ddev-http:latest
+    build:
+      context: ./ddev-http
+    init: true
+    environment:
+      DDEV_HOST: ${BOX_DDEV_PROJECT:-none}.ddev.site
+      # The project's web container directly. Not ddev-router: see the template.
+      DDEV_WEB: ddev-${BOX_DDEV_PROJECT:-none}-web
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -q -O /dev/null http://127.0.0.1/ 2>/dev/null || true"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    networks:
+      # A fixed address, because dind's --host-gateway-ip has to name it and
+      # that is set at daemon start, before Docker would assign a dynamic one.
+      #
+      # The alias makes the name resolve on this network too, not just inside
+      # dind (where wp-env's extra_hosts provides it). The box has no resolver
+      # of its own, so without this Chromium cannot load Matomo's tracker from
+      # host.docker.internal -- and CI fidelity requires that exact name.
+      # An alias rather than extra_hosts on the box, so the address stays
+      # declared in one place.
+      inner:
+        ipv4_address: 10.99.1.10
+        aliases:
+          - host.docker.internal
+      ddev_default: {}
+
 volumes:
   box-home:
     name: claudebox-home
@@ -207,6 +322,23 @@ networks:
   inner:
     name: claudebox_inner
     internal: true
+    # Pinned, and pinned OUTSIDE Docker's default address pool on purpose.
+    #
+    # dockerd inside the dind sidecar runs in its own network namespace and
+    # allocates bridges for nested containers from the same 172.16.0.0/12 pool
+    # the host daemon used for this network. Left to chance they collide: with
+    # this network at 172.21.0.0/16, a nested "docker compose up" claimed
+    # 172.21.0.0/16 too, and from then on the proxy's address resolved to a
+    # local bridge inside dind instead of leaving via slirp4netns. Every
+    # registry pull failed with "proxyconnect ... connect: connection refused"
+    # while the box itself reached the same address fine.
+    #
+    # 10.99.1.0/24 is clear of Docker's defaults (172.16.0.0/12, then
+    # 192.168.0.0/16) and of the host LAN. Changing it means checking both
+    # again.
+    ipam:
+      config:
+        - subnet: 10.99.1.0/24
 
   edge:
     name: claudebox_edge

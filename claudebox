@@ -13,7 +13,8 @@
 #   claudebox allowed         show the egress allowlist
 #   claudebox denied          show requests the proxy has blocked
 #
-# Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+# Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA,
+#               BOX_DDEV_PROJECT (which project's database is reachable as db:3306)
 set -euo pipefail
 
 # Resolve symlinks first: this script is normally invoked via ~/.local/bin, and
@@ -38,6 +39,21 @@ export BOX_USER="${BOX_USER:-$(id -un)}"
 export BOX_UID="${BOX_UID:-$(id -u)}"
 export BOX_GID="${BOX_GID:-$(id -g)}"
 export BOX_MKCERT_CA="${BOX_MKCERT_CA:-$(mkcert -CAROOT 2>/dev/null || echo "${HOME}/.local/share/mkcert")/rootCA.pem}"
+
+# Which DDEV project's database the box reaches at "db:3306" (see the ddev-db
+# service). Auto-detected when exactly one project is running -- with several up
+# there is no defensible guess, so it stays unset and the bridge points at a
+# name that does not resolve. Pin it with BOX_DDEV_PROJECT to override either
+# case. Resolved before the command dispatch below so "rebuild" sees it too.
+if [ -z "${BOX_DDEV_PROJECT:-}" ] && command -v ddev >/dev/null 2>&1; then
+    ddev_running="$(ddev list -j 2>/dev/null \
+        | jq -r '.raw[]? | select((.status // "") == "running") | .name' 2>/dev/null || true)"
+    ddev_count="$(printf '%s\n' "${ddev_running}" | grep -c . || true)"
+    if [ "${ddev_count}" = "1" ]; then
+        BOX_DDEV_PROJECT="$(printf '%s\n' "${ddev_running}" | head -1)"
+    fi
+fi
+export BOX_DDEV_PROJECT="${BOX_DDEV_PROJECT:-none}"
 
 # Regenerate the compose override before any command runs, so "stop"/"rebuild"
 # and the launch path below all act on the same, present file. It always carries
@@ -117,6 +133,37 @@ write_ddev_hosts() {
         echo "claudebox: reachable DDEV sites -> ${hosts_line#* }" >&2
     else
         echo "claudebox: no running DDEV projects detected" >&2
+    fi
+}
+
+# Prepare the bridged project's web container for UI tests (client IP, path
+# alias). Both live in that container's filesystem, so a `ddev restart` discards
+# them and they have to be re-applied -- doing it here means every session the
+# launcher starts begins in a known-good state.
+#
+# The work itself is claudebox-ddev-fixups in the box, deliberately the same code
+# path the box's Claude uses to repair a mid-session restart: if it works here it
+# works there. Never fatal -- a box that comes up without this is still a usable
+# box, it just cannot produce CI-comparable screenshots, so say so and continue.
+apply_ddev_fixups() {
+    local approot
+    if [ "${BOX_DDEV_PROJECT}" = "none" ]; then
+        return 0
+    fi
+    approot="$(ddev list -j 2>/dev/null \
+        | jq -r --arg p "${BOX_DDEV_PROJECT}" \
+            '.raw[]? | select(.name == $p) | .approot' 2>/dev/null \
+        | head -1 || true)"
+    if [ -z "${approot}" ] || [ ! -d "${approot}" ]; then
+        echo "claudebox: could not locate ${BOX_DDEV_PROJECT}'s directory; skipped web-container setup" >&2
+        return 0
+    fi
+    if docker exec -u "${BOX_UID}:${BOX_GID}" -w "${approot}" "${CONTAINER}" \
+            claudebox-ddev-fixups >/dev/null 2>&1; then
+        echo "claudebox: ${BOX_DDEV_PROJECT} web container ready for UI tests (client IP, path alias)" >&2
+    else
+        echo "claudebox: could NOT prepare ${BOX_DDEV_PROJECT}'s web container -- screenshots will not" >&2
+        echo "claudebox: match CI. In the box: cd ${approot} && claudebox-ddev-fixups" >&2
     fi
 }
 
@@ -232,6 +279,7 @@ claudebox -- run Claude Code in an isolated container over ~/Projects
   claudebox stop             stop the stack (volumes survive)
 
 Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+               BOX_DDEV_PROJECT  which project's database is reachable as db:3306
 For Claude Code's own help:  claudebox shell -c 'claude --help'
 USAGE
         exit 0
@@ -246,10 +294,29 @@ USAGE
         # TCP_DENIED is what Squid logs for a request the allowlist refused.
         # -a because the log picks up stray bytes from tunnelled traffic and
         # grep then reports "binary file matches" instead of the lines.
-        docker exec "${PROXY}" \
+        denied_lines="$(docker exec "${PROXY}" \
             grep -a TCP_DENIED /var/log/squid/access.log 2>/dev/null \
-            | awk '{print $4, $5}' | sort -u \
-            || echo "claudebox: nothing blocked yet" >&2
+            | awk '{print $4, $5}' | sort -u || true)"
+        if [ -z "${denied_lines}" ]; then
+            echo "claudebox: nothing blocked yet" >&2
+            exit 0
+        fi
+        printf '%s\n' "${denied_lines}"
+        # Two different failures land in this list and the difference matters.
+        # "CONNECT host:443" is the allowlist doing its job. "GET https://..."
+        # is not an allowlist decision at all -- it is a client that cannot
+        # tunnel -- and adding the domain will not help.
+        if printf '%s\n' "${denied_lines}" | grep -qE '^[A-Z]+ https://'; then
+            {
+                echo
+                echo "claudebox: lines above reading '<METHOD> https://...' are NOT allowlist"
+                echo "claudebox: refusals. That client cannot tunnel through a proxy, so it sent"
+                echo "claudebox: the URL in a plain request; allowing the domain changes nothing."
+                echo "claudebox: busybox wget does this, which covers most alpine images -- use"
+                echo "claudebox: curl instead, or 'apk add wget' for one that can CONNECT."
+                echo "claudebox: A genuinely blocked host looks like 'CONNECT host:443'."
+            } >&2
+        fi
         exit 0
         ;;
 
@@ -313,6 +380,14 @@ if ! allowlist_in_sync; then
 fi
 
 write_ddev_hosts
+
+if [ "${BOX_DDEV_PROJECT}" = "none" ]; then
+    echo "claudebox: no single DDEV project to bridge; db:3306 is unmapped (set BOX_DDEV_PROJECT)" >&2
+else
+    echo "claudebox: DDEV database -> ddev-${BOX_DDEV_PROJECT}-db, reachable as db:3306" >&2
+fi
+
+apply_ddev_fixups
 
 # ---------------------------------------------------------------------------
 # Attach

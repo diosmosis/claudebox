@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# Make a running DDEV project's web container behave like the single-host CI
+# runner that Matomo's UI-test baselines were recorded on.
+#
+# Two things, both applied inside the web container through `ddev exec` (the
+# relay), both idempotent and safe to repeat:
+#
+#   1. Client IP. Matomo's UI-test tracker proxy records the visitor from
+#      REMOTE_ADDR, which is 127.0.0.1 on a runner and is baked into every
+#      visits-log baseline. Requests from the box arrive via ddev-http, so
+#      REMOTE_ADDR is that container's address unless Apache is told to take the
+#      client from X-Real-IP -- which ddev-http sets. See ddev-realip.conf.
+#
+#   2. Path alias. The test runner runs in the box, where the project sits at its
+#      host path, while Matomo is served from /var/www/html. Matomo writes
+#      tests/PHPUnit/proxy/{matomo.js,plugins,libs,...} as ABSOLUTE symlinks, so
+#      every one of them dangles in the web container: matomo.js 404s, the JS
+#      tracker never runs, and the visits log comes out empty with broken icons.
+#
+# Both live in the web container's filesystem, so a `ddev restart` throws them
+# away. The launcher re-applies on every claudebox run, which covers any session
+# it starts; run this by hand if a project was restarted mid-session.
+#
+#   claudebox-ddev-fixups           apply what is missing (safe to repeat)
+#   claudebox-ddev-fixups --check   report only; non-zero if anything is missing
+#
+# Run it from anywhere inside the project.
+set -euo pipefail
+
+CONF_SRC=/usr/local/share/claudebox/ddev-realip.conf
+CONF_DEST=/etc/apache2/sites-enabled/zz-claudebox-realip.conf
+DDEV_MOUNT=/var/www/html
+
+mode=apply
+case "${1:-}" in
+    --check) mode=check ;;
+    "")      ;;
+    *)       echo "usage: $(basename "$0") [--check]" >&2; exit 2 ;;
+esac
+
+# The relay resolves the project from the working directory, so find the root the
+# same way it does rather than guessing a name.
+project_root=""
+d="${PWD}"
+while [ "${d}" != "/" ]; do
+    if [ -f "${d}/.ddev/config.yaml" ]; then
+        project_root="${d}"
+        break
+    fi
+    d="$(dirname "${d}")"
+done
+if [ -z "${project_root}" ]; then
+    echo "claudebox-ddev-fixups: not inside a DDEV project (no .ddev/config.yaml at or above ${PWD})" >&2
+    exit 2
+fi
+
+if [ ! -r "${CONF_SRC}" ]; then
+    echo "claudebox-ddev-fixups: ${CONF_SRC} is missing from the image; rebuild the box" >&2
+    exit 1
+fi
+
+want_sum="$(md5sum < "${CONF_SRC}" | cut -d' ' -f1)"
+
+# One round trip for both answers. Missing file and missing link both come back
+# empty rather than failing, so the reachability of the project is the only thing
+# that can error here.
+probe="$(ddev exec "md5sum < ${CONF_DEST} 2>/dev/null | cut -d' ' -f1; readlink ${project_root} 2>/dev/null" 2>/dev/null || true)"
+have_sum="$(printf '%s\n' "${probe}" | sed -n '1p' | tr -dc '0-9a-f')"
+have_link="$(printf '%s\n' "${probe}" | sed -n '2p' | tr -d '[:space:]')"
+
+conf_ok=0; [ -n "${want_sum}" ] && [ "${have_sum}" = "${want_sum}" ] && conf_ok=1
+link_ok=0; [ "${have_link}" = "${DDEV_MOUNT}" ] && link_ok=1
+
+if [ "${mode}" = "check" ]; then
+    [ "${conf_ok}" -eq 1 ] && echo "client IP (REMOTE_ADDR from X-Real-IP): ok" \
+                           || echo "client IP (REMOTE_ADDR from X-Real-IP): MISSING"
+    [ "${link_ok}" -eq 1 ] && echo "path alias (${project_root} -> ${DDEV_MOUNT}): ok" \
+                           || echo "path alias (${project_root} -> ${DDEV_MOUNT}): MISSING"
+    if [ "${conf_ok}" -eq 1 ] && [ "${link_ok}" -eq 1 ]; then
+        exit 0
+    fi
+    echo "run 'claudebox-ddev-fixups' to apply" >&2
+    exit 1
+fi
+
+changed=0
+
+if [ "${conf_ok}" -ne 1 ]; then
+    # base64 so the directive's quotes and regexp survive the trip through the
+    # shim, the relay, and `bash -lc` without any escaping to get wrong.
+    b64="$(base64 -w0 < "${CONF_SRC}")"
+    ddev exec "printf %s '${b64}' | base64 -d | sudo tee ${CONF_DEST} >/dev/null \
+        && sudo apachectl configtest >/dev/null 2>&1 \
+        && sudo apachectl graceful >/dev/null 2>&1" \
+        || { echo "claudebox-ddev-fixups: failed to install ${CONF_DEST}" >&2; exit 1; }
+    changed=1
+    echo "claudebox-ddev-fixups: installed ${CONF_DEST} and reloaded Apache"
+fi
+
+if [ "${link_ok}" -ne 1 ]; then
+    # -T so this can never end up creating the link *inside* an existing
+    # directory of the same name.
+    ddev exec "sudo mkdir -p '$(dirname "${project_root}")' \
+        && sudo ln -sfnT ${DDEV_MOUNT} '${project_root}'" \
+        || { echo "claudebox-ddev-fixups: failed to create ${project_root} -> ${DDEV_MOUNT}" >&2; exit 1; }
+    changed=1
+    echo "claudebox-ddev-fixups: linked ${project_root} -> ${DDEV_MOUNT} in the web container"
+fi
+
+if [ "${changed}" -eq 0 ]; then
+    echo "claudebox-ddev-fixups: already applied"
+fi
