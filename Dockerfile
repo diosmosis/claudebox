@@ -182,6 +182,21 @@ RUN sed -i -E \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# opencode, the box's second agent ("claudebox opencode"). The npm package is a
+# thin launcher; the real program is a ~180MB Bun binary pulled in as a
+# per-platform optional dependency (opencode-linux-x64), which is most of what
+# this layer adds to the image.
+#
+# The image owns the version, so `claudebox rebuild` is how it moves --
+# OPENCODE_DISABLE_AUTOUPDATE in docker-compose.yaml stops opencode replacing
+# itself with a copy in the HOME volume that would then shadow this one and
+# drift from what the Dockerfile says is installed.
+#
+# Being a Bun binary, it ignores NODE_OPTIONS -- so the DNS-preflight preload
+# below does not apply to it. It does not need it: Bun's fetch reads
+# HTTP_PROXY/HTTPS_PROXY/NO_PROXY on its own.
+RUN npm install -g opencode-ai
+
 # The node image already owns uid/gid 1000. Replace that user with one matching
 # the host user, so files written into the bind-mounted source tree keep the
 # right ownership instead of coming out root-owned.
@@ -224,7 +239,20 @@ RUN chmod 0755 /usr/local/bin/claudebox-ddev-fixups \
 # volume that entrypoint.sh seeds only once, so a copy there would never pick up
 # edits. Rebuild after changing box-CLAUDE.md.
 COPY box-CLAUDE.md /etc/claude-code/CLAUDE.md
-RUN chmod 0644 /etc/claude-code/CLAUDE.md
+
+# The same notes for opencode, which has no managed-policy path of its own. The
+# baked config adds this file to every session's instructions; OPENCODE_CONFIG
+# (docker-compose.yaml) points opencode at it. That variable names an ADDITIONAL
+# config, not a replacement, so a ~/.config/opencode/opencode.json seeded from
+# the host still loads alongside it.
+#
+# One source file for both agents on purpose: everything in it is about the box,
+# not about who is reading it, and two copies would drift.
+COPY box-CLAUDE.md    /etc/claudebox/AGENTS.md
+COPY box-opencode.json /etc/claudebox/opencode.json
+RUN chmod 0644 /etc/claude-code/CLAUDE.md \
+               /etc/claudebox/AGENTS.md \
+               /etc/claudebox/opencode.json
 
 # Node has its own CA bundle and ignores the system store, so point it at the
 # DDEV root CA that entrypoint.sh installs.

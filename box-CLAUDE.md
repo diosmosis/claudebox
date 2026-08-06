@@ -1,13 +1,25 @@
 # You are running inside claudebox
 
-A container that holds every project under `~/Projects`. This file is baked into
-the image at `/etc/claude-code/CLAUDE.md`; edit it in `~/.claudebox/box-CLAUDE.md`
-on the host and run `claudebox rebuild`.
+A container that holds every project under `~/Projects`. It runs one of two
+agents — Claude Code (`claudebox`) or opencode (`claudebox opencode`) — and
+everything below is about the box, so it applies whichever one you are.
+
+This file is baked into the image twice: at `/etc/claude-code/CLAUDE.md`, Claude
+Code's managed-policy path, and at `/etc/claudebox/AGENTS.md`, which opencode is
+pointed at by a baked config. Edit it in `~/.claudebox/box-CLAUDE.md` on the host
+and run `claudebox rebuild`.
 
 ## Filesystem
 
 - `~/Projects` is the host's source tree, bind-mounted at the same absolute path
   it has on the host. Paths you report are directly clickable outside the box.
+- `/media` is **not** the host's drives. It is `~/.claudebox/media` on the host,
+  **read-only**: material staged there deliberately with `claudebox media add`.
+  Read from it freely; writes fail. If something expected is missing, the answer
+  is "ask the host to stage it" — say that rather than reporting an empty
+  directory, and never suggest mounting the drive itself. Staging exists so
+  drives can be ejected while the box runs; a bind of the real `/media` pins
+  them until Docker Desktop is quit.
 - Nothing else of the host is visible. `~` is a container-private volume.
 - Plans written to `~/.claude/plans` land in `~/.claudebox/plans` on the host.
 

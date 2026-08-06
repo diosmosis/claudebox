@@ -20,6 +20,11 @@ fi
 seed() {
     local src="$1" dest="$2"
     if [ ! -e "$dest" ] && [ -e "$src" ]; then
+        # The parent may not exist yet: opencode's config and its credentials
+        # sit under ~/.config and ~/.local/share, neither of which the image
+        # creates. Owned by the user from the start rather than left to the
+        # root-owned sweep at the end of this file.
+        install -d -o "${USER_NAME}" -g "${USER_NAME}" "$(dirname "$dest")"
         cp -a "$src" "$dest"
         chown -R "${USER_NAME}:${USER_NAME}" "$dest"
         echo "claudebox: seeded ${dest} from host"
@@ -45,6 +50,15 @@ fi
 
 seed /host/claude.json "${USER_HOME}/.claude.json"
 seed /host/gitconfig "${USER_HOME}/.gitconfig"
+
+# The same one-time seed for opencode: its config directory (agents, commands,
+# themes, opencode.json) and, separately, its credentials -- opencode keeps
+# those under ~/.local/share, not with the config. Both host paths are mounted
+# read-only and only when they exist, so a host without opencode installed
+# simply has nothing to copy and these are no-ops. Once seeded, the box's copies
+# are its own: authenticating in here never writes back to the host.
+seed /host/opencode           "${USER_HOME}/.config/opencode"
+seed /host/opencode-auth.json "${USER_HOME}/.local/share/opencode/auth.json"
 
 # Make "localhost:<port>" here mean what it means on a single-host CI runner.
 #

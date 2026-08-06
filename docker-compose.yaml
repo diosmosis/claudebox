@@ -65,6 +65,22 @@ services:
       # requests rather than letting them fail against the proxy.
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
 
+      # What the box's opencode is told about its environment: the same notes
+      # Claude Code gets as managed policy, baked in as /etc/claudebox/AGENTS.md
+      # and added to every session by the config this points at.
+      #
+      # OPENCODE_CONFIG names an ADDITIONAL config file, not a replacement, so
+      # the user's own ~/.config/opencode/opencode.json (seeded from the host by
+      # entrypoint.sh) still loads. Both files must exist in the image -- a
+      # missing path here is not fatal, it just silently drops the box notes.
+      OPENCODE_CONFIG: /etc/claudebox/opencode.json
+
+      # The Dockerfile owns the version (npm i -g opencode-ai). Left to itself
+      # opencode would install an update into the HOME volume, which then
+      # shadows the image's copy and drifts from it -- and survives a rebuild,
+      # since the volume does. "claudebox rebuild" is the update path.
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+
       # Where the `ddev` shim (baked into the image) sends `ddev exec` requests.
       # ddev-relay is in NO_PROXY above, so this goes direct, not via squid.
       CLAUDEBOX_DDEV_RELAY: http://ddev-relay:7999
@@ -91,6 +107,29 @@ services:
       # to widen it -- the proxy reads its own copy, and only the host launcher
       # can reload it. /etc/claude-code/CLAUDE.md points here.
       - ./allowlist.conf:/etc/claudebox/allowlist.conf:ro
+
+      # Material to consult (archives, bundles, backups), read-only. Staged
+      # here from a removable drive by "claudebox media add <path>" -- the
+      # drives themselves are NOT mounted through, and /media must NOT be put
+      # back on Docker Desktop's file-sharing list.
+      #
+      # Why: this host's engine is a VM, and every shared host path is exported
+      # into it by a virtiofsd process on the host that is started with the VM
+      # and dies with the VM. It keeps an open fd for every inode the guest has
+      # looked up, so once the box walks into /media/dizzy/<label> those fds sit
+      # on the DRIVE's filesystem and umount returns EBUSY. Containers have
+      # nothing to do with it: "claudebox stop" removes the box, virtiofsd keeps
+      # the fds, and only quitting Docker Desktop -- stopping every container on
+      # the host, DDEV included -- lets the drive be ejected. Bind flags cannot
+      # help; :ro, rprivate and mounting one drive instead of /media all still
+      # route through that same process.
+      #
+      # Staging pays a copy to make the drive ejectable at any moment. It also
+      # drops the old requirement that the container be recreated for a drive
+      # plugged in mid-session: this source is an ordinary directory under
+      # /home, so anything added to it on the host is visible in the box at
+      # once. Read-only here so the box can consult it but not alter or grow it.
+      - ./media:/media:ro
 
       # Read-only host inputs, copied in once by entrypoint.sh.
       - ${BOX_MKCERT_CA:-/home/dizzy/.local/share/mkcert/rootCA.pem}:/host/mkcert/rootCA.pem:ro

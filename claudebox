@@ -4,9 +4,14 @@
 #
 #   claudebox                 start an interactive session in the current directory
 #   claudebox -p 'summarise'  pass any flags/prompt straight through to claude
+#   claudebox opencode [args] run opencode in the box instead of claude
 #   claudebox shell           drop into bash inside the box instead
 #   claudebox rebuild         rebuild the image after editing the Dockerfile
 #   claudebox stop            stop the box (state in the home volume survives)
+#
+#   claudebox media add <p>   copy material off a drive into the box's /media
+#   claudebox media ls        list what is staged there
+#   claudebox media rm <n>    drop a staged entry
 #
 #   claudebox allow <domain>  permit a domain and reload the proxy
 #   claudebox reload          re-apply allowlist.conf after a manual edit
@@ -25,6 +30,8 @@ BOX_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 CONTAINER=claudebox
 PROXY=claudebox-proxy
 ALLOWLIST="${BOX_DIR}/allowlist.conf"
+# Bind-mounted read-only at /media in the box (see docker-compose.yaml).
+MEDIA_DIR="${BOX_DIR}/media"
 # Both compose files, named explicitly. Passing -f at all turns OFF Compose's
 # automatic discovery of docker-compose.override.yaml, so it has to be listed by
 # hand -- otherwise the launcher-generated mounts (plans, optional gitconfig) are
@@ -72,8 +79,30 @@ mounts=()
 mkdir -p "${BOX_DIR}/plans"
 mounts+=("${BOX_DIR}/plans:/home/${BOX_USER}/.claude/plans")
 
+# The staging directory for /media. Its bind lives in docker-compose.yaml, not
+# in the override, but it needs the same guard: Docker creates a missing bind
+# source as a root-owned directory, and then nothing here can write to it.
+mkdir -p "${MEDIA_DIR}"
+
 if [ -f "${BOX_HOST_HOME}/.gitconfig" ]; then
     mounts+=("${BOX_HOST_HOME}/.gitconfig:/host/gitconfig:ro")
+fi
+
+# opencode's host config and credentials, read-only, for entrypoint.sh to seed
+# the box's own copies from on first start. Conditional because opencode need
+# not be installed on the host at all -- and because binding a path that does
+# not exist would have Docker create it, root-owned, in the host home directory.
+#
+# Credentials are a separate mount: opencode keeps its config under ~/.config
+# and its tokens under ~/.local/share, and only the latter is a secret. Nothing
+# reads either after the first start, so the file mount going stale when
+# opencode rewrites the host's auth.json (a replaced inode, see the allowlist
+# note below) does not matter here.
+if [ -d "${BOX_HOST_HOME}/.config/opencode" ]; then
+    mounts+=("${BOX_HOST_HOME}/.config/opencode:/host/opencode:ro")
+fi
+if [ -f "${BOX_HOST_HOME}/.local/share/opencode/auth.json" ]; then
+    mounts+=("${BOX_HOST_HOME}/.local/share/opencode/auth.json:/host/opencode-auth.json:ro")
 fi
 {
     printf 'services:\n  claude:\n    volumes:\n'
@@ -259,13 +288,133 @@ reload_proxy() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Staged media
+#
+# ~/.claudebox/media is what the box sees as /media, read-only. Material is
+# copied in from a removable drive rather than the drive being mounted through,
+# so the drive can be ejected at any time -- docker-compose.yaml has the reason
+# in full. The box sees additions immediately; no restart, no recreate.
+# ---------------------------------------------------------------------------
+
+# Resolve a staged entry's path, rejecting anything that is not a plain name
+# directly inside the staging directory. "media rm" deletes recursively, and a
+# name of "../Projects" would delete something else entirely.
+media_entry_path() {
+    case "${1}" in
+        ""|.|..|*/*) return 1 ;;
+    esac
+    printf '%s\n' "${MEDIA_DIR}/${1}"
+}
+
+media_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox media [ls]                list staged material
+       claudebox media add <path>...       copy a file or directory in
+       claudebox media rm <name>...        delete a staged entry
+
+"add" names each entry after the thing it copied, so
+  claudebox media add /media/dizzy/transfer/archive.zip
+is /media/archive.zip in the box. Re-running "add" on the same source
+refreshes that entry in place.
+USAGE
+}
+
+media_list() {
+    local entry found=""
+    for entry in "${MEDIA_DIR}"/*; do
+        # An unmatched glob comes back as the pattern itself.
+        [ -e "${entry}" ] || continue
+        found=1
+        printf '%s\t%s\n' \
+            "$(du -sh -- "${entry}" | cut -f1)" "$(basename -- "${entry}")"
+    done
+    if [ -z "${found}" ]; then
+        echo "claudebox: nothing staged -- 'claudebox media add <path>' copies material in" >&2
+        return 0
+    fi
+    echo "claudebox: ${MEDIA_DIR} -> /media in the box, read-only" >&2
+}
+
+media_add() {
+    local src name dest need have avail
+    if [ "$#" -eq 0 ]; then
+        media_usage
+        return 2
+    fi
+    for src in "$@"; do
+        # Strip trailing slashes. To rsync "dir/" means the CONTENTS of dir, and
+        # unpacking a drive's folder loose into the root of /media is never what
+        # was meant.
+        src="${src%"${src##*[!/]}"}"
+        if [ ! -e "${src}" ]; then
+            echo "claudebox: no such path: ${src}" >&2
+            return 1
+        fi
+        name="$(basename -- "${src}")"
+        if ! dest="$(media_entry_path "${name}")"; then
+            echo "claudebox: cannot stage ${src}: no usable name for it" >&2
+            return 1
+        fi
+
+        # Check the size first. The point of staging is that this directory
+        # lives on the internal disk, which is also the disk everything else on
+        # this host is on -- rsync discovering it is full halfway through a
+        # backup drive is a worse way to find that out.
+        echo "claudebox: measuring ${src}..." >&2
+        need="$(du -sb -- "${src}" 2>/dev/null | cut -f1)"
+        if [ -e "${dest}" ]; then
+            # A refresh only pays for the difference.
+            have="$(du -sb -- "${dest}" 2>/dev/null | cut -f1 || true)"
+            if [ -n "${need}" ] && [ -n "${have}" ]; then
+                need=$((need - have))
+                [ "${need}" -lt 0 ] && need=0
+            fi
+        fi
+        avail="$(df -B1 --output=avail "${MEDIA_DIR}" 2>/dev/null | tail -1 | tr -d ' ')"
+        if [ -n "${need}" ] && [ -n "${avail}" ] && [ "${need}" -gt "${avail}" ]; then
+            echo "claudebox: ${src} needs $(numfmt --to=iec "${need}") but only $(numfmt --to=iec "${avail}") is free" >&2
+            echo "claudebox: on ${MEDIA_DIR}. Stage a subdirectory instead, or free space." >&2
+            return 1
+        fi
+
+        if command -v rsync >/dev/null 2>&1; then
+            # --no-o/--no-g: -a asks to preserve owner and group, which needs
+            # root. Ownership here is meaningless anyway -- the box reads this
+            # as uid 1000 and that is the only reader.
+            rsync -a --no-o --no-g --info=progress2 -- "${src}" "${MEDIA_DIR}/"
+        else
+            # cp -a would try to preserve ownership and fail as a normal user.
+            cp -r --preserve=timestamps -- "${src}" "${MEDIA_DIR}/"
+        fi
+        echo "claudebox: staged /media/${name}" >&2
+    done
+}
+
+media_rm() {
+    local name dest
+    if [ "$#" -eq 0 ]; then
+        media_usage
+        return 2
+    fi
+    for name in "$@"; do
+        if ! dest="$(media_entry_path "${name}")" || [ ! -e "${dest}" ]; then
+            echo "claudebox: not staged: ${name}" >&2
+            return 1
+        fi
+        rm -rf -- "${dest}"
+        echo "claudebox: removed /media/${name}" >&2
+    done
+}
+
 case "${1:-}" in
     help|-h|--help)
         cat >&2 <<'USAGE'
-claudebox -- run Claude Code in an isolated container over ~/Projects
+claudebox -- run a coding agent in an isolated container over ~/Projects
 
   claudebox                  interactive session in the current directory
   claudebox <args...>        args are passed straight through to claude
+  claudebox opencode [args]  run opencode instead, args passed through to it
   claudebox shell [args]     bash in the box instead
 
   claudebox allow <domain>   permit a domain and reload the egress proxy
@@ -275,13 +424,30 @@ claudebox -- run Claude Code in an isolated container over ~/Projects
   claudebox allowed          show the egress allowlist
   claudebox denied           show requests the proxy has blocked
 
+  claudebox media add <path> copy material off a drive into the box's /media
+                             (the drive itself is not mounted -- eject freely)
+  claudebox media ls         list what is staged there
+  claudebox media rm <name>  delete a staged entry
+
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
 
 Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
                BOX_DDEV_PROJECT  which project's database is reachable as db:3306
 For Claude Code's own help:  claudebox shell -c 'claude --help'
+For opencode's own help:     claudebox opencode --help
 USAGE
+        exit 0
+        ;;
+
+    media)
+        shift
+        case "${1:-ls}" in
+            ls|list) media_list ;;
+            add)     shift; media_add "$@" ;;
+            rm)      shift; media_rm "$@" ;;
+            *)       media_usage; exit 2 ;;
+        esac
         exit 0
         ;;
 
@@ -404,6 +570,25 @@ if [ -t 0 ] && [ -t 1 ]; then
     exec_flags+=(-t)
 fi
 
+# Terminal capabilities. "docker exec -t" sets TERM=xterm and nothing else,
+# which leaves a full-screen TUI (opencode's especially) drawing in eight
+# colours.
+#
+# The host's TERM is only passed through when the image has a terminfo entry for
+# it. Modern terminals ship their own -- ghostty is xterm-ghostty, kitty is
+# xterm-kitty -- and Debian's ncurses has neither, so forwarding blindly would
+# trade dull colours for curses programs in the box (less, nano) failing on an
+# unknown terminal type. COLORTERM carries the truecolor answer both agents
+# actually look at, and needs no terminfo at all.
+if [ -n "${TERM:-}" ] && docker exec "${CONTAINER}" infocmp "${TERM}" >/dev/null 2>&1; then
+    exec_flags+=(-e "TERM=${TERM}")
+else
+    exec_flags+=(-e "TERM=xterm-256color")
+fi
+if [ -n "${COLORTERM:-}" ]; then
+    exec_flags+=(-e "COLORTERM=${COLORTERM}")
+fi
+
 # Nested containers route out through the dind sidecar's network namespace, so
 # they can reach the proxy but can't resolve its name (dind's embedded DNS
 # doesn't know about it). Hand the box the address so it can pass the proxy to
@@ -419,6 +604,16 @@ fi
 if [ "${1:-}" = "shell" ]; then
     shift
     exec docker exec "${exec_flags[@]}" "${CONTAINER}" bash "$@"
+fi
+
+# The box's other agent. Everything above is the same for both -- same box, same
+# allowlist, same DDEV bridging and the same working directory -- so this is
+# only a different program to hand the session to. Its own subcommands and flags
+# pass straight through: "claudebox opencode run '...'", "claudebox opencode
+# auth login".
+if [ "${1:-}" = "opencode" ]; then
+    shift
+    exec docker exec "${exec_flags[@]}" "${CONTAINER}" opencode "$@"
 fi
 
 exec docker exec "${exec_flags[@]}" "${CONTAINER}" claude "$@"

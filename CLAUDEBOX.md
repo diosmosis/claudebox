@@ -4,13 +4,14 @@ Context for Claude. Read this before modifying anything in `~/.claudebox/`.
 
 ## Purpose
 
-Run Claude Code against every project under `~/Projects` from a single isolated
-container, instead of installing it per-project or on the host.
+Run a coding agent — Claude Code or opencode — against every project under
+`~/Projects` from a single isolated container, instead of installing it
+per-project or on the host.
 
 Three requirements drove the design, in order:
 
 1. **One box, not one per project.** `~/Projects` is the root for all work.
-2. **Isolation.** Claude runs in its own container; the host filesystem is not
+2. **Isolation.** The agent runs in its own container; the host filesystem is not
    exposed beyond the shared source tree.
 3. **Reachability.** The box must be able to load DDEV project URLs
    (`https://<project>.ddev.site`) as if it were the host.
@@ -55,7 +56,7 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 
 | Container | Image | Role |
 |---|---|---|
-| `claudebox` | built from `Dockerfile` | Where Claude Code runs. No route off `claudebox_inner`. |
+| `claudebox` | built from `Dockerfile` | Where the agent runs — Claude Code or opencode, same container either way. No route off `claudebox_inner`. |
 | `claudebox-proxy` | built from `proxy/Dockerfile` | Squid forward proxy. The only container with egress. Also the only one that can reach `ddev-router`. |
 | `claudebox-dind` | `docker:dind-rootless` | Private rootless Docker daemon on `tcp://dind:2375`. |
 | `claudebox-ddev-relay` | built from `ddev-relay/Dockerfile` | Holds the host Docker socket; runs `ddev exec` in DDEV containers on the box's behalf. On `inner` only — no egress. See below. |
@@ -97,6 +98,47 @@ Each of these is doing real work. Changing one breaks something specific.
   orders mounts by path depth, so the volume lands on `/home/dizzy` first and
   the bind on `/home/dizzy/Projects` on top. Nothing else from the host home
   directory is exposed — no SSH keys, no cloud credentials.
+
+- **`/media` in the box is staged material, not the host's drives.** The source
+  is `~/.claudebox/media`, bind-mounted read-only, filled by `claudebox media
+  add <path>` (`ls`/`rm` alongside it). Each entry is named after what was
+  copied, re-running `add` refreshes it in place, and the command refuses a copy
+  that would not fit. Because the source is an ordinary directory under `/home`,
+  additions show up in a running box immediately — the old requirement to
+  recreate the container for a drive plugged in mid-session is gone with it.
+
+- **Binding the real `/media` was tried and reverted: it made removable drives
+  impossible to eject without quitting Docker Desktop.** Not a container
+  problem, and no bind flag fixes it. The engine here is a VM, and each entry in
+  Docker Desktop's file-sharing list is exported to it by a `virtiofsd` process
+  **on the host, started with the VM and killed only with the VM** — visible as
+  `~/.docker/desktop/virtiofs.sock{0,1}.pid`, one per shared directory, whose
+  logs bracket a whole Desktop session (`Client connected, servicing requests` …
+  `Client disconnected, shutting down`). It keeps an open fd for every inode the
+  guest looks up, so the moment the box walked into `/media/dizzy/<label>` those
+  fds sat on the *drive's* filesystem and `umount` returned `EBUSY`. `claudebox
+  stop` is a `compose down`: it removes containers, one layer above the share,
+  and changes nothing. Only stopping the VM released the drive. `:ro`,
+  `rprivate`, and sharing a single drive instead of `/media` all route through
+  the same process, so staging a copy is the fix — it pays a copy to keep the
+  drive ejectable at any moment. **Do not put `/media` back on the file-sharing
+  list.**
+
+- **Docker Desktop only passes through host paths on its file-sharing list.**
+  The engine is a VM reached over `~/.docker/desktop/docker.sock` (context
+  `desktop-linux`), not a plain host dockerd, and `FilesharingDirectories` in
+  `~/.docker/desktop/settings-store.json` reads `["/home"]` — which is the whole
+  reason `~/Projects` works. A bind of an unlisted path does not degrade to an
+  empty directory the way an unmounted source does; the container refuses to
+  start outright, with `mounts denied: The path /x is not shared from the host`.
+  **Any future mount of a host path outside `/home` needs adding here first, or
+  the box will not come up** — and needs weighing against the pin above, since
+  the entry is live for the whole Desktop session. Editing the key takes a
+  `docker desktop restart` (which stops every container on the host, DDEV
+  included); the GUI's Settings → Resources → File sharing writes the same key.
+  One consequence worth knowing: virtiofs presents shared files as the desktop
+  user, so a shared path shows as `dizzy:dizzy` in the box no matter what it is
+  on the host.
 
 - **The box's user is rebuilt at uid/gid 1000** to match the host user. The
   `node:22` base image already owns uid 1000, so `entrypoint`-adjacent Dockerfile
@@ -260,6 +302,7 @@ Each of these is doing real work. Changing one breaks something specific.
 |---|---|---|
 | Base image | `node:22-bookworm-slim` | node 22.23.1 |
 | Claude Code | 2.1.218 | installed via `npm i -g @anthropic-ai/claude-code` |
+| opencode | 1.18.14 | installed via `npm i -g opencode-ai`; a Bun binary, so it ignores `NODE_OPTIONS` |
 | Proxy | Squid 5.7 on `debian:bookworm-slim` | |
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
 | Host Docker | Docker Desktop on Linux, 29.6.2 | socket at `~/.docker/desktop/docker.sock` |
@@ -273,13 +316,14 @@ Each of these is doing real work. Changing one breaks something specific.
 |---|---|
 | `docker-compose.yaml` | The six services, three networks, two volumes |
 | `Dockerfile` | The claudebox image |
-| `entrypoint.sh` | Runs as root at start: installs the mkcert CA, seeds `~/.claude`, signals readiness |
+| `entrypoint.sh` | Runs as root at start: installs the mkcert CA, seeds `~/.claude` and opencode's config/credentials, signals readiness |
 | `ddev-shim` | The box's `ddev` (baked to `/usr/local/bin/ddev`); forwards `ddev exec` to the relay |
 | `ddev-relay/Dockerfile`, `ddev-relay/relay.mjs` | The scoped `ddev exec` relay image and server |
 | `ddev-http/Dockerfile`, `ddev-http/default.conf.template` | The `host.docker.internal` front door for nested containers |
 | `ddev-fixups`, `ddev-realip.conf` | Baked in as `claudebox-ddev-fixups`; prepares a DDEV web container for UI tests (client IP, path alias) |
 | `node-proxy-bootstrap.cjs` | Preloaded into every Node process via `NODE_OPTIONS`; DNS-preflight shim |
-| `box-CLAUDE.md` | Baked to `/etc/claude-code/CLAUDE.md`; what the box's Claude is told about its own environment |
+| `box-CLAUDE.md` | Baked to `/etc/claude-code/CLAUDE.md` **and** `/etc/claudebox/AGENTS.md`; what the box's agent is told about its own environment, one file for both |
+| `box-opencode.json` | Baked to `/etc/claudebox/opencode.json`; the config `OPENCODE_CONFIG` points at, whose only job is adding `AGENTS.md` to opencode's instructions |
 | `proxy/Dockerfile` | Squid image |
 | `proxy/squid.conf` | Baked-in proxy policy |
 | `proxy/allowlist.sh` | Expands `allowlist.conf` into Squid's ACL files; installed as `allowlist` |
@@ -293,6 +337,7 @@ Each of these is doing real work. Changing one breaks something specific.
 ```
 claudebox                  interactive session in the current directory
 claudebox -p '...'         flags/prompt passed straight to claude
+claudebox opencode [args]  opencode instead of claude, args passed straight to it
 claudebox shell            bash in the box
 claudebox rebuild          rebuild images (needed after Dockerfile/entrypoint edits)
 claudebox stop             stop the stack (volumes survive)
@@ -310,15 +355,77 @@ Env overrides: `BOX_WORKSPACE`, `BOX_USER`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`,
 
 1. Creates `ddev_default` if absent (DDEV reuses it as-is).
 2. Regenerates `docker-compose.override.yaml`: always the `~/.claudebox/plans →
-   ~/.claude/plans` bind (after `mkdir`ing the host side), plus optional host
-   mounts that actually exist (currently just `~/.gitconfig`) — binding a missing
-   path would make Docker create a directory in the host home directory.
+   ~/.claude/plans` bind (after `mkdir`ing the host side), plus the optional host
+   mounts that actually exist — `~/.gitconfig`, `~/.config/opencode` and
+   `~/.local/share/opencode/auth.json` — because binding a missing path would
+   make Docker create a directory in the host home directory.
 3. `compose up -d`, then **polls for `/run/claudebox.ready`** (see race below).
 4. Checks the proxy's copy of `allowlist.conf` against the host's and remounts
    it (restart + re-expand) if they differ.
 5. Resolves `ddev-router`'s IP and rewrites the proxy's `/etc/hosts`.
 6. Injects `CLAUDEBOX_PROXY=http://<proxy-ip>:3128` into the exec environment.
-7. `docker exec`s in as uid/gid 1000, mapping the host cwd 1:1.
+7. Sets `TERM` for the exec — the host's own if the image has a terminfo entry
+   for it, `xterm-256color` otherwise — and passes `COLORTERM` through. `docker
+   exec -t` sets `TERM=xterm` and nothing else, which leaves a full-screen TUI
+   drawing in eight colours; forwarding the host's blindly is not the fix
+   either, since ghostty's `xterm-ghostty` and kitty's `xterm-kitty` are absent
+   from Debian's ncurses and an unknown terminal type breaks `less` and `nano`
+   in the box. `COLORTERM` is what the TUIs read for truecolor and needs no
+   terminfo.
+8. `docker exec`s in as uid/gid 1000, mapping the host cwd 1:1, running
+   `claude`, `opencode` or `bash` depending on the subcommand.
+
+## Agents in the box
+
+Two agents share one container. `claudebox` starts Claude Code, `claudebox
+opencode` starts opencode, and everything around them is identical — same image,
+same allowlist, same DDEV bridging, same working directory, same startup checks.
+The subcommand only decides which program the final `docker exec` runs.
+
+| | Claude Code | opencode |
+|---|---|---|
+| Installed by | `npm i -g @anthropic-ai/claude-code` | `npm i -g opencode-ai` — a launcher whose real payload is a ~180MB Bun binary, pulled as a per-platform optional dependency |
+| Box notes | `/etc/claude-code/CLAUDE.md` (managed policy) | `/etc/claudebox/AGENTS.md`, via `OPENCODE_CONFIG=/etc/claudebox/opencode.json` |
+| Config seeded from host | `~/.claude` (minus per-machine state), `~/.claude.json` | `~/.config/opencode` |
+| Credentials seeded from host | inside `~/.claude` | `~/.local/share/opencode/auth.json` |
+| Version moves on | `claudebox rebuild` | `claudebox rebuild` only — `OPENCODE_DISABLE_AUTOUPDATE=1` |
+
+Both sets of box notes are the **same file**: `box-CLAUDE.md`, copied to two
+paths at build time. Everything in it describes the container rather than the
+reader, and two copies would drift.
+
+opencode has no managed-policy path of its own, hence the baked config.
+`OPENCODE_CONFIG` names an *additional* config rather than a replacement, so a
+global `~/.config/opencode/opencode.json` seeded from the host still loads
+alongside it. Check what actually resolved:
+
+```bash
+claudebox opencode debug config   # .instructions must contain /etc/claudebox/AGENTS.md
+```
+
+The two opencode host binds are built only when the paths exist, the same way
+`~/.gitconfig` is, so a host without opencode installed seeds nothing. Both are
+read-only and read exactly once: `entrypoint.sh` copies them into the HOME volume
+on first start, and from then on the box's copies are its own — authenticating
+inside the box never writes back to the host. Credentials are a separate mount
+because opencode keeps them under `~/.local/share`, not with the config, and only
+that half is a secret.
+
+Two things follow from opencode being a Bun binary rather than a Node program:
+
+- **It ignores `NODE_OPTIONS`**, so the DNS-preflight preload never loads into
+  it. It does not need it — Bun's `fetch` reads `HTTP_PROXY`/`HTTPS_PROXY`/
+  `NO_PROXY` on its own, and the cases the shim exists for are Node libraries'
+  `dns.resolve()` online checks.
+- **Self-update had to be disabled.** It would install into the HOME volume,
+  which then shadows the image's copy, survives `claudebox rebuild` (volumes do)
+  and drifts from what the Dockerfile says is installed.
+
+Providers are reached directly, so only the model API's own host needs to be on
+the allowlist — Anthropic's already is. `opencode.ai` and `models.opencode.ai`
+carry the auth flow and the model catalogue; blocking them does not stop opencode
+starting, it just falls back to a built-in catalogue, which is the kind of quiet
+degradation `claudebox denied` exists to explain.
 
 ## Egress allowlist
 
@@ -377,7 +484,8 @@ Currently allowed: `api.anthropic.com`, `claude.ai`, `claude.com`,
 `.ddev.site`, `.docker.io`, `production.cloudflare.docker.com`,
 `production.cloudfront.docker.com`, `*.github.com`, `*.githubusercontent.com`,
 `*.github.io`, `*.debian.org`, `*.alpinelinux.org`, `*.wordpress.org`,
-`*.woocommerce.com`, `*.packagist.org`, `getcomposer.org`.
+`*.woocommerce.com`, `*.packagist.org`, `getcomposer.org`, and for opencode
+`opencode.ai`, `*.opencode.ai`, `models.dev`.
 
 The `*.` entries were already written in the file before wildcards were
 supported, where they matched nothing. They take effect now — that widening is
@@ -891,6 +999,21 @@ claudebox shell -lc 'node -e "fetch(\"https://example.com/\").then(()=>console.l
 # End to end -- also the real check that the NODE_OPTIONS preload has not
 # broken Claude Code itself, since it is a node program too
 claudebox -p 'Reply with exactly: gate-ok'
+
+# Both agents are installed and start. The second line also proves the
+# launcher's dispatch: "opencode" must be consumed as a subcommand, not handed
+# to claude as an argument.
+claudebox shell -c 'claude --version; opencode --version'
+claudebox opencode --version
+
+# opencode's box notes are wired in -- the config it resolves must carry the
+# path, and the path must carry box-CLAUDE.md's content
+claudebox opencode debug config | jq -e '.instructions | index("/etc/claudebox/AGENTS.md")'
+claudebox shell -c 'head -1 /etc/claudebox/AGENTS.md'
+
+# The model catalogue host is reachable. Worth checking explicitly: a denial
+# here is silent, opencode just uses its built-in list.
+claudebox shell -c 'curl -s -o /dev/null -w "%{http_code}\n" https://models.opencode.ai/'
 ```
 
 With a DDEV project running, also check TLS still validates through the proxy
@@ -927,13 +1050,22 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   is how `libxshmfence1` got there — it is absent from every list upstream
   publishes. `ldd` cannot see libraries opened with `dlopen` at runtime, so
   finish by actually launching the browser.
-- **Change what the box's Claude knows about its environment** → `box-CLAUDE.md`,
+- **Change what the box's agent knows about its environment** → `box-CLAUDE.md`,
   then `claudebox rebuild`. It lands at `/etc/claude-code/CLAUDE.md`, Claude
-  Code's managed-policy memory path: loaded in every session in every directory
-  and not excludable by settings. Don't move it to `~/.claude/CLAUDE.md` — HOME
-  is a volume `entrypoint.sh` seeds once, so edits there would never land — or to
+  Code's managed-policy memory path (loaded in every session in every directory,
+  not excludable by settings), and at `/etc/claudebox/AGENTS.md`, which opencode
+  picks up through the baked config. Keep it about the box, not about either
+  agent, since both read it. Don't move it to `~/.claude/CLAUDE.md` — HOME is a
+  volume `entrypoint.sh` seeds once, so edits there would never land — or to
   `~/Projects/CLAUDE.md`, which the host's own sessions would then load. Keep it
   short; it costs context in every session.
+- **Add another agent** → install it in the `Dockerfile`, add a subcommand next
+  to `opencode` in the launcher, and give it `box-CLAUDE.md` by whatever
+  mechanism it has for always-on instructions (a baked path it is configured to
+  read, never a copy in HOME). Seed its host config the way the opencode binds
+  do it — conditional, read-only, copied once. Then check `claudebox denied`
+  after the first real session: the hosts an agent needs are rarely all
+  documented, and a blocked one usually degrades quietly rather than erroring.
 - **Change proxy policy** → `proxy/squid.conf`, then `claudebox rebuild`.
 - **Give the box the Docker socket or the `ddev` CLI** → read *No `ddev` CLI or
   Docker socket in the box* above first and surface the `exec-host:` host-RCE

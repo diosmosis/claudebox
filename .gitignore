@@ -1,0 +1,3 @@
+# Material staged for the box's /media by "claudebox media add" -- copies of
+# things that live on a drive somewhere, sometimes large. Never source.
+/media/
