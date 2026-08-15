@@ -4,3 +4,4 @@ services:
       - /home/dizzy/.claudebox/plans:/home/dizzy/.claude/plans
       - /home/dizzy/.gitconfig:/host/gitconfig:ro
       - /home/dizzy/.config/opencode:/host/opencode:ro
+      - /home/dizzy/.local/share/opencode/auth.json:/host/opencode-auth.json:ro

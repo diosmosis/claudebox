@@ -60,6 +60,60 @@ seed /host/gitconfig "${USER_HOME}/.gitconfig"
 seed /host/opencode           "${USER_HOME}/.config/opencode"
 seed /host/opencode-auth.json "${USER_HOME}/.local/share/opencode/auth.json"
 
+# Claude Code marketplaces and plugins the box always has.
+#
+# Installing a plugin writes into ~/.claude, which is the persistent volume
+# seeded above -- so one added by hand survives restarts but vanishes with the
+# volume, and a fresh box silently comes up without it. Listed here it is part
+# of the image instead: installed on any start that finds it missing, and a
+# single jq read on every other one. Both CLI calls are idempotent, so the
+# guard is an optimisation, not a correctness requirement -- it keeps a start
+# with no egress from stalling on a clone that cannot happen.
+#
+# One entry per line: "<marketplace source> <plugin>@<marketplace>". The source
+# is anything `claude plugin marketplace add` accepts -- an owner/repo, a URL,
+# or a path in the box. Naming a marketplace Claude Code already knows, as
+# claude-plugins-official is once ~/.claude has been seeded from the host, is
+# not a problem: adding it again is a no-op, and stating it here is what lets a
+# box built on a host with no ~/.claude still come up with the plugin.
+#
+# The egress each entry needs must be on allowlist.conf; the marketplace clone
+# from github.com is already covered. Neither plugin needs anything beyond that
+# at runtime, because the Dockerfile has already put both language servers on
+# PATH. phpantom's would otherwise be downloaded by the wrapper in the plugin's
+# bin/, but that build needs a newer glibc than this image has, so it is built
+# from source instead -- and the wrapper prefers what it finds on PATH.
+# typescript-lsp never downloads anything at all: it only declares the command
+# to run, so the image is the only thing that can supply it.
+#
+# A failure here is reported and stepped over: a box missing a plugin is a much
+# better outcome than a box that does not start.
+CLAUDE_PLUGINS="
+PHPantom-dev/phpantom_claude phpantom@phpantom
+anthropics/claude-plugins-official typescript-lsp@claude-plugins-official
+"
+installed_plugins="${USER_HOME}/.claude/plugins/installed_plugins.json"
+while read -r marketplace plugin; do
+    [ -n "${plugin}" ] || continue
+    if [ -f "${installed_plugins}" ] &&
+       jq -e --arg p "${plugin}" 'has("plugins") and (.plugins[$p] != null)' \
+           "${installed_plugins}" >/dev/null 2>&1; then
+        continue
+    fi
+    echo "claudebox: installing ${plugin} from ${marketplace}"
+    # env HOME, because runuser leaves root's in place and Claude Code would
+    # write the marketplace and the plugin into /root instead.
+    if ! out="$(runuser -u "${USER_NAME}" -- env HOME="${USER_HOME}" \
+                    claude plugin marketplace add "${marketplace}" 2>&1)" ||
+       ! out="$(runuser -u "${USER_NAME}" -- env HOME="${USER_HOME}" \
+                    claude plugin install "${plugin}" 2>&1)"; then
+        echo "claudebox: could not install ${plugin}: ${out}" >&2
+        echo "claudebox: the box starts without it" >&2
+    fi
+done <<EOF
+${CLAUDE_PLUGINS}
+EOF
+
 # Make "localhost:<port>" here mean what it means on a single-host CI runner.
 #
 # A container started inside dind publishes its ports onto DIND's interface, not

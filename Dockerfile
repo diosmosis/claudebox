@@ -25,6 +25,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# ---------------------------------------------------------------------------
+# The phpantom language server, built here rather than downloaded.
+#
+# The phpantom plugin (entrypoint.sh installs it) ships a wrapper that fetches
+# phpantom_lsp from GitHub Releases on first use. That artifact is linked
+# against glibc 2.39 and the runtime image below is bookworm, which has 2.36, so
+# the download succeeds and the binary then dies on a missing GLIBC_2.39 with no
+# musl build published as an alternative. Building the same tag against this
+# distro's glibc is the fix that leaves the runtime image's package set alone.
+#
+# The wrapper prefers a phpantom_lsp found on PATH over anything it would
+# download, so the binary copied out of here is what runs; PHPANTOM_NO_DOWNLOAD
+# below makes the fallback a clear error rather than a silent, unusable
+# download. Bump PHPANTOM_LSP_VERSION to take a new release.
+#
+# The build reaches github.com twice: the source clone, and a phpstorm-stubs
+# tarball that build.rs pins by commit and verifies against a SHA-256 in
+# stubs.lock. Both are the host's network -- "claudebox rebuild" runs on the
+# host daemon, not through the box's proxy -- so neither needs an allowlist
+# entry.
+#
+# This costs about nine minutes, and "claudebox rebuild" passes --no-cache, so
+# it is nine minutes on every rebuild rather than only the first. BuildKit cache
+# mounts on the crate registry and the target directory are the usual answer and
+# do nothing here: they come back empty on the next build on this host, and a
+# second --no-cache build with them took the same 8m20s as the first. Left out
+# rather than left in looking like an optimisation.
+# ---------------------------------------------------------------------------
+FROM rust:1-bookworm AS phpantom
+ARG PHPANTOM_LSP_VERSION=0.9.0
+RUN git clone --depth 1 --branch "${PHPANTOM_LSP_VERSION}" \
+        https://github.com/PHPantom-dev/phpantom_lsp.git /src \
+ && cd /src \
+ && PHPANTOM_GIT_VERSION="${PHPANTOM_LSP_VERSION}" cargo build --release --locked \
+ && strip target/release/phpantom_lsp
+
 FROM node:22-bookworm-slim
 
 ARG USERNAME=dizzy
@@ -52,6 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         php-xml \
         php-zip \
         procps \
+        python3 \
         ripgrep \
         rsync \
         socat \
@@ -197,6 +234,20 @@ RUN npm install -g @anthropic-ai/claude-code
 # HTTP_PROXY/HTTPS_PROXY/NO_PROXY on its own.
 RUN npm install -g opencode-ai
 
+# The language server behind the typescript-lsp plugin (entrypoint.sh installs
+# it). That plugin is only a declaration -- it says to run
+# `typescript-language-server --stdio` for .ts/.tsx/.js/.jsx and nothing more --
+# so without these two packages on PATH it installs cleanly and then every LSP
+# request fails. typescript comes along because the server is a wrapper around
+# tsserver: it prefers a workspace's own typescript and needs some copy to fall
+# back to when a project has no node_modules, which in this box is often the
+# case before an install has been run.
+#
+# Here rather than left to the box to install at runtime, for the same reason
+# opencode is: the image owns the version, and npm's registry is reachable at
+# build time on the host's network but only through the allowlist afterwards.
+RUN npm install -g typescript-language-server typescript
+
 # The node image already owns uid/gid 1000. Replace that user with one matching
 # the host user, so files written into the bind-mounted source tree keep the
 # right ownership instead of coming out root-owned.
@@ -250,6 +301,14 @@ COPY box-CLAUDE.md /etc/claude-code/CLAUDE.md
 # not about who is reading it, and two copies would drift.
 COPY box-CLAUDE.md    /etc/claudebox/AGENTS.md
 COPY box-opencode.json /etc/claudebox/opencode.json
+
+# The language server built in the phpantom stage at the top of this file. On
+# PATH, which is where the plugin's wrapper looks before it considers a
+# download; PHPANTOM_NO_DOWNLOAD turns the remaining fallback into an error,
+# since the only thing it could fetch is a binary this glibc cannot run.
+COPY --from=phpantom /src/target/release/phpantom_lsp /usr/local/bin/phpantom_lsp
+ENV PHPANTOM_NO_DOWNLOAD=1
+
 RUN chmod 0644 /etc/claude-code/CLAUDE.md \
                /etc/claudebox/AGENTS.md \
                /etc/claudebox/opencode.json
