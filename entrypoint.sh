@@ -198,14 +198,20 @@ chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}"
 # anything that looks like the cause -- and a top-level check does not see it,
 # because ~/.npm itself stays correctly owned.
 #
-# Two paths are pruned, both host binds that are not ours to rewrite: ~/Projects
-# is the source tree, and ~/.claude/plans is the host's plans directory, whose
-# files can legitimately appear as uid 0 in here through Docker Desktop's file
-# sharing while being correctly owned on the host.
+# Two paths are pruned, both host binds that are not ours to rewrite: the
+# workspace is the source tree, and ~/.claude/plans is the host's plans
+# directory, whose files can legitimately appear as uid 0 in here through Docker
+# Desktop's file sharing while being correctly owned on the host.
+#
+# The workspace prune uses its configured path, not a hardcoded ~/Projects: the
+# box's side of the bind is BOX_WORKSPACE, which need not sit under ~ at all. A
+# workspace outside ${USER_HOME} simply never matches, which is correct -- the
+# sweep does not reach it either.
+WORKSPACE="${CLAUDEBOX_WORKSPACE:-${USER_HOME}/Projects}"
 USER_UID="$(id -u "${USER_NAME}")"
 USER_GID="$(id -g "${USER_NAME}")"
 fixed="$(find "${USER_HOME}" \
-    -path "${USER_HOME}/Projects" -prune -o \
+    -path "${WORKSPACE}" -prune -o \
     -path "${USER_HOME}/.claude/plans" -prune -o \
     \( ! -uid "${USER_UID}" -o ! -gid "${USER_GID}" \) \
     -exec chown -h "${USER_NAME}:${USER_NAME}" {} + -print 2>/dev/null | wc -l)"

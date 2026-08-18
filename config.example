@@ -1,0 +1,46 @@
+# claudebox settings for this machine. Copy to "config" next to this file:
+#
+#   cp ~/.claudebox/config.example ~/.claudebox/config
+#
+# Sourced as shell by the launcher, so it is plain assignments (and anything
+# else bash accepts, though there is rarely a reason). The environment wins over
+# what is set here, so a one-off override still works:
+#
+#   BOX_WORKSPACE_HOST=/mnt/elsewhere claudebox
+#
+# "config" is gitignored: it describes this machine, not the box's design.
+
+# --- the workspace ---------------------------------------------------------
+
+# Where the box sees the source tree. Leave this alone unless you have a reason:
+# everything in the box, and every path it prints, is built on it.
+#BOX_WORKSPACE="${HOME}/Projects"
+
+# The host directory bound there. Defaults to BOX_WORKSPACE, which keeps paths
+# identical inside and out. Point it elsewhere to work on a tree that lives on
+# another drive -- an external SSD, or a removable drive carried between
+# machines -- while the box still sees a plain ~/Projects:
+#BOX_WORKSPACE_HOST=/media/dizzy/transfer/Projects
+
+# --- everything else -------------------------------------------------------
+
+# The box user and its ids. Default to yours; changing them means rebuilding.
+#BOX_USER="$(id -un)"
+#BOX_UID="$(id -u)"
+#BOX_GID="$(id -g)"
+
+# Which host home the launcher reads optional config from (~/.gitconfig,
+# opencode's config and credentials).
+#BOX_HOST_HOME="${HOME}"
+
+# The mkcert root CA to trust, so https://*.ddev.site validates in the box.
+#BOX_MKCERT_CA="${HOME}/.local/share/mkcert/rootCA.pem"
+
+# Which DDEV project's database is reachable as db:3306. Auto-detected when
+# exactly one project is running; pin it when several are.
+#BOX_DDEV_PROJECT=matomo
+
+# AppArmor profile for the rootless dind sidecar. On Ubuntu 24.04 the named
+# profile is required -- see apparmor/claudebox-dind. On a host with no AppArmor
+# confinement, "unconfined" is right.
+#BOX_DIND_APPARMOR=unconfined

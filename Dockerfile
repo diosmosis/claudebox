@@ -281,6 +281,15 @@ COPY ddev-realip.conf /usr/local/share/claudebox/ddev-realip.conf
 RUN chmod 0755 /usr/local/bin/claudebox-ddev-fixups \
  && chmod 0644 /usr/local/share/claudebox/ddev-realip.conf
 
+# Deletes gitignored build output from the workspace, which matters when the
+# workspace is a removable drive carrying source between machines. In here
+# rather than only on the host because the box is where the tree is worked on:
+# the agent can strip and reinstall in one place, and "claudebox strip" on the
+# host is a wrapper around this same script. See strip-artifacts for the
+# gitignore rule that keeps it from deleting a committed vendor/.
+COPY strip-artifacts /usr/local/bin/claudebox-strip-artifacts
+RUN chmod 0755 /usr/local/bin/claudebox-strip-artifacts
+
 # Claude Code's managed-policy memory location on Linux. Loaded at the start of
 # every session in every directory in the box, and not excludable by settings --
 # so the box's Claude always knows it is in a container, that egress is

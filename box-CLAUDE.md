@@ -11,8 +11,13 @@ and run `claudebox rebuild`.
 
 ## Filesystem
 
-- `~/Projects` is the host's source tree, bind-mounted at the same absolute path
-  it has on the host. Paths you report are directly clickable outside the box.
+- `~/Projects` is the host's source tree, bind-mounted. Normally it is the same
+  absolute path on the host, so paths you report are directly clickable outside
+  the box. It can be configured to a different host directory — an external
+  drive, say — and then it is not: `$CLAUDEBOX_WORKSPACE` is the tree's path in
+  here and `$CLAUDEBOX_WORKSPACE_HOST` the host directory behind it. When those
+  two differ, translate the prefix before naming a path the host has to act on,
+  and say which side you mean.
 - `/media` is **not** the host's drives. It is `~/.claudebox/media` on the host,
   **read-only**: material staged there deliberately with `claudebox media add`.
   Read from it freely; writes fail. If something expected is missing, the answer
@@ -20,6 +25,13 @@ and run `claudebox rebuild`.
   directory, and never suggest mounting the drive itself. Staging exists so
   drives can be ejected while the box runs; a bind of the real `/media` pins
   them until Docker Desktop is quit.
+- `claudebox-strip-artifacts` deletes gitignored build output (`node_modules`,
+  `vendor`, `target`, …) from the workspace, asking first. Reach for it when the
+  workspace is short of space — `df ~/Projects` — or before the host ejects a
+  removable workspace, since that drive should carry source, not artifacts that
+  are machine-specific anyway. It never touches a directory the project does not
+  ignore, so a committed `vendor/` is safe; `--dry-run` reports without deleting.
+  Reinstalling afterwards is yours to do (`npm ci`, `composer install`, …).
 - Nothing else of the host is visible. `~` is a container-private volume.
 - Plans written to `~/.claude/plans` land in `~/.claudebox/plans` on the host.
 

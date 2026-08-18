@@ -18,7 +18,8 @@
 #   claudebox allowed         show the egress allowlist
 #   claudebox denied          show requests the proxy has blocked
 #
-# Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA,
+# Env overrides: BOX_WORKSPACE, BOX_WORKSPACE_HOST, BOX_USER, BOX_HOST_HOME,
+#               BOX_MKCERT_CA,
 #               BOX_DDEV_PROJECT (which project's database is reachable as db:3306)
 set -euo pipefail
 
@@ -40,7 +41,90 @@ COMPOSE=(docker compose \
     -f "${BOX_DIR}/docker-compose.yaml" \
     -f "${BOX_DIR}/docker-compose.override.yaml")
 
+# ---------------------------------------------------------------------------
+# Settings file
+#
+# ~/.claudebox/config, sourced as shell. It holds the settings that describe
+# THIS machine -- most of all which host directory is the workspace, which is
+# not something to retype or keep in a shell profile when the answer is a
+# property of the box.
+#
+# The environment still wins, so a one-off stays a one-off:
+#   BOX_WORKSPACE_HOST=/mnt/other claudebox
+# works even when the file says otherwise. That is the whole reason for the
+# save/restore below rather than sourcing and hoping: a sourced assignment is
+# unconditional and would silently beat the command line.
+#
+# Only the names listed here are honoured. A file is a poor place to discover
+# that a setting was misspelled, and enumerating them means "claudebox config"
+# can print exactly what is settable.
+# ---------------------------------------------------------------------------
+BOX_CONFIG="${BOX_CONFIG:-${BOX_DIR}/config}"
+BOX_SETTINGS=(
+    BOX_WORKSPACE BOX_WORKSPACE_HOST
+    BOX_USER BOX_UID BOX_GID BOX_HOST_HOME
+    BOX_MKCERT_CA BOX_DDEV_PROJECT BOX_DIND_APPARMOR
+)
+if [ -f "${BOX_CONFIG}" ]; then
+    declare -A _from_env=()
+    for _s in "${BOX_SETTINGS[@]}"; do
+        # ${!v+set} distinguishes "unset" from "set but empty" -- an empty value
+        # in the environment is still a deliberate one.
+        if [ -n "${!_s+set}" ]; then
+            _from_env["${_s}"]="${!_s}"
+        fi
+    done
+    # shellcheck source=/dev/null
+    . "${BOX_CONFIG}" || {
+        echo "claudebox: ${BOX_CONFIG} failed to parse; fix it or move it aside" >&2
+        exit 2
+    }
+    for _s in "${!_from_env[@]}"; do
+        printf -v "${_s}" '%s' "${_from_env[${_s}]}"
+    done
+    unset _s _from_env
+fi
+
+# The workspace has two paths, and they are only the same by default.
+#
+# BOX_WORKSPACE is where the box sees the source tree; BOX_WORKSPACE_HOST is the
+# directory on the host that is bound there. Keeping them equal is what makes
+# paths the box prints clickable on the host, so BOX_WORKSPACE_HOST defaults to
+# BOX_WORKSPACE and everything stays 1:1 unless it is set.
+#
+# Set BOX_WORKSPACE_HOST alone to keep the tree somewhere else -- an external or
+# removable drive, say -- while the box still sees a plain ~/Projects. Doing it
+# the other way round, by pointing BOX_WORKSPACE at the drive so both sides
+# match, works too, but the box then carries the drive's path everywhere and a
+# mount point under /media collides with the box's own staged-material mount.
+#
+# Two things to know before moving the workspace onto a removable drive:
+#   - The path has to be on Docker Desktop's file-sharing list, which by default
+#     here is /home only. require_workspace below checks this and says what to
+#     do; without it the container refuses to start.
+#   - A shared host path is pinned by the VM's virtiofsd for as long as Docker
+#     Desktop runs, so the drive cannot be ejected until Desktop is quit -- the
+#     reason /media in the box is staged copies instead of the real drives. For
+#     material only to be read from, "claudebox media add" is the better tool;
+#     this is for a tree to work in.
 export BOX_WORKSPACE="${BOX_WORKSPACE:-${HOME}/Projects}"
+export BOX_WORKSPACE_HOST="${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE}}"
+# Strip a trailing slash from each: they are compared and concatenated as string
+# prefixes below, where "/x/" and "/x" would not match.
+BOX_WORKSPACE="${BOX_WORKSPACE%/}"
+BOX_WORKSPACE_HOST="${BOX_WORKSPACE_HOST%/}"
+for _ws_var in BOX_WORKSPACE BOX_WORKSPACE_HOST; do
+    # Compose reads a relative volume source as a NAMED VOLUME, not a path, so a
+    # relative setting here would come up as an empty tree rather than an error.
+    case "${!_ws_var}" in
+        /?*) ;;
+        *)
+            echo "claudebox: ${_ws_var} must be an absolute path (got '${!_ws_var}')" >&2
+            exit 2
+            ;;
+    esac
+done
+unset _ws_var
 export BOX_HOST_HOME="${BOX_HOST_HOME:-${HOME}}"
 export BOX_USER="${BOX_USER:-$(id -un)}"
 export BOX_UID="${BOX_UID:-$(id -u)}"
@@ -109,6 +193,86 @@ fi
     printf '      - %s\n' "${mounts[@]}"
 } > "${BOX_DIR}/docker-compose.override.yaml"
 
+# Translate a host path into the path the box sees, or fail if it is outside the
+# workspace -- which is the same thing as "the box cannot see it at all", since
+# the workspace is the only host tree bound in. Identity when the two workspace
+# roots are equal, so the default configuration passes everything through.
+box_path() {
+    case "${1}" in
+        "${BOX_WORKSPACE_HOST}")   printf '%s\n' "${BOX_WORKSPACE}" ;;
+        "${BOX_WORKSPACE_HOST}"/*) printf '%s\n' "${BOX_WORKSPACE}${1#"${BOX_WORKSPACE_HOST}"}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Refuse to bring the box up against a workspace that is not really there.
+#
+# Every failure below is one Docker reports late and badly, or not at all: a
+# missing bind source is silently created (root-owned, and on a removable drive's
+# mount point that also means writing to the internal disk under it), and a host
+# path outside Docker Desktop's file-sharing list stops the container from
+# starting with an error that names the path but not the setting.
+require_workspace() {
+    local store shared entry ok=""
+
+    if [ ! -d "${BOX_WORKSPACE_HOST}" ]; then
+        echo "claudebox: workspace ${BOX_WORKSPACE_HOST} does not exist (or is not a directory)" >&2
+        if [ "${BOX_WORKSPACE_HOST}" != "${BOX_WORKSPACE}" ]; then
+            echo "claudebox: it is set by BOX_WORKSPACE_HOST -- if that is a removable drive, mount it first." >&2
+        fi
+        exit 1
+    fi
+
+    # An empty workspace is legitimate on a first run, so this is a warning. It
+    # is also exactly what an unmounted drive's mount point looks like, and the
+    # box coming up over one is a session that quietly sees no projects.
+    if [ -z "$(ls -A -- "${BOX_WORKSPACE_HOST}" 2>/dev/null)" ]; then
+        echo "claudebox: warning: ${BOX_WORKSPACE_HOST} is empty; the box will see no projects" >&2
+    fi
+
+    # Docker Desktop exports only the host paths on its file-sharing list into
+    # the engine VM. Anything else fails at container create with "mounts
+    # denied", one layer below this script. Advisory: if the list cannot be read
+    # (no jq) the check is skipped rather than guessed at.
+    #
+    # Gated on the ACTIVE CONTEXT, not on the settings file existing: a native
+    # dockerd binds host paths directly and shares nothing, so the list means
+    # nothing to it -- and the file outlives Docker Desktop on a host that has
+    # moved off it, which would otherwise leave this rejecting perfectly good
+    # paths for a reason that no longer applies.
+    store="${BOX_HOST_HOME}/.docker/desktop/settings-store.json"
+    if [ ! -f "${store}" ] || ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    case "$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null || true)" in
+        *"/.docker/desktop/docker.sock") ;;
+        *) return 0 ;;
+    esac
+    shared="$(jq -r '.FilesharingDirectories[]?' "${store}" 2>/dev/null || true)"
+    if [ -z "${shared}" ]; then
+        return 0
+    fi
+    while IFS= read -r entry; do
+        entry="${entry%/}"
+        case "${BOX_WORKSPACE_HOST}" in
+            "${entry}"|"${entry}"/*) ok=1; break ;;
+        esac
+    done <<< "${shared}"
+    if [ -n "${ok}" ]; then
+        return 0
+    fi
+
+    echo "claudebox: ${BOX_WORKSPACE_HOST} is not shared with Docker Desktop, so the box cannot" >&2
+    echo "claudebox: start over it. Shared now: $(printf '%s' "${shared}" | tr '\n' ' ')" >&2
+    echo "claudebox: Add it in Docker Desktop > Settings > Resources > File sharing, then" >&2
+    echo "claudebox: 'Apply & restart'. Note what that costs: a shared path is held open by" >&2
+    echo "claudebox: the VM's virtiofsd for as long as Docker Desktop runs, so a drive shared" >&2
+    echo "claudebox: this way cannot be ejected until Desktop is quit. For material you only" >&2
+    echo "claudebox: need to read, 'claudebox media add <path>' copies it in and keeps the" >&2
+    echo "claudebox: drive ejectable." >&2
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Point DDEV hostnames at ddev-router
 #
@@ -175,7 +339,7 @@ write_ddev_hosts() {
 # works there. Never fatal -- a box that comes up without this is still a usable
 # box, it just cannot produce CI-comparable screenshots, so say so and continue.
 apply_ddev_fixups() {
-    local approot
+    local approot boxroot
     if [ "${BOX_DDEV_PROJECT}" = "none" ]; then
         return 0
     fi
@@ -187,12 +351,20 @@ apply_ddev_fixups() {
         echo "claudebox: could not locate ${BOX_DDEV_PROJECT}'s directory; skipped web-container setup" >&2
         return 0
     fi
-    if docker exec -u "${BOX_UID}:${BOX_GID}" -w "${approot}" "${CONTAINER}" \
+    # approot is a host path; the fixups run in the box, which sees the project
+    # under its own workspace root. Outside the workspace it is not visible in
+    # there at all, and there is nothing to run the fixups against.
+    if ! boxroot="$(box_path "${approot}")"; then
+        echo "claudebox: ${BOX_DDEV_PROJECT} is at ${approot}, outside the workspace" >&2
+        echo "claudebox: (${BOX_WORKSPACE_HOST}); skipped web-container setup" >&2
+        return 0
+    fi
+    if docker exec -u "${BOX_UID}:${BOX_GID}" -w "${boxroot}" "${CONTAINER}" \
             claudebox-ddev-fixups >/dev/null 2>&1; then
         echo "claudebox: ${BOX_DDEV_PROJECT} web container ready for UI tests (client IP, path alias)" >&2
     else
         echo "claudebox: could NOT prepare ${BOX_DDEV_PROJECT}'s web container -- screenshots will not" >&2
-        echo "claudebox: match CI. In the box: cd ${approot} && claudebox-ddev-fixups" >&2
+        echo "claudebox: match CI. In the box: cd ${boxroot} && claudebox-ddev-fixups" >&2
     fi
 }
 
@@ -429,10 +601,36 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
   claudebox media ls         list what is staged there
   claudebox media rm <name>  delete a staged entry
 
+  claudebox eject            release a removable workspace: stop everything
+                             holding it, unmount, then close the encrypted
+                             volume -- which is what proves it is released. A
+                             bare "udisksctl unmount" can report success while a
+                             container still holds the drive. --power-off also
+                             powers the disk down.
+
+  claudebox strip [args]     delete gitignored build output (node_modules,
+                             vendor, target...) from the workspace -- for a
+                             workspace on a drive, which should carry source and
+                             not artifacts. Lists and asks first; --dry-run to
+                             only look. Same script the box's agent can run as
+                             claudebox-strip-artifacts.
+
+  claudebox fix-perms        give the workspace back to you after a container
+                             process wrote into it as root (native engine only:
+                             Docker Desktop squashed every uid to yours)
+
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
 
-Env overrides: BOX_WORKSPACE, BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+Env overrides: BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
+               BOX_WORKSPACE       where the box sees the tree  (default ~/Projects)
+               BOX_WORKSPACE_HOST  the host directory bound there (default: the same,
+                                   which is what keeps printed paths clickable). Point
+                                   it elsewhere -- an external drive, say -- to work on
+                                   a tree that does not live under ~. The path must be
+                                   on Docker Desktop's file-sharing list, and sharing a
+                                   removable drive pins it until Desktop is quit; for
+                                   read-only material use "claudebox media add" instead.
                BOX_DDEV_PROJECT  which project's database is reachable as db:3306
 For Claude Code's own help:  claudebox shell -c 'claude --help'
 For opencode's own help:     claudebox opencode --help
@@ -452,9 +650,245 @@ USAGE
         ;;
 
     stop)     exec "${COMPOSE[@]}" down ;;
-    rebuild)  "${COMPOSE[@]}" build --no-cache && exec "${COMPOSE[@]}" up -d --force-recreate ;;
+    rebuild)  require_workspace
+              "${COMPOSE[@]}" build --no-cache && exec "${COMPOSE[@]}" up -d --force-recreate ;;
 
     allowed)  exec grep -vE '^\s*(#|$)' "${ALLOWLIST}" ;;
+
+    eject)
+        # Release a removable workspace, in the one order that actually works.
+        #
+        # The trap this exists for, measured on this host: with the box running,
+        # "udisksctl unmount" SUCCEEDS and the mountpoint disappears -- while the
+        # container's mount namespace still holds the filesystem. It goes on
+        # reading the tree, the device stays busy, and nothing in that success
+        # message says the drive is unsafe to pull. So: stop everything holding
+        # it first, then unmount, then prove the release by locking (LUKS) --
+        # and only claim it is safe when a step actually confirmed it.
+        shift
+        eject_power_off=""
+        case "${1:-}" in
+            --power-off) eject_power_off=1 ;;
+            "") ;;
+            *) echo "usage: claudebox eject [--power-off]" >&2; exit 2 ;;
+        esac
+
+        if ! command -v findmnt >/dev/null 2>&1 || ! command -v udisksctl >/dev/null 2>&1; then
+            echo "claudebox: eject needs findmnt and udisksctl (util-linux, udisks2)" >&2
+            exit 1
+        fi
+        if [ ! -d "${BOX_WORKSPACE_HOST}" ]; then
+            # The device is identified from the workspace path, so a workspace
+            # that is already gone leaves nothing to work from. Worth saying what
+            # to do anyway: "unmounted but still unlocked" is a real state to be
+            # in -- it is where a half-finished eject stops -- and it is the one
+            # that looks finished without being finished.
+            echo "claudebox: ${BOX_WORKSPACE_HOST} is not there; nothing to eject" >&2
+            echo "claudebox: (if a drive is unmounted but its encrypted volume is still open," >&2
+            echo "claudebox: close it with 'udisksctl lock -b /dev/<partition>' before unplugging)" >&2
+            exit 1
+        fi
+
+        eject_src="$(findmnt -no SOURCE --target "${BOX_WORKSPACE_HOST}" 2>/dev/null || true)"
+        eject_mnt="$(findmnt -no TARGET --target "${BOX_WORKSPACE_HOST}" 2>/dev/null || true)"
+        if [ -z "${eject_mnt}" ]; then
+            echo "claudebox: cannot tell what ${BOX_WORKSPACE_HOST} is mounted from" >&2
+            exit 1
+        fi
+        # A workspace on the root filesystem has nothing to eject, and unmounting
+        # what it is really asking about would be a very bad day.
+        if [ "${eject_mnt}" = "/" ]; then
+            echo "claudebox: ${BOX_WORKSPACE_HOST} is on the root filesystem, not a removable" >&2
+            echo "claudebox: mount -- nothing to eject." >&2
+            exit 1
+        fi
+        echo "claudebox: workspace is ${eject_src} at ${eject_mnt}" >&2
+
+        # DDEV projects living on the drive pin it exactly as the box does, and
+        # they are not part of this compose stack. Stop the ones that are on it;
+        # projects elsewhere are left alone.
+        if command -v ddev >/dev/null 2>&1; then
+            ddev_on_drive="$(ddev list -j 2>/dev/null \
+                | jq -r --arg m "${eject_mnt}/" \
+                    '.raw[]? | select((.status // "") == "running")
+                     | select((.approot + "/") | startswith($m)) | .name' 2>/dev/null || true)"
+            if [ -n "${ddev_on_drive}" ]; then
+                echo "claudebox: stopping DDEV projects on this drive: $(printf '%s' "${ddev_on_drive}" | tr '\n' ' ')" >&2
+                # shellcheck disable=SC2086
+                ddev stop ${ddev_on_drive} >/dev/null 2>&1 || \
+                    echo "claudebox: could not stop them; the unmount below will say so" >&2
+            fi
+        fi
+
+        echo "claudebox: stopping the box" >&2
+        "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+
+        if findmnt -no TARGET "${eject_mnt}" >/dev/null 2>&1; then
+            if ! udisksctl unmount -b "${eject_src}" >&2; then
+                echo "claudebox: could not unmount ${eject_src}; something still has it open." >&2
+                echo "claudebox: 'lsof ${eject_mnt}' (or fuser -vm) will name it." >&2
+                exit 1
+            fi
+        else
+            echo "claudebox: already unmounted" >&2
+        fi
+
+        # Locking is the proof. It fails with "Device or resource busy" while
+        # anything still holds the filesystem -- including a container namespace
+        # that survived the unmount -- so a success here is the real answer and
+        # an unmount on its own is not.
+        #
+        # PKNAME is read with -s (the inverse tree). Without it lsblk reports an
+        # EMPTY parent for a device-mapper node -- PKNAME is only filled in
+        # walking downwards -- and the first version of this code took that
+        # empty string as "not encrypted", skipped the lock, and reported the
+        # drive safe to unplug while the LUKS volume was still open. Anything
+        # here that cannot prove a release now says so instead.
+        eject_type="$(lsblk -no TYPE "${eject_src}" 2>/dev/null | head -1 || true)"
+        eject_parent="$(lsblk -sno PKNAME "${eject_src}" 2>/dev/null | head -1 || true)"
+
+        if [ "${eject_type}" = "crypt" ]; then
+            if [ -z "${eject_parent}" ]; then
+                echo "claudebox: ${eject_src} is an encrypted volume but its backing device could" >&2
+                echo "claudebox: not be identified, so it cannot be closed here. It is unmounted;" >&2
+                echo "claudebox: close it in your file manager before unplugging." >&2
+                exit 1
+            fi
+            if ! udisksctl lock -b "/dev/${eject_parent}" >&2; then
+                echo "claudebox: unmounted, but the encrypted volume will not close -- something" >&2
+                echo "claudebox: still holds it. Do NOT unplug yet." >&2
+                exit 1
+            fi
+            eject_disk="$(lsblk -sno PKNAME "/dev/${eject_parent}" 2>/dev/null | head -1 || true)"
+            eject_proved=1
+        else
+            eject_disk="${eject_parent}"
+            eject_proved=""
+        fi
+
+        if [ -n "${eject_power_off}" ] && [ -n "${eject_disk}" ]; then
+            if udisksctl power-off -b "/dev/${eject_disk}" >&2; then
+                eject_proved=1
+            else
+                echo "claudebox: could not power the disk down" >&2
+            fi
+        fi
+
+        if [ -n "${eject_proved}" ]; then
+            echo "claudebox: ${eject_mnt} released -- safe to unplug" >&2
+        else
+            # Plain filesystem, no power-off asked for: the unmount returned
+            # success, and on this stack that alone has been seen to mean
+            # nothing. Say what is and is not known rather than inventing
+            # confidence.
+            echo "claudebox: ${eject_mnt} unmounted. That is not proof the kernel released the" >&2
+            echo "claudebox: device -- rerun with --power-off, which fails if anything still" >&2
+            echo "claudebox: holds it, to be sure before unplugging." >&2
+        fi
+        exit 0
+        ;;
+
+    strip)
+        # Delete gitignored build output from the workspace. The work is
+        # claudebox-strip-artifacts in the box -- the same script the box's agent
+        # runs -- because the tree is mounted read-write in there as the box
+        # user, so nothing here needs to touch the host filesystem itself.
+        #
+        # -t when this is a terminal: the script asks before deleting, and a
+        # confirmation prompt that cannot be answered is just a refusal.
+        shift
+        if ! docker exec "${CONTAINER}" true 2>/dev/null; then
+            echo "claudebox: the box is not running; start it first" >&2
+            exit 1
+        fi
+        strip_flags=(-i -u "${BOX_UID}:${BOX_GID}" -w "${BOX_WORKSPACE}")
+        if [ -t 0 ] && [ -t 1 ]; then
+            strip_flags+=(-t)
+        fi
+        exec docker exec "${strip_flags[@]}" "${CONTAINER}" \
+            claudebox-strip-artifacts "$@"
+        ;;
+
+    fix-perms)
+        # Give the workspace back to you after a container process wrote into it
+        # as root.
+        #
+        # Docker Desktop made this impossible: its virtiofsd squashed every uid
+        # to 1000 in both directions, so a root write in a container came back
+        # owned by you. A native engine passes ownership straight through, and
+        # anything a root process in a container creates in the tree is owned by
+        # root on the host -- which the box, running as ${BOX_UID}, then cannot
+        # touch. (That squashing is also why CLAUDEBOX.md says never to widen
+        # entrypoint.sh's sweep to the workspace: ownership there used to be an
+        # artifact. It is real now, and this is the sweep for it.)
+        #
+        # Run as root INSIDE the box rather than with sudo out here: chown needs
+        # root, the box has it on the same bind, and the host user does not need
+        # to hand this script any privilege at all.
+        if ! docker exec "${CONTAINER}" true 2>/dev/null; then
+            echo "claudebox: the box is not running; start it first" >&2
+            exit 1
+        fi
+
+        # Resolve the target ids from BOX_USER's passwd entry, NOT from
+        # BOX_UID/BOX_GID.
+        #
+        # Those default to "$(id -u)"/"$(id -g)", which are the ids of the
+        # INVOKING PROCESS -- and a process running under "sg docker" or
+        # "newgrp" has the group it switched to as its primary, not the user's
+        # own. This command recursively chowns a whole source tree, so taking
+        # that as the target rewrites every file in the workspace to the wrong
+        # group. That is not hypothetical: it happened here, to 230k files,
+        # while this very command was being tested through "sg docker -c".
+        # Everywhere else BOX_GID is only ever handed to "docker exec -u", where
+        # a wrong value affects one process and nothing on disk.
+        fix_uid="$(id -u "${BOX_USER}" 2>/dev/null || true)"
+        fix_gid="$(id -g "${BOX_USER}" 2>/dev/null || true)"
+        if [ -z "${fix_uid}" ] || [ -z "${fix_gid}" ]; then
+            echo "claudebox: cannot resolve ${BOX_USER}'s uid/gid on this host" >&2
+            exit 1
+        fi
+
+        echo "claudebox: scanning ${BOX_WORKSPACE_HOST} for files not owned by ${fix_uid}:${fix_gid}..." >&2
+        # Count before changing anything. A recursive chown is not something to
+        # discover the scope of afterwards, and a number in the thousands means
+        # the target ids are wrong far more often than it means the workspace is
+        # genuinely that broken.
+        mismatched="$(docker exec -u 0 "${CONTAINER}" \
+            find "${BOX_WORKSPACE}" \
+                \( ! -uid "${fix_uid}" -o ! -gid "${fix_gid}" \) \
+                -print 2>/dev/null | wc -l)"
+        if [ "${mismatched}" -eq 0 ]; then
+            echo "claudebox: nothing to fix" >&2
+            exit 0
+        fi
+        if [ "${mismatched}" -gt 1000 ]; then
+            echo "claudebox: ${mismatched} files do not match. That is a lot -- check that" >&2
+            echo "claudebox: ${fix_uid}:${fix_gid} is really who should own ${BOX_WORKSPACE_HOST}" >&2
+            echo "claudebox: before continuing." >&2
+            if [ ! -t 0 ]; then
+                echo "claudebox: refusing to chown that many files non-interactively." >&2
+                exit 1
+            fi
+            printf 'claudebox: chown %s files to %s:%s? [y/N] ' \
+                "${mismatched}" "${fix_uid}" "${fix_gid}" >&2
+            read -r reply
+            case "${reply}" in
+                y|Y|yes|YES) ;;
+                *) echo "claudebox: nothing changed" >&2; exit 1 ;;
+            esac
+        fi
+
+        # -h so a symlink is retargeted rather than its destination, which may
+        # sit outside the tree.
+        reclaimed="$(docker exec -u 0 "${CONTAINER}" \
+            find "${BOX_WORKSPACE}" \
+                \( ! -uid "${fix_uid}" -o ! -gid "${fix_gid}" \) \
+                -exec chown -h "${fix_uid}:${fix_gid}" {} + -print 2>/dev/null \
+            | wc -l)"
+        echo "claudebox: reclaimed ${reclaimed} file(s)" >&2
+        exit 0
+        ;;
 
     denied)
         # TCP_DENIED is what Squid logs for a request the allowlist refused.
@@ -517,6 +951,8 @@ esac
 # Bring the box up
 # ---------------------------------------------------------------------------
 
+require_workspace
+
 # DDEV creates this network when the first project starts. Create it ahead of
 # time so the box doesn't depend on a project being up; DDEV reuses it as-is.
 docker network inspect ddev_default >/dev/null 2>&1 \
@@ -559,11 +995,13 @@ apply_ddev_fixups
 # Attach
 # ---------------------------------------------------------------------------
 
-# The workspace is mounted at its host path, so the current directory maps 1:1.
+# Start in the current directory's counterpart inside the box -- the same path
+# when the two workspace roots are equal, its translation otherwise. Anywhere
+# outside the workspace has no counterpart, so fall back to the root of the tree.
 workdir="${BOX_WORKSPACE}"
-case "${PWD}" in
-    "${BOX_WORKSPACE}"|"${BOX_WORKSPACE}"/*) workdir="${PWD}" ;;
-esac
+if mapped_pwd="$(box_path "${PWD}")"; then
+    workdir="${mapped_pwd}"
+fi
 
 exec_flags=(-i -u "${BOX_UID}:${BOX_GID}" -w "${workdir}")
 if [ -t 0 ] && [ -t 1 ]; then

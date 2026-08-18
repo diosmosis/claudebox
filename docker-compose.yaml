@@ -15,6 +15,8 @@ services:
     stdin_open: true
     tty: true
     command: ["sleep", "infinity"]
+    # The container-side workspace path; the launcher overrides this per session
+    # with the directory it was invoked from.
     working_dir: ${BOX_WORKSPACE:-/home/dizzy/Projects}
     depends_on:
       proxy:
@@ -23,6 +25,14 @@ services:
         condition: service_healthy
     environment:
       BOX_USER: ${BOX_USER:-dizzy}
+
+      # Where the source tree is, seen from in here and from the host. Equal by
+      # default; they differ when BOX_WORKSPACE_HOST points the tree at another
+      # drive. entrypoint.sh reads the first to keep its ownership sweep off the
+      # bind, and the box's agent reads the second to name host paths correctly
+      # when they are not the paths it works with.
+      CLAUDEBOX_WORKSPACE: ${BOX_WORKSPACE:-/home/dizzy/Projects}
+      CLAUDEBOX_WORKSPACE_HOST: ${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}
 
       # "docker" in the box drives the sidecar daemon, never the host's.
       DOCKER_HOST: tcp://dind:2375
@@ -99,9 +109,14 @@ services:
       # history out of the host home directory.
       - box-home:/home/${BOX_USER:-dizzy}
 
-      # The shared source tree, mounted at the same absolute path it has on the
-      # host so every path Claude reports is directly clickable outside the box.
-      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+      # The shared source tree. BOX_WORKSPACE_HOST defaults to BOX_WORKSPACE, so
+      # by default it is mounted at the same absolute path it has on the host and
+      # every path Claude reports is directly clickable outside the box. Setting
+      # BOX_WORKSPACE_HOST separately keeps the tree elsewhere -- another drive --
+      # while the box still sees a plain ~/Projects; the launcher then translates
+      # between the two, and CLAUDEBOX_WORKSPACE_HOST above tells the box which
+      # host prefix its paths correspond to.
+      - ${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}:${BOX_WORKSPACE:-/home/dizzy/Projects}
 
       # Read-only so the box can see what egress is permitted without being able
       # to widen it -- the proxy reads its own copy, and only the host launcher
@@ -191,7 +206,19 @@ services:
     # snapshotter, and tun is needed by slirp4netns for the daemon's network.
     security_opt:
       - seccomp=unconfined
-      - apparmor=unconfined
+      # Not "apparmor=unconfined": Ubuntu 24.04 denies unprivileged
+      # user-namespace creation to unconfined processes
+      # (kernel.apparmor_restrict_unprivileged_userns=1), and rootlesskit needs
+      # one before dockerd starts -- so unconfined is exactly the case that
+      # fails, with "fork/exec /proc/self/exe: operation not permitted". This
+      # profile is unconfined plus "userns". Install it once with
+      #   sudo cp apparmor/claudebox-dind /etc/apparmor.d/ \
+      #     && sudo apparmor_parser -r /etc/apparmor.d/claudebox-dind
+      # See apparmor/claudebox-dind for why this rather than the host-wide
+      # sysctl. On a host with no AppArmor confinement -- the Docker Desktop VM
+      # this box used to run on -- the profile is absent and unconfined is
+      # right: set BOX_DIND_APPARMOR=unconfined for that case.
+      - apparmor=${BOX_DIND_APPARMOR:-claudebox-dind}
       - systempaths=unconfined
     devices:
       - /dev/fuse
@@ -218,10 +245,11 @@ services:
       - --host-gateway-ip=10.99.1.10
     volumes:
       - dind-data:/home/rootless/.local/share/docker
-      # The source tree at its host path again: "-v" sources in a nested
+      # The source tree again, at the path the BOX sees: "-v" sources in a nested
       # "docker run" are resolved by THIS daemon, not by the box, so the paths
-      # only line up if the daemon sees the tree at the same location.
-      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+      # only line up if the daemon sees the tree where the box does -- which is
+      # the container-side path, not the host one, when the two differ.
+      - ${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}:${BOX_WORKSPACE:-/home/dizzy/Projects}
     healthcheck:
       test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
       interval: 3s
@@ -252,7 +280,9 @@ services:
       # Read-only workspace, so the relay can find each project's
       # .ddev/config.yaml and confirm a requested workdir is inside it. Builds
       # write through the web container, not this mount, so it stays read-only.
-      - ${BOX_WORKSPACE:-/home/dizzy/Projects}:${BOX_WORKSPACE:-/home/dizzy/Projects}:ro
+      # Mounted at the path the box uses, because the workdirs it validates are
+      # the ones the box sent.
+      - ${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}:${BOX_WORKSPACE:-/home/dizzy/Projects}:ro
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:7999/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 5s

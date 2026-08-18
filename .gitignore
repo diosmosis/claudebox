@@ -1,3 +1,7 @@
 # Material staged for the box's /media by "claudebox media add" -- copies of
 # things that live on a drive somewhere, sometimes large. Never source.
 /media/
+
+# Per-machine settings: which drive holds the workspace, which ids the box runs
+# as. config.example is the documented template and IS tracked.
+/config

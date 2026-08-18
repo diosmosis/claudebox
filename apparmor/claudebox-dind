@@ -1,0 +1,48 @@
+# AppArmor profile for the claudebox dind sidecar.
+#
+# Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which denies
+# unprivileged user-namespace creation to any UNCONFINED process. The dind
+# sidecar is rootless: rootlesskit creates a userns before dockerd starts, so
+# under that restriction it dies at startup with
+#
+#   [rootlesskit:parent] error: failed to start the child:
+#   fork/exec /proc/self/exe: operation not permitted
+#
+# "apparmor=unconfined" in docker-compose.yaml does not exempt it -- unconfined
+# is precisely the restricted case. The two ways out are turning the restriction
+# off for the whole host (sysctl) or granting the capability to this one
+# container, which is what this profile does: the effect of unconfined, plus
+# "userns", and nothing granted to anything else on the host.
+#
+# This is not a loosening of the box relative to how it ran on Docker Desktop:
+# that engine's linuxkit VM kernel had no such restriction at all.
+#
+# Install (one time, needs root; survives reboot):
+#   sudo cp ~/.claudebox/apparmor/claudebox-dind /etc/apparmor.d/claudebox-dind
+#   sudo apparmor_parser -r /etc/apparmor.d/claudebox-dind
+#
+# docker-compose.yaml names it as "apparmor=claudebox-dind" on the dind service.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile claudebox-dind flags=(attach_disconnected,mediate_deleted) {
+  # The one rule this profile exists for.
+  userns,
+
+  # Everything else: unrestricted, matching the "apparmor=unconfined" this
+  # replaces. Confining the daemon further is a separate piece of work -- it
+  # would have to cover every nested container's needs -- and doing it here by
+  # accident would break the box in ways that look like Docker bugs.
+  capability,
+  file,
+  network,
+  mount,
+  umount,
+  pivot_root,
+  ptrace,
+  signal,
+  unix,
+  dbus,
+}

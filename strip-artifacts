@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# Delete regenerable build output from the workspace.
+#
+# Why this exists: the workspace can live on a removable drive carried between
+# machines (BOX_WORKSPACE_HOST -- see CLAUDEBOX.md). What belongs on that drive
+# is SOURCE. Build output does not: it is derived, it is usually the largest
+# thing in the tree, and it is machine-specific -- native node modules and Rust
+# objects are compiled against one toolchain and glibc, so carrying them to
+# another computer is wasted space at best and a subtly broken build at worst.
+#
+# Runs inside the box, where the workspace is mounted read-write as the box
+# user, so the whole cycle -- strip here, reinstall here -- stays in the
+# container. The host launcher's "claudebox strip" is a wrapper around this.
+#
+# THE SAFETY RULE: a directory is deleted only if git itself says it is ignored.
+#
+# That is the difference between "derived" and "looks derived". Plenty of
+# projects commit their vendor/ (WordPress plugins ship one), some commit dist/,
+# and a name alone proves nothing. "git check-ignore" is the project's own
+# answer to the question, so a committed vendor/ is never touched, and anything
+# outside a git repository is skipped rather than guessed at.
+#
+# Nothing here is clever about reinstalling. That is deliberate: "npm ci",
+# "composer install" and "cargo build" know their own projects, and a wrapper
+# that guessed wrong would be worse than typing them.
+
+set -uo pipefail
+
+WORKSPACE="${CLAUDEBOX_WORKSPACE:-${HOME}/Projects}"
+
+# Conservative by default: names that are build output essentially wherever they
+# appear. The gitignore rule is what actually protects the tree, but a tight
+# list keeps the scan fast and the report readable. Add more with --name.
+NAMES=(node_modules vendor target .venv __pycache__ dist build coverage)
+
+assume_yes=""
+dry_run=""
+declare -a extra_names=()
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox-strip-artifacts [--dry-run] [--yes] [--name DIR]... [PATH]
+
+Delete gitignored build-output directories from the workspace (or from PATH,
+which must be inside it). Lists what it found and asks before deleting.
+
+  --dry-run     report only, delete nothing
+  --yes         do not ask (for scripts; --dry-run still wins)
+  --name DIR    also consider directories with this name
+
+Considered by default: node_modules vendor target .venv __pycache__ dist build
+coverage -- each deleted only where "git check-ignore" says the project ignores
+it. Directories outside a git repository are always skipped.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        --dry-run) dry_run=1; shift ;;
+        --yes|-y)  assume_yes=1; shift ;;
+        --name)    shift; [ "$#" -gt 0 ] || { usage; exit 2; }; extra_names+=("${1}"); shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        usage; exit 2 ;;
+        *)         break ;;
+    esac
+done
+
+root="${1:-${WORKSPACE}}"
+root="$(cd -- "${root}" 2>/dev/null && pwd)" || {
+    echo "claudebox-strip-artifacts: no such directory: ${1:-${WORKSPACE}}" >&2
+    exit 1
+}
+# Confine to the workspace. Everything else in here is either the container's
+# own HOME or a read-only mount, and neither is this tool's business.
+case "${root}" in
+    "${WORKSPACE}"|"${WORKSPACE}"/*) ;;
+    *)
+        echo "claudebox-strip-artifacts: ${root} is outside the workspace (${WORKSPACE})" >&2
+        exit 1
+        ;;
+esac
+
+if [ "${#extra_names[@]}" -gt 0 ]; then
+    NAMES+=("${extra_names[@]}")
+fi
+
+# Build the find expression: -name a -o -name b -o ...
+find_expr=()
+for n in "${NAMES[@]}"; do
+    if [ "${#find_expr[@]}" -gt 0 ]; then
+        find_expr+=(-o)
+    fi
+    find_expr+=(-name "${n}")
+done
+
+echo "claudebox: scanning ${root} for gitignored build output..." >&2
+
+# -prune: do not descend into a match. A node_modules inside a node_modules goes
+# with its parent, and walking 200k paths to rediscover that wastes the scan.
+# .git is pruned outright -- it is the one large directory here that is source.
+candidates=()
+while IFS= read -r -d '' dir; do
+    candidates+=("${dir}")
+done < <(find "${root}" \
+    -name .git -prune -o \
+    -type d \( "${find_expr[@]}" \) -prune -print0 2>/dev/null)
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+    echo "claudebox: nothing found" >&2
+    exit 0
+fi
+
+# Partition into "git says ignored" and everything else, and total the sizes.
+declare -a targets=()
+declare -a target_sizes=()
+declare -a kept=()
+total=0
+for dir in "${candidates[@]}"; do
+    parent="$(dirname -- "${dir}")"
+    if ! git -C "${parent}" rev-parse --git-dir >/dev/null 2>&1; then
+        kept+=("${dir}	not in a git repository")
+        continue
+    fi
+    if ! git -C "${parent}" check-ignore -q "${dir}" 2>/dev/null; then
+        kept+=("${dir}	tracked or not ignored by this project")
+        continue
+    fi
+    size="$(du -sb -- "${dir}" 2>/dev/null | cut -f1)"
+    [ -n "${size}" ] || size=0
+    targets+=("${dir}")
+    target_sizes+=("${size}")
+    total=$((total + size))
+done
+
+# Report what is being left behind first: a vendor/ this refuses to touch is the
+# single most useful line of output here, because it is the case where a name
+# looks like build output and is not.
+if [ "${#kept[@]}" -gt 0 ]; then
+    echo "claudebox: keeping ${#kept[@]} director$([ "${#kept[@]}" = 1 ] && echo y || echo ies):" >&2
+    printf '  %s\n' "${kept[@]}" | sed "s#${root}/##" >&2
+fi
+
+if [ "${#targets[@]}" -eq 0 ]; then
+    echo "claudebox: nothing to delete" >&2
+    exit 0
+fi
+
+echo "claudebox: ${#targets[@]} director$([ "${#targets[@]}" = 1 ] && echo y || echo ies) to delete, $(numfmt --to=iec "${total}") total:" >&2
+for i in "${!targets[@]}"; do
+    printf '  %8s  %s\n' \
+        "$(numfmt --to=iec "${target_sizes[$i]}")" \
+        "${targets[$i]#"${root}/"}" >&2
+done
+
+if [ -n "${dry_run}" ]; then
+    echo "claudebox: --dry-run, nothing deleted" >&2
+    exit 0
+fi
+
+if [ -z "${assume_yes}" ]; then
+    if [ ! -t 0 ]; then
+        echo "claudebox: refusing to delete without a terminal; pass --yes" >&2
+        exit 1
+    fi
+    printf 'claudebox: delete these? [y/N] ' >&2
+    read -r reply
+    case "${reply}" in
+        y|Y|yes|YES) ;;
+        *) echo "claudebox: nothing deleted" >&2; exit 1 ;;
+    esac
+fi
+
+failed=0
+for dir in "${targets[@]}"; do
+    if ! rm -rf -- "${dir}" 2>/dev/null; then
+        echo "claudebox: could not remove ${dir}" >&2
+        failed=$((failed + 1))
+    fi
+done
+
+if [ "${failed}" -gt 0 ]; then
+    # The usual cause: a nested container wrote in there as a uid this user
+    # cannot unlink, which a native engine passes through rather than squashing.
+    echo "claudebox: ${failed} could not be removed. If they belong to another" >&2
+    echo "claudebox: uid, run 'claudebox fix-perms' on the host and try again." >&2
+    exit 1
+fi
+
+echo "claudebox: freed $(numfmt --to=iec "${total}")" >&2
+echo "claudebox: reinstall per project as needed (npm ci, composer install, cargo build)" >&2

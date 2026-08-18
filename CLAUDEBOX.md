@@ -89,10 +89,72 @@ Each of these is doing real work. Changing one breaks something specific.
   `/workspace`), so paths Claude prints are clickable on the host and
   `claudebox` from a subdirectory lands in the matching directory.
 
-- **The workspace is also mounted into `dind` at the same path.** `-v` sources in
-  a nested `docker run` are resolved by the *daemon*, not the client. Without
-  this second mount, `-v /home/dizzy/Projects/x:/app` silently creates an empty
-  directory instead of mounting the source.
+- **The host side of that bind is configurable, the box side is what everything
+  else is built on.** `BOX_WORKSPACE` is the path the box sees; `BOX_WORKSPACE_HOST`
+  is the host directory bound there and defaults to `BOX_WORKSPACE`, which is
+  what keeps the 1:1 mapping above true unless it is set. Setting it alone —
+  `BOX_WORKSPACE_HOST=/mnt/ssd/projects` — puts the tree on another drive while
+  the box, `dind` and the relay all still see a plain `~/Projects`; the launcher
+  translates between the two for the working directory it exec's into and for
+  the DDEV approot it hands the fixups. Pointing `BOX_WORKSPACE` at the drive
+  instead, so both sides match again, also works and keeps paths clickable, but
+  the box then carries the drive's path everywhere and a mount point under
+  `/media` collides with the staged-material mount. Two costs before moving a
+  workspace onto a *removable* drive: the path has to go on Docker Desktop's
+  file-sharing list (below), and sharing it pins the drive for as long as
+  Desktop runs (below that) — `claudebox media add` remains the right tool for
+  material only to be read.
+
+- **`claudebox eject` is that order, and it refuses to claim more than it
+  proved.** Stop DDEV projects whose approot is on the drive → `compose down` →
+  `udisksctl unmount` → `udisksctl lock`, and only the lock succeeding earns
+  "safe to unplug". Two traps found while building it, both now in the code:
+  `lsblk -no PKNAME` reports an **empty** parent for a device-mapper node (use
+  `-s`, the inverse tree), and the first version read that empty string as "not
+  encrypted", skipped the lock, and declared a still-open LUKS volume safe to
+  unplug. So a path that cannot prove a release now says so and exits non-zero —
+  including a plain unencrypted filesystem, where `--power-off` is the only
+  thing here that can prove it.
+
+- **A removable workspace must be released in one order, and a successful
+  `umount` does not mean it was.** Measured on the native engine with the
+  workspace on a LUKS/ext4 drive: with the box running, `udisksctl unmount`
+  **succeeds** and the host mountpoint disappears — but the container's mount
+  namespace still holds the filesystem (it goes on reading the tree fine), and
+  `udisksctl lock` then fails with `Device or resource busy`. The drive is not
+  safe to pull at that point, and nothing about the unmount says so. Stop the box
+  first and all three steps pass:
+
+  ```
+  claudebox stop
+  udisksctl unmount -b /dev/mapper/luks-<uuid>
+  udisksctl lock -b /dev/sdb1      # "Locked" = genuinely released
+  ```
+
+  This is still a large improvement on Docker Desktop, where the unmount itself
+  returned `EBUSY` and only *quitting Desktop* released the drive — the pin
+  outlived every container. Here it outlives only the containers themselves.
+
+- **`claudebox` refuses to start over a workspace that is not really there.**
+  A missing bind source is silently *created* by Docker, root-owned — on an
+  unmounted drive's mount point that means writing to the internal disk
+  underneath it — and a host path off the file-sharing list fails at container
+  create with an error that names the path but not the setting. So the launcher
+  checks first: the host workspace must exist and be a directory (fatal), is
+  warned about when empty (an unmounted drive looks exactly like a fresh
+  workspace), and is checked against `FilesharingDirectories` when Docker
+  Desktop's settings store is readable (fatal, with the ejection caveat in the
+  message). Both workspace paths must also be absolute: Compose reads a relative
+  volume source as a *named volume*, which would come up as an empty tree rather
+  than an error.
+
+- **The workspace is also mounted into `dind` at the path the box uses.** `-v`
+  sources in a nested `docker run` are resolved by the *daemon*, not the client.
+  Without this second mount, `-v /home/dizzy/Projects/x:/app` silently creates
+  an empty directory instead of mounting the source. The box is the client, so
+  the mount target here is the container-side path (`BOX_WORKSPACE`) even when
+  the host directory behind it is somewhere else — same for the relay's
+  read-only copy, which validates workdirs the box sent.
 
 - **`$HOME` is a named volume with the bind mount nested inside it.** Docker
   orders mounts by path depth, so the volume lands on `/home/dizzy` first and
@@ -348,23 +410,36 @@ claudebox allowed          show the allowlist
 claudebox denied           show what the proxy has blocked
 ```
 
-Env overrides: `BOX_WORKSPACE`, `BOX_USER`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`,
-`BOX_DDEV_PROJECT`.
+Settings live in `~/.claudebox/config`, sourced as shell (see `config.example`,
+which documents every one; `config` itself is gitignored as per-machine). The
+**environment wins over the file**, so `BOX_WORKSPACE_HOST=/mnt/x claudebox`
+stays a one-off — the launcher saves the environment's values, sources the file,
+then puts them back, because a sourced assignment is unconditional and would
+otherwise beat the command line. Only the enumerated names are honoured, so a
+typo in the file is inert rather than mysterious.
+
+Settings: `BOX_WORKSPACE` (where the box sees the tree), `BOX_WORKSPACE_HOST`
+(the host directory bound there; defaults to `BOX_WORKSPACE`), `BOX_USER`,
+`BOX_UID`, `BOX_GID`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`, `BOX_DDEV_PROJECT`,
+`BOX_DIND_APPARMOR`.
 
 ### What the launcher does on each run
 
-1. Creates `ddev_default` if absent (DDEV reuses it as-is).
-2. Regenerates `docker-compose.override.yaml`: always the `~/.claudebox/plans →
+1. Checks the host workspace: exists, non-empty, on Docker Desktop's
+   file-sharing list (also before `rebuild`, not before `stop` — a drive can be
+   gone by then and `compose down` does not care).
+2. Creates `ddev_default` if absent (DDEV reuses it as-is).
+3. Regenerates `docker-compose.override.yaml`: always the `~/.claudebox/plans →
    ~/.claude/plans` bind (after `mkdir`ing the host side), plus the optional host
    mounts that actually exist — `~/.gitconfig`, `~/.config/opencode` and
    `~/.local/share/opencode/auth.json` — because binding a missing path would
    make Docker create a directory in the host home directory.
-3. `compose up -d`, then **polls for `/run/claudebox.ready`** (see race below).
-4. Checks the proxy's copy of `allowlist.conf` against the host's and remounts
+4. `compose up -d`, then **polls for `/run/claudebox.ready`** (see race below).
+5. Checks the proxy's copy of `allowlist.conf` against the host's and remounts
    it (restart + re-expand) if they differ.
-5. Resolves `ddev-router`'s IP and rewrites the proxy's `/etc/hosts`.
-6. Injects `CLAUDEBOX_PROXY=http://<proxy-ip>:3128` into the exec environment.
-7. Sets `TERM` for the exec — the host's own if the image has a terminfo entry
+6. Resolves `ddev-router`'s IP and rewrites the proxy's `/etc/hosts`.
+7. Injects `CLAUDEBOX_PROXY=http://<proxy-ip>:3128` into the exec environment.
+8. Sets `TERM` for the exec — the host's own if the image has a terminfo entry
    for it, `xterm-256color` otherwise — and passes `COLORTERM` through. `docker
    exec -t` sets `TERM=xterm` and nothing else, which leaves a full-screen TUI
    drawing in eight colours; forwarding the host's blindly is not the fix
@@ -372,8 +447,11 @@ Env overrides: `BOX_WORKSPACE`, `BOX_USER`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`,
    from Debian's ncurses and an unknown terminal type breaks `less` and `nano`
    in the box. `COLORTERM` is what the TUIs read for truecolor and needs no
    terminfo.
-8. `docker exec`s in as uid/gid 1000, mapping the host cwd 1:1, running
-   `claude`, `opencode` or `bash` depending on the subcommand.
+9. `docker exec`s in as uid/gid 1000, in the host cwd's counterpart inside the
+   box — the same path when the workspace roots match, its translation when
+   `BOX_WORKSPACE_HOST` differs, the root of the tree when the cwd is outside the
+   workspace entirely — running `claude`, `opencode` or `bash` depending on the
+   subcommand.
 
 ## Agents in the box
 
@@ -760,6 +838,24 @@ Do not re-introduce these.
   reclaimed. Do not widen that sweep to `~/Projects` or `~/.claude/plans`: both
   are host binds, and plans files can legitimately read as uid 0 in the box
   while being correctly owned on the host.
+
+- **On a native engine, ownership in the binds is real — and root writes stay
+  root.** Docker Desktop ran virtiofsd with `--translate-uid squash-guest:0:1000`,
+  which mapped every uid to yours in both directions: host files always read as
+  1000 in a container, and anything a container's root wrote came back owned by
+  you. That is what made the caveat above a caveat. A native `dockerd` does no
+  translation, so a root process in a container leaves root-owned files in the
+  tree that the box, running as 1000, then cannot touch. Three of the four
+  writers here are already fine — the agent is exec'd as `1000:1000`, DDEV sets
+  its web container to the host uid, and rootlesskit maps a nested container's
+  root back to the dind user, which is 1000 on the host — so what remains is a
+  deliberate `docker exec -u 0`. `claudebox fix-perms` is the sweep for it, run
+  on demand rather than per start (a full walk of a large tree, over USB, is not
+  a thing to do on every launch). It chowns from **inside** the box, where root
+  is already available on the same bind, so the host user needs no `sudo`. For a
+  blanket guarantee instead, `bindfs --force-user` reproduces the squash exactly
+  at the cost of a FUSE layer on every stat; kernel idmapped mounts cannot —
+  they shift disjoint ranges and cannot collapse many uids onto one.
 
 - **Busybox `wget` cannot issue `CONNECT`, and the failure reads as a blocked
   host.** `docker run --rm alpine wget https://…` fails for an *allowed* domain,
