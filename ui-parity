@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# Print everything about an image that a UI test can observe.
+#
+#   ui-parity [image]            default: claudebox:latest
+#
+# The point is to DIFF two of these. claudebox:latest and claudebox-runner:latest
+# are both built from the `base` stage of this repo's Dockerfile, so on one
+# machine they must be identical:
+#
+#   ui-parity claudebox:latest        > /tmp/box
+#   ui-parity claudebox-runner:latest > /tmp/runner
+#   diff /tmp/box /tmp/runner         # must be empty
+#
+# The check that actually matters is between MACHINES. `base` is built on each
+# one, so apt resolves against whatever that machine's mirrors currently hold --
+# same Dockerfile, not necessarily the same package versions. Font package
+# versions are exactly what moves pixels (fonts-dejavu-core 2.37-6 against 2.37-8
+# renders every glyph a pixel off), so carry the runner machine's output back and
+# diff it against this one's. A difference here is a screenshot diff waiting to
+# happen; if one appears, `docker save claudebox-base | ssh target docker load`
+# settles it.
+#
+# Package versions alone are NOT the whole answer, which is why the file hashes
+# are here too: the DejaVu, Liberation and Noto files come from ubuntu:24.04 and
+# are laid OVER Debian's packages, so dpkg reports Debian's version while the
+# bytes being rasterised are Ubuntu's. The hashes are the authoritative half.
+set -euo pipefail
+
+IMAGE="${1:-claudebox:latest}"
+
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo "ui-parity: no such image: ${IMAGE}" >&2
+    echo "ui-parity: build it first ('claudebox rebuild', or 'claudebox-runner')" >&2
+    exit 1
+fi
+
+# To stderr, so that `ui-parity a > x; ui-parity b > y; diff x y` compares the
+# report and not the name of the image it came from.
+echo "ui-parity: ${IMAGE}" >&2
+
+# --entrypoint sh: both images have an entrypoint that expects to be starting a
+# service. Everything below is read-only and deterministic -- no timestamps, no
+# unsorted output -- so two runs of the same image produce byte-identical text.
+docker run --rm --entrypoint sh "${IMAGE}" -c '
+set -eu
+
+echo "## distribution"
+. /etc/os-release; echo "os          ${PRETTY_NAME}"
+echo "node        $(node -v 2>/dev/null || echo -)"
+echo "php         $(php -r "echo PHP_VERSION;" 2>/dev/null || echo -)"
+echo
+
+echo "## packages that decide how anything renders"
+# Everything in the rasterisation path (freetype, harfbuzz, fontconfig), the
+# toolkit Chromium draws through (cairo, pango, gtk, gdk-pixbuf), the image
+# codecs, and ImageMagick, which is what compares the result.
+dpkg-query -W -f="\${Package}\t\${Version}\n" 2>/dev/null \
+  | grep -E "^(fontconfig|fontconfig-config|libfontconfig[0-9]|fonts-|libfreetype|libharfbuzz|libcairo|libpango|libgdk-pixbuf|libgtk-3|libnss3|libnspr4|libx11-6|libxcb1|libxrender1|libxext6|imagemagick|libmagick|php[0-9.]*-cli|php[0-9.]*-gd|libgd3|libjpeg|libpng|libwebp|zlib1g)" \
+  | sort
+echo
+
+echo "## font files, by content"
+# The authoritative half. Sorted by path so the list is stable, and covering
+# /usr/local/share/fonts too -- that is where the Arial/Verdana/Courier New that
+# CI copies in from matomo-org/github-action-tests live, and they are cloned at
+# build time from @main, so they have no package version at all.
+find /usr/share/fonts /usr/local/share/fonts -type f \
+     \( -name "*.ttf" -o -name "*.otf" -o -name "*.ttc" -o -name "*.pfb" \) 2>/dev/null \
+  | sort | while read -r f; do
+        printf "%s  %s\n" "$(md5sum < "$f" | cut -d" " -f1)" "$f"
+    done
+echo
+
+echo "## fontconfig rules in force"
+# Ubuntu enables two that Debian does not, and the Dockerfile reproduces them.
+# 10-sub-pixel-rgb is why rgba resolves at all (Chromium asks fontconfig for it);
+# 70-no-bitmaps-except-emoji is what keeps Noto Color Emoji from being discarded.
+ls /etc/fonts/conf.d/ | sort
+echo
+
+echo "## what fontconfig actually resolves"
+fc-match -v sans-serif 2>/dev/null \
+  | grep -E "^\s+(family|file|rgba|hintstyle|hinting|antialias|lcdfilter):" \
+  | sed "s/^[[:space:]]*//" | sort
+echo
+for f in Arial Verdana "Courier New" "Times New Roman" sans-serif serif monospace emoji; do
+    printf "%-16s %s\n" "${f}" "$(fc-match "${f}" 2>/dev/null || echo -)"
+done
+echo
+
+echo "## ImageMagick limits"
+# Not a rendering input, but a comparison one: Debian ships limits well below
+# what a full-page screenshot needs, and CI raises exactly these.
+grep -oE "name=\"(memory|width|height|area|disk)\" value=\"[^\"]+\"" \
+     /etc/ImageMagick-6/policy.xml 2>/dev/null | sort || echo "(no policy.xml)"
+'

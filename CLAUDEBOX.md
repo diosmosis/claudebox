@@ -425,6 +425,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
 | `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
+| `ui-parity` | Prints everything about an image that a UI test can observe, in diffable form — package versions, font file hashes, fontconfig's resolved settings, ImageMagick's limits |
 | `apparmor/claudebox-dind` | The profile that grants `userns` to the dind sidecar; installed once with `sudo`, on each machine |
 | `node-proxy-bootstrap.cjs` | Preloaded into every Node process via `NODE_OPTIONS`; DNS-preflight shim |
 | `box-CLAUDE.md` | Baked to `/etc/claude-code/CLAUDE.md` **and** `/etc/claudebox/AGENTS.md`; what the box's agent is told about its own environment, one file for both |
@@ -637,6 +638,33 @@ the baselines came from.
 
 `claudebox-runner` builds `--target base` from this same file before building the
 runner image, which is why the base image is a build ARG rather than a fixed tag.
+
+`ui-parity` is how that claim is checked rather than assumed. It prints, in
+diffable form, everything about an image a test can observe:
+
+```bash
+ui-parity claudebox:latest        > /tmp/box
+ui-parity claudebox-runner:latest > /tmp/runner
+diff /tmp/box /tmp/runner          # empty
+```
+
+Empty on this machine, as it must be — both images come off the same layers here
+(measured: 146 lines, identical).
+**The check that matters is between machines**, because `base` is built on each
+one and `apt` resolves against whatever that machine's mirrors currently hold:
+same Dockerfile, not necessarily the same package versions, and font package
+versions are precisely what moves pixels. Carry the runner machine's output back
+and diff it against this one's; a difference there is a screenshot diff waiting to
+happen, and `docker save claudebox-base | ssh target docker load` settles it.
+
+Package versions alone would not be enough, which is why the report also hashes
+every font file. The DejaVu, Liberation and Noto files come from `ubuntu:24.04`
+and are laid *over* Debian's packages, so `dpkg` reports Debian's version while
+the bytes being rasterised are Ubuntu's — and the Arial/Verdana/Courier New that
+CI copies in are cloned from `@main` and carry no package version at all. It also
+records what fontconfig *resolves* (`rgba: 1`, `hintstyle`, which file each family
+lands on), since that is the layer where Debian and Ubuntu differ by
+configuration rather than by content.
 
 ### The trust boundary
 
@@ -1702,6 +1730,14 @@ claudebox shell -c 'head -1 /etc/claudebox/AGENTS.md'
 # The model catalogue host is reachable. Worth checking explicitly: a denial
 # here is silent, opencode just uses its built-in list.
 claudebox shell -c 'curl -s -o /dev/null -w "%{http_code}\n" https://models.opencode.ai/'
+```
+
+The two images must be indistinguishable to a test. This is the one check to run
+after touching the `base` stage, and the one to run on a new runner machine:
+
+```bash
+ui-parity claudebox:latest > /tmp/box && ui-parity claudebox-runner:latest > /tmp/runner
+diff /tmp/box /tmp/runner
 ```
 
 After a change to the `base`/`claudebox` stage split, the acceptance test is
