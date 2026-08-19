@@ -955,6 +955,133 @@ ps_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# Stopping one
+#
+# "claudebox kill" takes a pid from "claudebox ps" and ends that session. It
+# exists because a headless run has no terminal to interrupt: nobody is holding
+# it, so there is nothing to press Ctrl-C on -- and a run that arrived through
+# the agent door cannot be stopped from the machine that asked for it either,
+# once that machine has walked away.
+#
+# What it kills is the session AND what the session started. Collecting the
+# descendants BEFORE signalling is the whole trick: once claude is gone its
+# children are reparented to pid 1 and there is no way left to tell which of
+# them were its. A test suite or a language server left running is exactly the
+# thing this is meant to stop.
+# ---------------------------------------------------------------------------
+kill_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox kill [<pid>|--all]
+
+  <pid>   the session to stop, as printed by "claudebox ps"
+  --all   stop every claude session in the box
+
+  With no argument and exactly one session running, that one is stopped.
+
+  The session is asked to stop (TERM) and then made to (KILL), along with
+  whatever it had started -- a test run, a language server. A session that
+  arrived through the agent door can be stopped from here too; the machine that
+  sent it sees the run end.
+USAGE
+}
+
+kill_cmd() {
+    local arg="${1:-}" all="" target="" snapshot sessions targets pid
+
+    case "${arg}" in
+        --all)     all=1 ;;
+        -h|--help) kill_usage; return 0 ;;
+        "")        ;;
+        *[!0-9]*)  echo "claudebox: '${arg}' is not a pid -- see 'claudebox ps'" >&2; return 2 ;;
+        *)         target="${arg}" ;;
+    esac
+
+    if ! docker exec "${CONTAINER}" true 2>/dev/null; then
+        echo "claudebox: the box is not running, so nothing is running in it" >&2
+        return 1
+    fi
+
+    snapshot="$(docker exec "${CONTAINER}" ps -ww -eo pid=,ppid=,etime=,args= 2>/dev/null)"
+    sessions="$(printf '%s\n' "${snapshot}" | awk '$4 == "claude" { print $1 }')"
+
+    if [ -z "${sessions}" ]; then
+        echo "claudebox: no claude sessions running in the box" >&2
+        return 0
+    fi
+
+    if [ -n "${all}" ]; then
+        targets="${sessions}"
+    elif [ -n "${target}" ]; then
+        # Only a pid that IS a session. Otherwise this is a way to send a signal
+        # to any process in the box, which is not what it says on the tin.
+        if ! printf '%s\n' "${sessions}" | grep -qx "${target}"; then
+            echo "claudebox: ${target} is not a claude session in the box. Running now:" >&2
+            ps_cmd >&2
+            return 2
+        fi
+        targets="${target}"
+    elif [ "$(printf '%s\n' "${sessions}" | grep -c .)" = "1" ]; then
+        targets="${sessions}"
+    else
+        echo "claudebox: more than one session is running; name the one to stop:" >&2
+        ps_cmd >&2
+        return 2
+    fi
+
+    while IFS= read -r pid; do
+        [ -n "${pid}" ] || continue
+
+        # Everything descended from this session, found by walking the parent
+        # map to a fixed point -- children of children included, since a test
+        # runner's workers are two levels down.
+        local kin
+        kin="$(printf '%s\n' "${snapshot}" | awk -v root="${pid}" '
+            { parent[$1] = $2 }
+            END {
+                want[root] = 1
+                changed = 1
+                while (changed) {
+                    changed = 0
+                    for (p in parent)
+                        if (!(p in want) && (parent[p] in want)) { want[p] = 1; changed = 1 }
+                }
+                for (p in want) if (p != root) print p
+            }' | tr '\n' ' ')"
+
+        # As the box user, which owns them. Root would do for the signal, but
+        # the session's own user is the one that certainly may -- the box drops
+        # capabilities, and this is not the place to discover which.
+        docker exec -u "${BOX_UID}:${BOX_GID}" "${CONTAINER}" \
+            sh -c "kill -TERM ${pid} ${kin} 2>/dev/null; exit 0" || true
+
+        # Give it a moment to go on its own before insisting. claude writes its
+        # state as it exits, and a KILL that arrives first leaves that half
+        # written.
+        local waited=0
+        while [ "${waited}" -lt 5 ]; do
+            docker exec "${CONTAINER}" test -d "/proc/${pid}" 2>/dev/null || break
+            sleep 1
+            waited=$(( waited + 1 ))
+        done
+        if docker exec "${CONTAINER}" test -d "/proc/${pid}" 2>/dev/null; then
+            docker exec -u "${BOX_UID}:${BOX_GID}" "${CONTAINER}" \
+                sh -c "kill -KILL ${pid} ${kin} 2>/dev/null; exit 0" || true
+            echo "claudebox: session ${pid} did not stop when asked; killed" >&2
+        else
+            echo "claudebox: stopped session ${pid}" >&2
+        fi
+
+        # Whatever it started, swept after the fact: by now those are orphans
+        # reparented to pid 1, and nothing else can identify them.
+        if [ -n "${kin// /}" ]; then
+            docker exec -u "${BOX_UID}:${BOX_GID}" "${CONTAINER}" \
+                sh -c "kill -KILL ${kin} 2>/dev/null; exit 0" || true
+            echo "claudebox: and $(printf '%s' "${kin}" | wc -w) process(es) it had started" >&2
+        fi
+    done <<< "${targets}"
+}
+
+# ---------------------------------------------------------------------------
 # The agent door
 #
 # Two roles, one launcher, and which one applies is decided by what is running
@@ -1486,7 +1613,7 @@ runner_machine_gate() {
     # of this launcher's own subcommands -- "claudebox opencode ... -p" is a
     # different agent, and "claudebox media ..." is not an agent at all.
     case "${first}" in
-        shell|opencode|media|runner|stop|rebuild|allowed|denied|allow|reload|eject|strip|fix-perms|plugins|ps)
+        shell|opencode|media|runner|stop|rebuild|allowed|denied|allow|reload|eject|strip|fix-perms|plugins|ps|kill)
             ;;
         *)
             for arg in "$@"; do
@@ -1641,6 +1768,11 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              agent door, and what they are executing right now.
                              A headless run prints nothing until it finishes, so
                              this is how to tell working from wedged.
+
+  claudebox kill [<pid>]     stop a session "claudebox ps" lists, and whatever it
+                             had started. With one session running, no pid is
+                             needed; --all stops every one. For a headless run,
+                             which has no terminal to interrupt.
 
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
@@ -1993,6 +2125,12 @@ USAGE
     ps)
         shift
         ps_cmd "$@"
+        exit $?
+        ;;
+
+    kill)
+        shift
+        kill_cmd "$@"
         exit $?
         ;;
 

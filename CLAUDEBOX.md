@@ -485,6 +485,8 @@ claudebox agent show|test|forget
 claudebox ps               what claude sessions are running in the box: how long,
                            which project, whether they came through the agent
                            door, and what each is executing right now
+claudebox kill [<pid>]     stop one of them, and whatever it had started
+                           (--all stops every one)
 claudebox plugins          list the commands plugins add, and where they are looked for
 claudebox <p>:<cmd> [args] run one (plugins/<p>/commands/<cmd>)
 
@@ -1287,7 +1289,7 @@ is one less difference.
 passing them through. `/enrol` is not forwarded: it is spoken once, at join time,
 by a one-off container and never by the box.
 
-## Seeing what a session is doing
+## Seeing what a session is doing, and stopping it
 
 A headless run is silent by construction: `claude -p` is print mode, so it emits
 its answer when it finishes and nothing before. A session that is thinking hard
@@ -1318,6 +1320,21 @@ nothing is recorded anywhere while a session runs, because the process table
 - **A session whose parent is `agent-serve.mjs` came through the door.**
   Anything else was started here. That is the whole of how origin is decided —
   no bookkeeping, just the parent pid.
+
+`claudebox kill` stops one. A headless run has no terminal to interrupt —
+nobody is holding it — and one that arrived through the agent door cannot be
+stopped from the machine that asked for it once that machine has walked away.
+With a single session running it needs no pid; otherwise it takes one from `ps`,
+or `--all`.
+
+It refuses a pid that is not a session, so it cannot be used to signal arbitrary
+processes in the box. It asks (TERM) before insisting (KILL), because claude
+writes state as it exits and a KILL that arrives first leaves that half written.
+And it **collects the session's descendants before signalling** — once claude is
+gone its children are reparented to pid 1 and nothing can identify them any
+more, which is how a test suite or a language server survives a naive kill.
+Stopping a forwarded session works from here too: the machine that sent it sees
+the run end with 143.
 
 `jira:triage-issue` prints a `still running (2m30s)` line every thirty seconds
 while it waits, for the same reason: the cheapest thing that distinguishes a
@@ -2143,6 +2160,18 @@ docker rm -f claudebox-runner
 claudebox agent status | grep fingerprint
 claudebox agent stop && claudebox agent start
 claudebox agent status | grep fingerprint
+
+# ps and kill, against a session that is definitely still going. kill must take
+# the tool processes with it -- a jest run outliving the session that started it
+# is the failure this collects descendants to avoid -- and must refuse a pid
+# that is not a session, or it is a way to signal anything in the box.
+cd ~/Projects/<a project>
+claudebox -p 'Use the Bash tool to run: sleep 90. Then say done.' >/dev/null 2>&1 &
+sleep 10
+claudebox ps                        # project, "doing: sleep 90", the prompt
+claudebox kill $(docker exec claudebox pgrep -f 'agent-serve') ; echo "want 2, got $?"
+claudebox kill                      # one session running, so no pid needed
+docker exec claudebox sh -c "ps -eo args | grep -c '[s]leep 90'"   # want 0
 
 # With the door up: the front door is on the LAN, the box
 # is NOT, and the door refuses anything without the token. The second line is
