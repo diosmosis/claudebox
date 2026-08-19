@@ -18,6 +18,8 @@
 #   db:3306                      ->  10.99.2.10:3306 ->  this forwarder, started
 #                                                        INSIDE the sidecar
 #                                                        -> ddev-<p>-db:3306
+#   http://host.docker.internal  ->  10.99.2.10:80    ->  a front-door nginx
+#                                                        -> ddev-<p>-web:80
 #
 # The first line needs nothing from this script. `ddev start` publishes the
 # router itself (given router_bind_all_interfaces, which the entrypoint sets),
@@ -25,22 +27,40 @@
 # address -- which, the daemon being the sidecar, is already the right answer.
 # `--status` reports it so a mismatch is visible rather than mysterious.
 #
-# The second line is what this exists for. DDEV publishes the database on a port
-# it picks per start, which is no use to a config file that says `host = "db"`.
-# So: a forwarder on a fixed port, with ONE hard-coded destination -- the same
-# constraint the box's ddev-db has, and for the same reason. One that took its
-# target from the request would be a general TCP proxy into the sidecar's
-# network.
+# The other two are what this exists for, and both are containers started INSIDE
+# the sidecar, because that is the only side of the boundary that can see a
+# project's containers by name.
+#
+#   The database forward exists because DDEV publishes the database on a port it
+#   picks per start, which is no use to a config file that says `host = "db"`.
+#
+#   The front door is the box's ddev-http, moved a level down. It is the name and
+#   the port a single-host CI runner serves Matomo on -- what wp-env's WordPress
+#   and the UI specs both navigate to -- and it is where the client is presented
+#   as 127.0.0.1, the address every visits-log baseline contains. Straight to the
+#   web container rather than through ddev-router, because traefik would replace
+#   those headers with this container's address. It renders the SAME nginx
+#   configuration the box's ddev-http service is built from.
+#
+# Both have ONE hard-coded destination, the same constraint the box's ddev-db and
+# ddev-http have and for the same reason: one that took its target from the
+# request would be a general proxy into the sidecar's network.
 #
 #   claudebox-ddev-bridge            bridge the project in the current directory
 #   claudebox-ddev-bridge --status   what is bridged now
-#   claudebox-ddev-bridge --down     tear the database forward down
+#   claudebox-ddev-bridge --down     tear the forwards down
 #
 # Re-runnable, and re-running it in another project moves the bridge there.
 set -euo pipefail
 
 FORWARDER=claudebox-ddev-db
+FRONTDOOR=claudebox-ddev-http
+TEMPLATE=/usr/local/share/claudebox/ddev-http.conf.template
 SIDECAR_ADDR="${CLAUDEBOX_RUNNER_DIND_ADDR:-10.99.2.10}"
+# Under HOME because docker-compose.runner.yaml mounts HOME into the sidecar at
+# this same path -- a bind source is resolved by THAT daemon, so a file anywhere
+# else would silently arrive as an empty directory.
+RENDERED="${HOME:-/home/dizzy}/.ddev/claudebox-ddev-http.conf"
 
 die() { echo "claudebox-ddev-bridge: $*" >&2; exit 1; }
 
@@ -50,9 +70,15 @@ command -v docker >/dev/null 2>&1 || die "no docker client in this image"
 case "${1:-}" in
     --status)
         if target="$(docker inspect -f '{{index .Config.Cmd 1}}' "${FORWARDER}" 2>/dev/null)"; then
-            echo "database:  db:3306 -> ${target##*tcp-connect:}"
+            echo "database:   db:3306 -> ${target##*tcp-connect:}"
         else
-            echo "database:  not bridged"
+            echo "database:   not bridged"
+        fi
+        if docker inspect -f '{{.State.Running}}' "${FRONTDOOR}" 2>/dev/null | grep -qx true; then
+            echo "front door: http://host.docker.internal -> $(docker inspect \
+                -f '{{index .Config.Labels "claudebox.upstream"}}' "${FRONTDOOR}" 2>/dev/null)"
+        else
+            echo "front door: not running (http://host.docker.internal goes nowhere)"
         fi
         # DDEV's own doing, not this script's -- but the single most useful
         # thing to see when a project "is running" and every request to it lands
@@ -64,10 +90,10 @@ case "${1:-}" in
         exit 0
         ;;
     --down)
-        docker rm -f "${FORWARDER}" >/dev/null 2>&1 || true
+        docker rm -f "${FORWARDER}" "${FRONTDOOR}" >/dev/null 2>&1 || true
         # Leave the hostnames: they cost nothing, they point at a router that is
         # still there, and removing them would break a project that is up.
-        echo "claudebox-ddev-bridge: database forward removed"
+        echo "claudebox-ddev-bridge: database forward and front door removed"
         exit 0
         ;;
     "") ;;
@@ -134,6 +160,88 @@ if docker inspect -f '{{.State.Running}}' "${db}" 2>/dev/null | grep -qx true; t
     echo "claudebox-ddev-bridge: db:3306 -> ${db}:3306"
 else
     echo "claudebox-ddev-bridge: ${db} is not running; no database to bridge" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# The host.docker.internal front door
+#
+# The box's ddev-http service, one level down. Same nginx configuration file --
+# rendered here rather than envsubst'd at container start, because a stock
+# nginx:alpine is all the sidecar can be given (it cannot see images built out
+# here, and there is no registry to pull a local one from).
+#
+# Port 80 in the sidecar, which is why the entrypoint moves the DDEV router's
+# plain-HTTP port to 8080: this name and this port are what the UI baselines were
+# recorded against, and the second server block below hands every other Host back
+# to the router so nothing else changes.
+# ---------------------------------------------------------------------------
+web="ddev-${name}-web"
+if docker inspect -f '{{.State.Running}}' "${web}" 2>/dev/null | grep -qx true; then
+    net_web="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "${web}" | head -1)"
+    [ -n "${net_web}" ] || die "${web} is on no network"
+
+    # traefik listens INTERNALLY on whatever router_http_port says, not on 80 --
+    # moving the published port moves the entrypoint with it -- so the
+    # passthrough has to name the configured value. Read rather than assumed:
+    # the entrypoint owns that setting and it is overridable.
+    router_port="$(sed -n 's/^router_http_port:[[:space:]]*"\{0,1\}\([0-9]\{1,\}\)"\{0,1\}[[:space:]]*$/\1/p' \
+        "${HOME:-/home/dizzy}/.ddev/global_config.yaml" 2>/dev/null | tail -1)"
+    [ -n "${router_port}" ] || router_port=8080
+
+    mkdir -p "$(dirname "${RENDERED}")"
+    {
+        sed -e "s|\${DDEV_HOST}|${name}.ddev.site|g" \
+            -e "s|\${DDEV_WEB}|${web}|g" "${TEMPLATE}"
+        cat <<'NGINX'
+
+# Appended by claudebox-ddev-bridge, and only on the runner.
+#
+# The front door above takes port 80 in the sidecar, which is also where
+# http://<project>.ddev.site would have arrived. Without this, plain HTTP to any
+# project would quietly reach the ONE project the front door points at -- a wrong
+# answer that looks like a right one. nginx prefers an exact server_name over a
+# regex, so host.docker.internal still goes to the block above and everything
+# ending in .ddev.site comes here, to the router, with its Host intact.
+server {
+    listen 80;
+    server_name ~^.+\.ddev\.site$;
+
+    resolver 127.0.0.11 ipv6=off valid=10s;
+
+    location / {
+        set $router http://ddev-router:__ROUTER_HTTP_PORT__;
+        proxy_pass $router$request_uri;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto http;
+
+        proxy_http_version 1.1;
+        client_max_body_size 64m;
+        proxy_read_timeout  300s;
+        proxy_send_timeout  300s;
+    }
+}
+NGINX
+    } | sed "s|__ROUTER_HTTP_PORT__|${router_port}|g" > "${RENDERED}"
+
+    docker rm -f "${FRONTDOOR}" >/dev/null 2>&1 || true
+    docker run -d --name "${FRONTDOOR}" \
+        --network "${net_web}" \
+        --restart unless-stopped \
+        --label "claudebox.upstream=${web}" \
+        -p 80:80 \
+        -v "${RENDERED}:/etc/nginx/conf.d/default.conf:ro" \
+        nginx:alpine >/dev/null \
+        || die "could not start the host.docker.internal front door"
+    # ddev-router lives on ddev_default, not on the project's network, so the
+    # passthrough block below cannot resolve it from where the web container is.
+    # A second attachment rather than starting there instead: the front door's
+    # whole point is reaching the web container by name.
+    docker network connect ddev_default "${FRONTDOOR}" >/dev/null 2>&1 \
+        || echo "claudebox-ddev-bridge: warning: could not join ddev_default; http://<project>.ddev.site will 502" >&2
+    echo "claudebox-ddev-bridge: http://host.docker.internal -> ${web} (client presented as 127.0.0.1)"
+else
+    echo "claudebox-ddev-bridge: ${web} is not running; no front door started" >&2
 fi
 
 # ---------------------------------------------------------------------------

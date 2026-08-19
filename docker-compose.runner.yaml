@@ -36,6 +36,14 @@ services:
       BOX_USER: ${BOX_USER:-dizzy}
       CLAUDEBOX_RUNNER_WORKSPACE: ${BOX_RUNNER_WORKSPACE:-/home/dizzy/Projects}
       CLAUDEBOX_RUNNER_STATE: /var/lib/claudebox-runner
+
+      # Where the DDEV router's plain-HTTP entrypoint goes, because port 80
+      # inside the sidecar belongs to the host.docker.internal front door -- the
+      # address and the port a single-host CI runner serves Matomo on, and what
+      # the screenshot baselines were recorded against. https stays on 443.
+      # Asserted into the global DDEV config on every start; see
+      # runner/entrypoint.sh.
+      CLAUDEBOX_RUNNER_ROUTER_HTTP_PORT: ${BOX_RUNNER_ROUTER_HTTP_PORT:-8080}
       # "docker" here drives the sidecar daemon, never this machine's own --
       # and so does the ddev in this image, which is the whole of "DDEV on the
       # runner": ddev is a docker client, so pointing it at the sidecar puts
@@ -45,6 +53,15 @@ services:
       # the mkcert root the entrypoint generates for this machine's own DDEV
       # projects.
       NODE_EXTRA_CA_CERTS: /usr/local/share/ca-certificates/ddev-rootCA.crt
+
+      # Ports to republish from the sidecar onto this container's loopback, so
+      # "localhost:<port>" means here what it means on a single-host CI runner.
+      # A container started inside the sidecar publishes to ITS interface, not
+      # this one, so wp-env's WordPress is at dind:8888 and a Puppeteer spec that
+      # says localhost:8888 -- or a screenshot baseline recorded on a runner --
+      # finds nothing. 8888/8889 are wp-env's development and tests ports;
+      # comma-separated, empty disables. Identical to the box's list on purpose.
+      CLAUDEBOX_DIND_PORTS: "8888,8889"
     extra_hosts:
       # The database of whichever DDEV project has been bridged
       # ("claudebox-runner-db <project>"), under the name a project's own config
@@ -62,6 +79,13 @@ services:
       # which is when the project's hostnames are known; this is the router
       # itself, for anything that wants the address rather than a name.
       - "ddev-router:10.99.2.10"
+      # The name a single-host CI runner gives the machine serving Matomo.
+      # Chromium runs in THIS container, and the UI specs navigate to
+      # http://host.docker.internal/... , so it has to resolve here as well as
+      # inside the sidecar (where wp-env's containers get it from
+      # --host-gateway-ip). Both land on the same front door; see
+      # claudebox-ddev-bridge.
+      - "host.docker.internal:10.99.2.10"
     ports:
       # On every interface on purpose: the whole point is that the other machine
       # can reach it. What protects it is what is in front of it -- TLS with a
@@ -129,6 +153,18 @@ services:
       # Keep the networks this daemon hands out away from the one its own
       # containers have to reach the runner on.
       - --default-address-pool=base=172.28.0.0/14,size=24
+      # What "host.docker.internal:host-gateway" resolves to for containers
+      # started in here -- which is every container wp-env starts, since that is
+      # what wp-env attaches to all of them, and it is how WordPress reaches
+      # Matomo on a CI runner.
+      #
+      # THIS container's own address on the runner network, so a nested
+      # container's packet goes to the sidecar's namespace and lands on whatever
+      # is published there. The front door claudebox-ddev-bridge starts is
+      # published on port 80 in here, which is why the DDEV router's http port is
+      # moved to 8080 (see runner/entrypoint.sh) -- 80 belongs to the name CI
+      # uses.
+      - --host-gateway-ip=10.99.2.10
     volumes:
       - dind-data:/home/rootless/.local/share/docker
       # The workspace at the path the RUNNER sees it, because "-v" sources in a

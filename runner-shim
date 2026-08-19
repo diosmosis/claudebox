@@ -7,6 +7,7 @@
 //   runner sync                push this project's source to it
 //   runner exec <cmd...>       run <cmd> there, in this project, without syncing
 //   runner run  <cmd...>       sync, then run -- the one you usually want
+//   runner fetch <path...>     copy results back -- screenshots, diffs, logs
 //
 // The box has no route to that machine and no credential for it. Everything
 // here goes to runner-relay on the internal network, which holds both; see
@@ -326,6 +327,55 @@ function uploadFiles(ctx, need) {
 }
 
 // ---------------------------------------------------------------------------
+// fetch
+//
+// The return path for what a run produced. Deliberately takes a PATH rather than
+// working out what an artifact is: "everything under tests/" would be wrong for
+// the next suite, and `runner fetch tests/UI/screenshot-diffs` needs no
+// convention to read.
+//
+// Extracts over what is here and removes nothing -- a result being copied back,
+// not a tree being kept in step.
+// ---------------------------------------------------------------------------
+function fetchOne(ctx, rel) {
+	return new Promise((resolve) => {
+		relayRequest(
+			'GET',
+			`/artifacts?project=${encodeURIComponent(ctx.project)}&path=${encodeURIComponent(rel)}`,
+			{
+				onResponse: (res) => {
+					if (res.statusCode !== 200) {
+						let t = '';
+						res.setEncoding('utf8');
+						res.on('data', (d) => (t += d));
+						res.on('end', () => die(t.trim() || `fetch failed (${res.statusCode})`));
+						return;
+					}
+					const tar = spawn('tar', ['-x', '-f', '-', '-C', ctx.root, '--no-same-owner'], {
+						stdio: ['pipe', 'ignore', 'pipe'],
+					});
+					let err = '';
+					tar.stderr.on('data', (b) => {
+						if (err.length < 8192) err += b.toString();
+					});
+					tar.on('error', (e) => die(`could not run tar: ${e.message}`));
+					let bytes = 0;
+					res.on('data', (d) => (bytes += d.length));
+					res.pipe(tar.stdin);
+					tar.on('close', (code) => {
+						if (code !== 0) die(`tar exited ${code}: ${err.trim()}`);
+						process.stderr.write(
+							`runner: fetched ${rel} (${(bytes / 1e6).toFixed(1)} MB)\n`
+						);
+						resolve();
+					});
+				},
+			}
+		);
+	});
+}
+
+// ---------------------------------------------------------------------------
 // exec
 // ---------------------------------------------------------------------------
 function doExec(ctx, command) {
@@ -380,12 +430,13 @@ function doExec(ctx, command) {
 
 	if (!sub || sub === '-h' || sub === '--help') {
 		process.stderr.write(
-			'usage: runner [--no-git] [-v] <status|sync|exec|run> [command...]\n' +
+			'usage: runner [--no-git] [-v] <status|sync|exec|run|fetch> [args...]\n' +
 				'\n' +
-				'  status         show what runner is joined and what it sees\n' +
-				'  sync           push this project\'s source to the runner\n' +
-				'  exec <cmd...>  run <cmd> there without syncing first\n' +
-				'  run  <cmd...>  sync, then run <cmd> there\n'
+				'  status          show what runner is joined and what it sees\n' +
+				'  sync            push this project\'s source to the runner\n' +
+				'  exec <cmd...>   run <cmd> there without syncing first\n' +
+				'  run  <cmd...>   sync, then run <cmd> there\n' +
+				'  fetch <path...> copy results back from the runner into this tree\n'
 		);
 		process.exit(sub ? 0 : 2);
 	}
@@ -405,6 +456,11 @@ function doExec(ctx, command) {
 
 	if (sub === 'sync') {
 		await doSync(ctx, opts);
+		return;
+	}
+	if (sub === 'fetch') {
+		if (!argv.length) die('usage: runner fetch <path...>', 2);
+		for (const rel of argv) await fetchOne(ctx, rel);
 		return;
 	}
 	if (sub === 'exec' || sub === 'run') {

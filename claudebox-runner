@@ -41,6 +41,7 @@ BOX_SETTINGS=(
     BOX_USER BOX_UID BOX_GID
     BOX_DIND_APPARMOR
     BOX_RUNNER_PORT BOX_RUNNER_WORKSPACE BOX_RUNNER_BASE_IMAGE
+    BOX_RUNNER_ROUTER_HTTP_PORT
 )
 if [ -f "${BOX_CONFIG}" ]; then
     declare -A _from_env=()
@@ -65,6 +66,9 @@ export BOX_RUNNER_PORT="${BOX_RUNNER_PORT:-7998}"
 # because a nested "docker run -v" resolves its source against it.
 export BOX_RUNNER_WORKSPACE="${BOX_RUNNER_WORKSPACE:-/home/${BOX_USER}/Projects}"
 export BOX_RUNNER_BASE_IMAGE="${BASE_IMAGE}"
+# Port 80 inside the sidecar is the host.docker.internal front door's; this is
+# where the DDEV router's plain-HTTP entrypoint moves to. https stays on 443.
+export BOX_RUNNER_ROUTER_HTTP_PORT="${BOX_RUNNER_ROUTER_HTTP_PORT:-8080}"
 
 DIND_APPARMOR_TAG=claudebox-runner
 DIND_APPARMOR_DIR="${BOX_DIR}"

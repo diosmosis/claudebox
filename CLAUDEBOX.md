@@ -421,7 +421,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | `runner-shim` | The box's `runner` (baked to `/usr/local/bin/runner`); syncs a project to the remote runner and runs commands there |
 | `runner-relay/Dockerfile`, `runner-relay/relay.mjs` | The relay that holds the runner's credential and forwards to it |
 | `runner/Dockerfile`, `runner/runner.mjs`, `runner/entrypoint.sh` | The runner image (`FROM` the main Dockerfile's `base` stage), its API, and the first-start identity, DDEV and mkcert setup |
-| `ddev-bridge` | Baked into the runner image as `claudebox-ddev-bridge`; points `db:3306` and a project's hostnames at a DDEV project running inside the runner's dind |
+| `ddev-bridge` | Baked into the runner image as `claudebox-ddev-bridge`; points `db:3306`, `host.docker.internal` and a project's hostnames at a DDEV project running inside the runner's dind |
 | `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
 | `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
@@ -573,10 +573,22 @@ the same fontconfig rules.
   this machine                                    the runner machine
   ------------                                    ------------------
   claudebox ──POST {project, command}──▶ runner-relay ──TLS+token──▶ claudebox-runner
-   (agent)      (claudebox_inner,               (holds address,          │
-                 internal: true)                 token, fingerprint)     ├─ rootless dind
-                                                                         └─ workspace volume
+   (agent)      (claudebox_inner,               (holds address,          │  ddev, Chromium
+                 internal: true)                 token, fingerprint)     │
+                                                                         ├─ workspace volume
+                                                                         └─ rootless dind
+                                                                             ├─ ddev-router  :443
+                                                                             ├─ ddev-<p>-web/-db
+                                                                             ├─ front door   :80
+                                                                             │   = host.docker.internal
+                                                                             ├─ db forward   :3306
+                                                                             └─ wp-env       :8888
 ```
+
+Everything a project consists of lives inside the sidecar. The runner reaches it
+only through ports published there, which is what shapes the three pieces below:
+the database bridge, the `host.docker.internal` front door, and the loopback
+forwarders.
 
 ### Why it is built this way
 
@@ -692,6 +704,14 @@ Directories only: an ignored *file* still goes, so nothing a checkout needs is
 quietly withheld. The walk switches repository when it descends into a nested
 checkout, so that project's own `.gitignore` is the one that applies inside it.
 
+That last rule has a visible consequence worth knowing: a gitignored *file* is
+overwritten on the runner by this machine's copy. For a DDEV project it happens
+to be what you want — Matomo's `config/config.ini.php` says `host = "db"` on both
+sides, and carrying the same salt and `trusted_hosts` across means the two
+instances agree — but it does mean the runner cannot hold a machine-local
+*file* that differs. Anything that must differ per machine belongs in an ignored
+*directory*, or in the environment.
+
 The client sends that exclusion list along with the manifest, and this is
 load-bearing rather than an optimisation: without it the runner walks into its
 own `vendor/`, sees files the manifest does not mention, and **deletes them** —
@@ -713,10 +733,11 @@ once **on the runner** and stay there.
 ### In the box
 
 ```
-runner status          what is joined, and which project/workdir this resolves to
-runner sync            push this project's source
-runner run <cmd...>    sync, then run <cmd> there (the usual one)
-runner exec <cmd...>   run without syncing first
+runner status           what is joined, and which project/workdir this resolves to
+runner sync             push this project's source
+runner run <cmd...>     sync, then run <cmd> there (the usual one)
+runner exec <cmd...>    run without syncing first
+runner fetch <path...>  copy results back into this tree
 ```
 
 A DDEV-backed suite is one line, because the runner has a real `ddev`:
@@ -816,6 +837,131 @@ commands rather than trying to guess.
 `claudebox-ddev-fixups` ports unchanged: it drives `ddev exec`, which on the
 runner is the real thing rather than the box's shim onto the host.
 
+#### The CI-shaped addresses: host.docker.internal and localhost:8888
+
+Matomo's UI suite is written against a single-host CI runner, and two addresses
+in it are load-bearing:
+
+```js
+const baseUrl = process.env.UITEST_WP_ENV_BASE_URL || 'http://localhost:8888';
+await page.webpage.goto('http://host.docker.internal/tests/PHPUnit/proxy/index.php?...');
+```
+
+`localhost:8888` is wp-env's WordPress and `http://host.docker.internal/` is
+Matomo — **on port 80**, which is why the DDEV router's plain-HTTP port is moved
+out of the way rather than the front door being put somewhere convenient. A port
+suffix would appear in URLs the screenshots contain.
+
+**`localhost:8888`** is the box's `CLAUDEBOX_DIND_PORTS` forwarders, ported to
+`runner/entrypoint.sh` unchanged: a container started inside the sidecar
+publishes onto the *sidecar's* interface, so wp-env's WordPress is at `dind:8888`
+and a spec that says `localhost:8888` finds nothing. Chromium runs in the runner
+container, so that is the side that has to agree with the baseline.
+
+**`host.docker.internal`** is the box's `ddev-http`, moved a level down — and the
+move is what makes it interesting. In the box it is a sibling compose service at
+a fixed address on `claudebox_inner`. On the runner it cannot be a sibling: the
+project's containers live inside the sidecar, and a sibling could only reach them
+through published ports, which means through `ddev-router` — and traefik replaces
+`X-Real-Ip`/`X-Forwarded-For` with the address it received the connection from
+unless that peer is in its trusted list. The whole point of the front door is
+that those headers are *ours* to set.
+
+Nor can the runner create siblings: it drives the sidecar's daemon and has no
+access to this machine's, by design. So the front door runs **inside** the
+sidecar, started by `claudebox-ddev-bridge` on the project's own network, where
+it reaches `ddev-<project>-web` by name.
+
+Three consequences, each of which cost a round to find:
+
+| | |
+|---|---|
+| `--host-gateway-ip=10.99.2.10` | The sidecar's own address on the runner network, so `host.docker.internal:host-gateway` — which wp-env attaches to everything it starts — lands on whatever the sidecar publishes. `extra_hosts` gives the runner container the same name, because Chromium runs there. |
+| `router_http_port: "8080"` | Port 80 inside the sidecar belongs to the front door. The router keeps 443, so `https://<project>.ddev.site` is unchanged. |
+| a passthrough server block | Without it, `http://<project>.ddev.site` would quietly reach the *one* project the front door points at — a wrong answer that looks like a right one. nginx prefers an exact `server_name` over a regex, so `host.docker.internal` keeps the front door and `*.ddev.site` goes to the router. It must name the router's **configured** port: moving the published port moves traefik's entrypoint with it. |
+
+The nginx configuration is the *same file* the box's `ddev-http` image is built
+from — shipped into the runner image as a template, rendered by the bridge with
+`sed`, and handed to a stock `nginx:alpine` over a bind mount. Not built as an
+image, because a container inside the sidecar cannot see images built out here
+and there is no registry to pull a local one from. Sharing the file is the point:
+what is in it (the `Host` rewrite, `X-Real-IP: 127.0.0.1`) is exactly the part
+that would show up as screenshot diffs if the two copies drifted.
+
+Measured on the runner, which is the check worth repeating after any change here:
+
+```
+via host.docker.internal : 127.0.0.1|matomo.ddev.site
+via https router         : 172.28.1.1|matomo.ddev.site
+```
+
+The first line is what a CI runner records. The second is why the front door is
+not simply the router.
+
+And from inside a container wp-env started, which is the path that has to work
+for the WordPress side of the suite:
+
+```
+$ getent hosts host.docker.internal
+10.99.2.10      host.docker.internal
+$ curl -o /dev/null -w '%{http_code}' http://host.docker.internal/tests/PHPUnit/proxy/index.php
+200
+```
+
+#### Where UI testing actually stands
+
+The infrastructure is verified end to end, and **rendering parity is proven**.
+`WordPress_Plugin_wp_installed.png` compared clean against a baseline recorded on
+an `ubuntu-24.04` CI runner. Better evidence still came from one that did *not*
+compare clean: stacking `WordPress_Plugin_wp_admin.png` against its baseline shows
+the two pages pixel-identical — same glyphs, same wrap points, same shades —
+except for a URL string reading `matomo.ddev.site` where the baseline reads
+`host.docker.internal`. An 11403-pixel diff that is entirely one line of *text
+content* is exactly what a correct font stack looks like; a font mismatch moves
+every glyph on the page.
+
+The suite as a whole does not pass yet, and none of the remaining causes is the
+runner:
+
+- **The nested-uid write permission** above, which blocks the plugin install and
+  is measurably identical in the box.
+- **WooCommerce onboarding drift.** `.wp-env.json` pulls
+  `downloads.wordpress.org/plugin/woocommerce.zip` — always the latest — and the
+  spec's "skip setup" step no longer finds its link (`cannot find skip setup
+  link`, then `Execution context was destroyed`). That is the project's pin to
+  fix, and it would fail the same way here.
+- **The Matomo instance's own recorded URL.** A Matomo installed on the runner by
+  `ddev matomo:init` knows itself as `matomo.ddev.site`, and the plugin's settings
+  page prints that URL where the baseline has `host.docker.internal` — which is
+  the entire 11403-pixel diff above. The fix is `UITEST_MATOMO_BASE_URL` in
+  `plugins/WooCommerceAnalytics/.env`, which the fixture reads; the file is
+  gitignored, and gitignored *files* do cross, so writing it on this machine puts
+  it on the runner. (`tests:run-ui --matomo-domain=...` looks like the tidier
+  answer and is not: it is forwarded to `tests:setup-fixture`, which does not
+  accept it, and the fixture then fails to set up at all.) Setup state, not
+  environment.
+
+So: proven that the runner can render a baseline-identical screenshot; not yet
+proven that this particular suite is green anywhere.
+
+#### Artifacts
+
+`GET /artifacts?project=&path=` returns a tar of one path; `runner fetch <path>`
+extracts it into the local tree.
+
+The plan asked whether it should return everything or only diffs. Neither: **the
+caller names the path**. The runner has no idea what an artifact is, and a rule
+baked in at either end (`only diffs`, `everything under tests/`) would be wrong
+for the next suite. `runner fetch tests/UI/screenshot-diffs` needs no convention
+to read.
+
+It extracts over what is there and removes nothing — a result being copied back,
+not a tree being kept in step. The path is validated against the project root the
+same way every other path is, and the size is checked *before* streaming rather
+than cut off mid-tar: a truncated tar fails with an error about the archive,
+which is a poor way to learn that a UI failure produced four thousand
+screenshots. `CLAUDEBOX_RUNNER_MAX_ARTIFACT` (2 GB) is the ceiling.
+
 #### The one environment difference: DDEV containers run as root
 
 On a **rootless** Docker daemon, DDEV runs its containers as root — container
@@ -859,15 +1005,48 @@ The runner's identity lives in the `claudebox-runner-state` volume, so restarts
 and rebuilds of the *service* keep it. `claudebox-runner reset` deletes the synced
 workspace (costing a re-sync) and keeps the identity.
 
-### Not yet done
+#### First run for a project
 
-`/artifacts` — pulling screenshots, diffs and logs back — is not implemented;
-anything a test writes on the runner stays there. wp-env under the runner's
-dind, the `CLAUDEBOX_DIND_PORTS` socat forwarders and the `--host-gateway-ip` /
-`ddev-http` arrangement that lets nested containers reach Matomo are still to
-come, and with them the `X-Real-IP: 127.0.0.1` that makes the client-IP half of
-`claudebox-ddev-fixups` mean anything on the runner. Until then the runner
-handles suites that need a checkout, its own dependencies, and a DDEV project.
+Nothing gitignored is synced, which is the whole design — and it means every
+`node_modules` and `vendor` has to be installed *on the runner*, once. It is
+worth knowing how many there are before hunting the third one: Matomo's UI suite
+needs **three separate installs**, and each failure names something else.
+
+```
+runner exec "composer install"                                 # vendor/
+runner exec "npm ci"                                           # node_modules/
+runner exec "cd tests/lib/screenshot-testing && npm ci"         # Cannot find module 'puppeteer'
+runner exec "cd plugins/WooCommerceAnalytics && npm install"    # sh: 1: wp-env: not found
+```
+
+Then, per session:
+
+```
+runner run "ddev start -y && claudebox-ddev-bridge && claudebox-ddev-fixups"
+runner exec "WP_ENV_HOME=/home/dizzy/Projects/.wp-env-home \
+  php console tests:run-ui --plugin=WooCommerceAnalytics --keep-symlinks WordPress_Plugin"
+runner fetch plugins/WooCommerceAnalytics/tests/UI/processed-screenshots \
+              plugins/WooCommerceAnalytics/tests/UI/screenshot-diffs
+```
+
+`WP_ENV_HOME` must be a path the sidecar can see. Under the workspace is the
+obvious one and matches what this machine needs. On the runner the default
+`~/.wp-env` would work too — HOME is mounted into the sidecar for DDEV's sake, and
+a bind out of it resolves (checked) — but keeping the same value on both machines
+is one less difference.
+
+### Protocol
+
+| Operation | Purpose |
+|---|---|
+| `POST /sync/plan` | manifest in, `{need, delete}` out |
+| `POST /sync/delete` | remove what this side no longer has |
+| `POST /sync/upload` | a tar of what it needs |
+| `POST /exec` | run a command, framed output back |
+| `GET /artifacts` | tar one path back |
+
+`runner-relay` forwards exactly these and rebuilds the headers rather than
+passing them through.
 
 ## Egress allowlist
 
@@ -1019,6 +1198,55 @@ Nested containers get the standard proxy variables injected and nothing else
 them unless its image or command sets `NODE_USE_ENV_PROXY` too.
 
 ## Known issues and caveats
+
+### Open: nested containers cannot write to the workspace as a non-root user
+
+**This affects the box, not only the runner**, and it arrived with the move off
+Docker Desktop rather than with any change here.
+
+Under rootless dind, rootlesskit maps *nested* root to the daemon's user, so a
+tree owned by uid 1000 outside appears as **uid 0** inside a nested container. A
+nested process running as uid 1000 — which is what wp-env runs Apache as — then
+cannot write to it. Measured identically on both machines:
+
+```
+$ docker run --rm -v ~/Projects/matomo/wp-uploads:/w -u 1000:1000 alpine \
+    sh -c 'ls -ldn /w; touch /w/probe'
+drwxr-xr-x 5 0 0 4096 /w
+touch: /w/probe: Permission denied      # as root: writable
+```
+
+Docker Desktop's virtiofsd squashed every uid to 1000, so this could not happen
+there; a native `dockerd` passes ownership through. The last successful UI run on
+this machine predates that switch.
+
+What it looks like when you hit it, and why it is worth naming: the suite runs,
+the fixture sets up, Chromium drives the browser, and the failure is a WordPress
+page reading
+
+```
+The uploaded file could not be moved to wp-content/uploads/2026/08.
+```
+
+— which reads like a WordPress or wp-env problem and is neither.
+
+It is not only the directories the fixture maps in (`wp-uploads`,
+`wp-debug.log`). wp-env's own WordPress tree under `WP_ENV_HOME` has the same
+problem — WordPress needs `wp-content/upgrade` to unpack a plugin, and that is
+created by wp-env as the outer user and therefore shows as uid 0 inside too. The
+first symptom is the upload; the next one, once that is fixed, is
+
+```
+Could not create directory. /var/www/html/wp-content/upgrade
+```
+
+so fixing them one at a time is a trap. Everything the containers write into has
+to be writable by the nested uid.
+
+Making those trees world-writable is the small fix; running wp-env's containers
+as root is the other. Neither is chosen here — it is the *project's* fixture that
+creates those directories, and which answer is right depends on what else writes
+into that tree.
 
 ### Design consequences (working as intended, but surprising)
 
@@ -1559,6 +1787,33 @@ claudebox shell -c 'runner exec "claudebox-ddev-fixups && claudebox-ddev-fixups 
 claudebox-runner stop && claudebox-runner >/dev/null
 claudebox shell -c 'runner exec "claudebox-ddev-bridge --status"'   # 127.0.0.1
 claudebox shell -c 'runner exec "claudebox-ddev-bridge && claudebox-ddev-bridge --status"'
+```
+
+The CI-shaped addresses. **The first is the one that decides whether screenshot
+baselines can ever match**, and it fails silently -- the suite runs, the visits
+log fills in, and only the IP text in the image is wrong:
+
+```bash
+cd ~/Projects/matomo
+claudebox shell -c 'runner exec "ddev exec \"printf %s \\\"<?php echo \\\\\$_SERVER[REMOTE_ADDR];\\\" > /var/www/html/p.php\" \
+  && curl -sS http://host.docker.internal/p.php && echo \
+  && curl -sS https://matomo.ddev.site/p.php && echo \
+  && ddev exec rm -f /var/www/html/p.php"'
+# host.docker.internal MUST print 127.0.0.1. Through the router it will not --
+# that is why the front door exists, not a fault.
+
+# The passthrough: plain http to a project must reach THAT project through the
+# router, not the one the front door points at.
+claudebox shell -c 'runner exec "curl -sS -o /dev/null -w \"%{http_code}\n\" http://matomo.ddev.site/"'
+
+# The loopback forwarders exist (wp-env's ports), listening in the runner itself.
+claudebox shell -c 'runner exec "ss -ltn 2>/dev/null | grep -E \"127.0.0.1:(8888|8889)\" || \
+  echo MISSING -- check CLAUDEBOX_DIND_PORTS"'
+
+# Artifacts round-trip, and refuse to leave the project.
+claudebox shell -c 'runner exec "mkdir -p probe && date > probe/one.txt"'
+claudebox shell -c 'runner fetch probe' && cat probe/one.txt && rm -rf probe
+claudebox shell -c 'runner fetch ../elsewhere'   # must refuse
 ```
 
 With a DDEV project running, also check TLS still validates through the proxy

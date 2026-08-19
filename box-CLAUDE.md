@@ -167,9 +167,9 @@ to do with a new project on the runner is therefore install into it —
 
 Two consequences worth remembering:
 
-- Anything a test WRITES on the runner stays there. There is no return path for
-  files yet, so a suite whose result is a file (screenshot diffs, coverage) is
-  not finished by running it remotely — read what you need with `runner exec`.
+- Anything a test WRITES on the runner stays there until you ask for it. A suite
+  whose result is a file — screenshot diffs, coverage — is not finished by
+  running it remotely; `runner fetch <path>` brings it back.
 - The runner has ordinary internet access; it is not behind this box's
   allowlist. A `composer install` that fails here may well work there.
 
@@ -189,6 +189,25 @@ itself. Run it after every `ddev start` and after a runner restart; it is
 idempotent, and `claudebox-ddev-bridge --status` shows what is pointed where.
 
 `claudebox-ddev-fixups` is there too and behaves exactly as it does here.
+
+After `claudebox-ddev-bridge`, three addresses mean on the runner what they mean
+on a single-host CI runner — which is what the screenshot baselines were recorded
+against:
+
+| | |
+|---|---|
+| `http://host.docker.internal/` | the bridged DDEV project, with the client presented as **127.0.0.1**. This is what wp-env's WordPress and the UI specs navigate to. |
+| `https://<project>.ddev.site/` | the same project through ddev-router, client IP not rewritten |
+| `localhost:8888`, `localhost:8889` | wp-env's WordPress, forwarded from the runner's own dind |
+
+Anything a run produces stays on the runner unless you ask for it:
+
+```
+runner fetch tests/UI/screenshot-diffs      copy a path back into this tree
+```
+
+It takes a path because there is no general answer to "what is an artifact" —
+name what you want. It extracts over what is here and deletes nothing.
 
 One real difference from a DDEV project on this machine, worth knowing before it
 confuses you: **the runner's DDEV containers run as root inside**. That is DDEV's

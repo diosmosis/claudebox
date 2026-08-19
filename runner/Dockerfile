@@ -106,6 +106,20 @@ RUN apt-get update \
 COPY ddev-bridge /usr/local/bin/claudebox-ddev-bridge
 RUN chmod 0755 /usr/local/bin/claudebox-ddev-bridge
 
+# The same nginx configuration the box's ddev-http service is built from, shipped
+# as a template the bridge renders and hands to a stock nginx inside the sidecar.
+#
+# Shared rather than reimplemented, because what is in it is the load-bearing
+# part: the Host rewrite, and X-Real-IP/X-Forwarded-For set to 127.0.0.1 so the
+# project records visits from the address a single-host CI runner would. A second
+# copy of that would drift, and the drift would show up as screenshot diffs.
+#
+# Not built as an image here: this container runs inside the sidecar's daemon,
+# which cannot see images built out here and has no registry to pull a local one
+# from. Stock nginx:alpine plus a rendered config over a bind mount avoids both.
+COPY ddev-http/default.conf.template /usr/local/share/claudebox/ddev-http.conf.template
+RUN chmod 0644 /usr/local/share/claudebox/ddev-http.conf.template
+
 COPY runner/runner.mjs /app/runner.mjs
 COPY runner/entrypoint.sh /usr/local/bin/runner-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/runner-entrypoint.sh

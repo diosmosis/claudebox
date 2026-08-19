@@ -40,6 +40,7 @@ const ROUTES = new Set([
 	'POST /sync/delete',
 	'POST /sync/upload',
 	'POST /exec',
+	'GET /artifacts',
 ]);
 
 function parseTarget(t) {

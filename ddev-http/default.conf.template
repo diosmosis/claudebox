@@ -10,8 +10,12 @@
 # environment.
 
 server {
+    # Named as well as default: on the runner a second block is appended that
+    # passes *.ddev.site through to ddev-router, and nginx picks an exact name
+    # over a regex, so this one keeps host.docker.internal. In the box, where it
+    # is the only block, default_server means this is unchanged.
     listen 80 default_server;
-    server_name _;
+    server_name host.docker.internal;
 
     # Docker's embedded DNS, consulted per request rather than at startup:
     # naming the upstream directly in proxy_pass would make nginx refuse to boot

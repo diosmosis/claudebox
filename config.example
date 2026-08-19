@@ -69,3 +69,10 @@
 # (a path inside its workspace volume, not on that machine's disk).
 #BOX_RUNNER_PORT=7998
 #BOX_RUNNER_WORKSPACE=/home/dizzy/Projects
+
+# Where the DDEV router's plain-HTTP entrypoint goes inside the runner's dind.
+# Port 80 in there belongs to the host.docker.internal front door, which is the
+# address and the port a single-host CI runner serves Matomo on -- moving it
+# would put a port suffix into URLs the screenshot baselines contain. https is
+# unaffected and stays on 443. Change this only if 8080 collides.
+#BOX_RUNNER_ROUTER_HTTP_PORT=8080

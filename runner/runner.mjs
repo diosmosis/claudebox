@@ -15,6 +15,7 @@
 //   POST /sync/delete   {project, paths}     -> removed from the project
 //   POST /exec          {project, workdir, command}
 //                                            -> framed stdout/stderr/exit
+//   GET  /artifacts     ?project=&path=      -> tar stream of that path
 //
 // Everything is confined to WORKSPACE. Paths arrive RELATIVE -- a project name
 // and a path within it -- so there is no assumption that the two machines
@@ -36,7 +37,7 @@ import path from 'node:path';
 import https from 'node:https';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const WORKSPACE = path.resolve(
 	process.env.CLAUDEBOX_RUNNER_WORKSPACE || '/home/dizzy/Projects'
@@ -309,6 +310,63 @@ function syncUpload(req, res, project) {
 }
 
 // ---------------------------------------------------------------------------
+// /artifacts
+//
+// The return path for whatever a run produced: screenshot diffs, coverage, logs.
+// The CALLER names the path, and that is the whole policy -- this end has no idea
+// what an artifact is, and a rule baked in here ("only diffs", "everything under
+// tests/") would be wrong for the next suite. `runner fetch tests/UI/screenshot-diffs`
+// is explicit and needs no convention.
+//
+// Not a mirror: it extracts over what is here and removes nothing, because the
+// thing being copied back is a result, not a tree to keep in step.
+//
+// Sized before streaming rather than cut off mid-tar. A truncated tar fails to
+// extract with an error about the archive, which is a bad way to learn that a
+// UI failure produced four thousand screenshots.
+// ---------------------------------------------------------------------------
+const MAX_ARTIFACT = Number(process.env.CLAUDEBOX_RUNNER_MAX_ARTIFACT || 2 * 1024 * 1024 * 1024);
+
+function sendArtifacts(res, project, rel) {
+	const root = projectDir(project);
+	if (typeof rel !== 'string' || rel === '' || rel === '.') {
+		throw new Error('path is required (naming the whole project is never what is meant)');
+	}
+	const target = insideProject(root, rel);
+	if (!fs.existsSync(target)) {
+		throw new Error(`${rel} does not exist on the runner`);
+	}
+
+	const sized = spawnSync('du', ['-sb', '--', target], { encoding: 'utf8' });
+	const bytes = Number((sized.stdout || '').split(/\s+/)[0]) || 0;
+	if (bytes > MAX_ARTIFACT) {
+		throw new Error(
+			`${rel} is ${Math.round(bytes / 1e6)} MB, over the ${Math.round(MAX_ARTIFACT / 1e6)} MB ` +
+				'limit. Name something narrower, or raise CLAUDEBOX_RUNNER_MAX_ARTIFACT on the runner.'
+		);
+	}
+
+	res.writeHead(200, {
+		'content-type': 'application/x-tar',
+		'x-claudebox-artifact-bytes': String(bytes),
+	});
+
+	const child = spawn('tar', ['-c', '-f', '-', '-C', root, '--', rel], {
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+	child.stderr.resume();
+	child.stdout.pipe(res);
+	child.on('error', () => res.destroy());
+	res.on('close', () => {
+		try {
+			child.kill('SIGKILL');
+		} catch {
+			/* already gone */
+		}
+	});
+}
+
+// ---------------------------------------------------------------------------
 // /exec
 // ---------------------------------------------------------------------------
 function runExec(res, { project, workdir, command, env }) {
@@ -419,6 +477,9 @@ const server = https.createServer(
 			}
 			if (req.method === 'POST' && url.pathname === '/exec') {
 				return runExec(res, await readJson(req));
+			}
+			if (req.method === 'GET' && url.pathname === '/artifacts') {
+				return sendArtifacts(res, url.searchParams.get('project'), url.searchParams.get('path'));
 			}
 			return fail(res, 404, 'claudebox-runner: not found');
 		} catch (e) {
