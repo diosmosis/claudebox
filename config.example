@@ -47,8 +47,8 @@
 
 # --- the remote test runner -------------------------------------------------
 
-# Set by "claudebox runner add <host:port> <token> <fingerprint>", which is the
-# line the other machine's "claudebox-runner" prints when it starts. They are
+# Set by "claudebox runner add <host:port> <code>", using the eight-character
+# enrolment code the other machine's "claudebox-runner" prints. They are
 # handed to the runner-relay container and to nothing else -- the box itself
 # never sees the address, the token or the fingerprint, which is what keeps a
 # remote runner from being a hole in the egress sandbox.

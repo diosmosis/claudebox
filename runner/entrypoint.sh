@@ -49,6 +49,40 @@ fi
 openssl x509 -in "${STATE}/cert.pem" -noout -fingerprint -sha256 \
     | sed 's/^.*Fingerprint=//' > "${STATE}/fingerprint"
 
+# ---------------------------------------------------------------------------
+# The enrolment window
+#
+# The token is 64 hex characters and the fingerprint 95, and the two of them
+# together are not a thing anyone types across a room correctly. So the join line
+# carries a SHORT code instead, and the agent machine trades it for the token
+# over the runner's own TLS connection, pinning whatever certificate it is shown.
+#
+# What that buys and what it costs, plainly:
+#
+#   The code is single-use and short-lived, so another host on this network
+#   cannot simply connect during the window and walk away with a token that
+#   grants it code execution here. That is the attack worth closing.
+#
+#   The certificate is trusted on first sight. An attacker already sitting
+#   ON the path at the moment of enrolment could present its own and keep
+#   MITMing thereafter -- the same residual risk ssh accepts the first time it
+#   shows you a host key, and it is why every request after enrolment is pinned
+#   rather than re-negotiated. `claudebox-runner join --full` prints the token
+#   and fingerprint explicitly for anyone who would rather not accept it.
+#
+# The alphabet leaves out 0/O and 1/l/I: this exists to be read aloud and typed.
+# 8 characters of 31 is about 40 bits, which a single-use code behind a network
+# round trip does not need to beat by much -- and ten wrong guesses close the
+# window rather than letting anyone keep trying.
+# ---------------------------------------------------------------------------
+# Only while this runner has never been joined. A runner that restarts nightly
+# should not re-open a window every night; "claudebox-runner enrol" is how you
+# open one deliberately, to join it to another machine or after a re-issue.
+# Same script both ways, so there is one definition of what a window is.
+if [ ! -f "${STATE}/enrolled" ]; then
+    /usr/local/bin/claudebox-runner-enrol
+fi
+
 chown -R "${USERNAME}:${USERNAME}" "${STATE}"
 
 # Only the root of the workspace, not -R: it is a volume that will hold entire

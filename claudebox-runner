@@ -11,6 +11,10 @@
 #
 #   claudebox-runner            build if needed, start, and print the join line
 #   claudebox-runner join       print the join line again
+#   claudebox-runner join --full  the token and fingerprint, for a join that
+#                               trusts no certificate on sight
+#   claudebox-runner enrol      open a new enrolment window (to join a second
+#                               machine, or after one expired)
 #   claudebox-runner status     show what is running and what it holds
 #   claudebox-runner logs [-f]  the runner's log
 #   claudebox-runner rebuild    rebuild both images from scratch
@@ -96,8 +100,18 @@ lan_address() {
     ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}'
 }
 
+# The join line, in its short form: an address and an eight-character code.
+#
+# The long form -- the 64-hex token and the 95-character fingerprint -- is still
+# what ends up in the other machine's config, and "join --full" still prints it.
+# It is simply not a thing anyone types across a room correctly, so by default
+# the code is printed and the two machines trade it for the rest over the
+# runner's own TLS connection. See runner/entrypoint.sh for what that protects
+# and what it does not.
 print_join() {
-    local token fp addr
+    local full="" token fp code expires addr left
+    [ "${1:-}" = "--full" ] && full=1
+
     token="$(runner_state token)"
     fp="$(runner_state fingerprint)"
     if [ -z "${token}" ] || [ -z "${fp}" ]; then
@@ -105,28 +119,75 @@ print_join() {
         echo "claudebox-runner: start it first ('claudebox-runner')." >&2
         return 1
     fi
+
     addr="$(lan_address)"
     [ -n "${addr}" ] || addr="<this machine's address>"
+
+    if [ -n "${full}" ]; then
+        cat <<EOF
+
+claudebox-runner: the explicit form. It needs no enrolment window and trusts no
+certificate on sight. On the machine that runs the agent:
+
+  claudebox runner add ${addr}:${BOX_RUNNER_PORT} ${token} ${fp}
+
+EOF
+        return 0
+    fi
+
+    code="$(runner_state enrol-code)"
+    expires="$(runner_state enrol-expires)"
+    left=0
+    if [ -n "${expires}" ]; then
+        left=$(( expires - $(date +%s) ))
+    fi
+
+    if [ -z "${code}" ] || [ "${left}" -le 0 ]; then
+        cat <<EOF
+
+claudebox-runner: ready, and already joined to a machine (or its enrolment
+window has expired). To join one now, open a new window here:
+
+  claudebox-runner enrol
+
+EOF
+        return 0
+    fi
+
     cat <<EOF
 
 claudebox-runner: ready. On the machine that runs the agent, run:
 
-  claudebox runner add ${addr}:${BOX_RUNNER_PORT} ${token} ${fp}
+  claudebox runner add ${addr}:${BOX_RUNNER_PORT} ${code}
 
-That stores the address, the token and the certificate fingerprint in that
-machine's ~/.claudebox/config. Nothing is stored here about it: this runner
-accepts anything that presents the token over the pinned certificate.
+That code works once and is good for $(( (left + 59) / 60 )) more minutes. It is
+traded for the token over this runner's own connection, so nothing secret is
+typed. "claudebox-runner join --full" prints the token and fingerprint instead,
+for a join that trusts no certificate on sight.
 
 EOF
 }
 
 case "${1:-}" in
     -h|--help|help)
-        sed -n '3,22p' "$(readlink -f -- "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+        sed -n '3,26p' "$(readlink -f -- "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
 
     join)
+        shift
+        print_join "${1:-}"
+        exit $?
+        ;;
+
+    enrol|enroll)
+        # A deliberate window, for joining this runner after the first time: a
+        # re-install on the agent side, a second agent machine, or a window that
+        # expired before anyone got to it.
+        if ! docker exec "${STATE_CONTAINER}" /usr/local/bin/claudebox-runner-enrol; then
+            echo "claudebox-runner: could not open an enrolment window; is the runner running?" >&2
+            exit 1
+        fi
         print_join
         exit $?
         ;;

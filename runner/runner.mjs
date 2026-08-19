@@ -17,6 +17,10 @@
 //                                            -> framed stdout/stderr/exit
 //   GET  /artifacts     ?project=&path=      -> tar stream of that path
 //
+// and one that does NOT take the token, because it is what hands the token out:
+//
+//   POST /enrol         {code}               -> {token}
+//
 // Everything is confined to WORKSPACE. Paths arrive RELATIVE -- a project name
 // and a path within it -- so there is no assumption that the two machines
 // mount the tree at the same place, and every one of them is resolved and
@@ -81,6 +85,92 @@ function tokenOk(req) {
 	const a = Buffer.from(got);
 	const b = Buffer.from(TOKEN);
 	return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// /enrol
+//
+// The bootstrap, and the only route that answers without the token -- it is
+// where the token comes from. A short code is traded for it once; see the note
+// in runner/entrypoint.sh for what that model does and does not protect.
+//
+// State is read from disk per request rather than cached, so
+// `claudebox-runner enrol` opening a new window takes effect without a restart.
+// ---------------------------------------------------------------------------
+const ENROL_CODE = path.join(STATE, 'enrol-code');
+const ENROL_EXPIRES = path.join(STATE, 'enrol-expires');
+const ENROL_FAILURES = path.join(STATE, 'enrol-failures');
+const ENROLLED = path.join(STATE, 'enrolled');
+const MAX_ENROL_FAILURES = 10;
+
+function closeEnrolment() {
+	for (const f of [ENROL_CODE, ENROL_EXPIRES, ENROL_FAILURES]) {
+		try {
+			fs.unlinkSync(f);
+		} catch {
+			/* already gone */
+		}
+	}
+}
+
+function enrol(req, res, { code }) {
+	const peer = req.socket.remoteAddress || '?';
+	const closed =
+		'claudebox-runner: enrolment is closed on this runner.\n' +
+		'Open a window on the runner machine with:  claudebox-runner enrol\n';
+
+	let want;
+	try {
+		want = fs.readFileSync(ENROL_CODE, 'utf8').trim();
+	} catch {
+		return fail(res, 403, closed);
+	}
+	const expires = Number(fs.readFileSync(ENROL_EXPIRES, 'utf8').trim() || 0);
+	if (!want || !Number.isFinite(expires) || Date.now() / 1000 > expires) {
+		closeEnrolment();
+		console.error(`claudebox-runner: enrolment attempt from ${peer} after the window closed`);
+		return fail(res, 403, closed);
+	}
+
+	const got = typeof code === 'string' ? code.trim() : '';
+	const a = Buffer.from(got);
+	const b = Buffer.from(want);
+	const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+
+	if (!ok) {
+		// Guessing burns the window rather than getting unlimited attempts. It
+		// is a denial of service anyone on this network can trigger, and that is
+		// the right trade: re-opening is one command on the console, and a
+		// window that closed by itself is a thing you want to notice.
+		let failures = 0;
+		try {
+			failures = Number(fs.readFileSync(ENROL_FAILURES, 'utf8').trim() || 0);
+		} catch {
+			/* first failure */
+		}
+		failures += 1;
+		if (failures >= MAX_ENROL_FAILURES) {
+			closeEnrolment();
+			console.error(
+				`claudebox-runner: ${failures} bad enrolment codes (last from ${peer}); window closed`
+			);
+		} else {
+			fs.writeFileSync(ENROL_FAILURES, String(failures));
+			console.error(`claudebox-runner: bad enrolment code from ${peer} (${failures})`);
+		}
+		return fail(res, 403, 'claudebox-runner: that enrolment code is not right');
+	}
+
+	// Single use. Logged with the peer, so an enrolment you did not perform is
+	// visible in `claudebox-runner logs` rather than silent.
+	closeEnrolment();
+	try {
+		fs.writeFileSync(ENROLLED, new Date().toISOString() + ' ' + peer + '\n');
+	} catch {
+		/* not fatal */
+	}
+	console.error(`claudebox-runner: enrolled ${peer}`);
+	sendJson(res, 200, { token: TOKEN });
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +550,16 @@ const server = https.createServer(
 	},
 	async (req, res) => {
 		const url = new URL(req.url, 'https://runner');
+
+		// Before the token check, because this is the route that issues it.
+		if (req.method === 'POST' && url.pathname === '/enrol') {
+			try {
+				return enrol(req, res, await readJson(req));
+			} catch (e) {
+				return fail(res, 400, `claudebox-runner: ${e.message}`);
+			}
+		}
+
 		if (!tokenOk(req)) return fail(res, 401, 'claudebox-runner: bad or missing token');
 
 		try {

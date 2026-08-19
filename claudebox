@@ -646,9 +646,13 @@ runner_usage() {
     cat >&2 <<'USAGE'
 usage: claudebox runner <add|show|forget|test>
 
+  add <host:port> <code>
+        Join the runner on another machine, using the eight-character enrolment
+        code it printed. This is the line that machine's "claudebox-runner"
+        shows when it starts.
   add <host:port> <token> <fingerprint>
-        Join the runner on another machine. This is the line that machine's
-        "claudebox-runner" prints when it starts; copy it whole.
+        The explicit form, from "claudebox-runner join --full". Longer to type
+        and trusts no certificate on sight.
   show  What is joined (the token is not printed).
   test  Ask the runner whether it is reachable, through the relay.
   forget
@@ -659,13 +663,44 @@ running tests -- see claudebox-runner in this directory.
 USAGE
 }
 
+# Trade an enrolment code for the runner's token, and pin the certificate that
+# answered.
+#
+# Done in a one-off container from the relay image, because that is the only
+# thing here with both node and a route off this machine: the box has no LAN
+# access by design, and the host may have no node at all. The default bridge
+# network is enough -- it NATs to the host, which is where the LAN is.
+runner_enrol() {
+    local addr="${1}" code="${2}" out token fp
+    if ! docker image inspect claudebox-runner-relay:latest >/dev/null 2>&1; then
+        echo "claudebox: building the relay image, which is what performs the join..." >&2
+        "${COMPOSE[@]}" build runner-relay >/dev/null || {
+            echo "claudebox: could not build claudebox-runner-relay" >&2
+            return 1
+        }
+    fi
+    out="$(docker run --rm claudebox-runner-relay:latest \
+              node /app/enrol.mjs "${addr}" "${code}")" || return 1
+    token="$(printf '%s\n' "${out}" | sed -n 's/^TOKEN=//p')"
+    fp="$(printf '%s\n' "${out}" | sed -n 's/^FINGERPRINT=//p')"
+    if [ -z "${token}" ] || [ -z "${fp}" ]; then
+        echo "claudebox: the runner did not return a usable token" >&2
+        return 1
+    fi
+    config_set BOX_RUNNER "${addr}"
+    config_set BOX_RUNNER_TOKEN "${token}"
+    config_set BOX_RUNNER_FINGERPRINT "${fp}"
+    echo "claudebox: joined runner at ${addr}" >&2
+    echo "claudebox: pinned certificate ${fp}" >&2
+}
+
 runner_cmd() {
     local sub="${1:-}"
     shift || true
     case "${sub}" in
         add)
-            if [ "$#" -ne 3 ]; then
-                echo "claudebox: runner add takes exactly three arguments" >&2
+            if [ "$#" -ne 2 ] && [ "$#" -ne 3 ]; then
+                echo "claudebox: runner add takes an address and either a code or a token and fingerprint" >&2
                 runner_usage
                 return 2
             fi
@@ -673,6 +708,13 @@ runner_cmd() {
                 *:[0-9]*) ;;
                 *) echo "claudebox: '${1}' is not host:port" >&2; return 2 ;;
             esac
+            if [ "$#" -eq 2 ]; then
+                # The short form. The relay learns the certificate on the same
+                # connection it presents the code on, and pins it.
+                runner_enrol "${1}" "${2}" || return 1
+                echo "claudebox: relaunch claudebox to pick it up, then 'runner status' in the box" >&2
+                return 0
+            fi
             # The fingerprint is compared as an uppercase colon-separated hex
             # string, which is the form node reports and openssl prints. Reject
             # anything else here rather than letting it fail later as a
@@ -759,10 +801,12 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              process wrote into it as root (native engine only:
                              Docker Desktop squashed every uid to yours)
 
-  claudebox runner add <host:port> <token> <fingerprint>
-                             join a test runner on another machine -- paste the
-                             line that machine's "claudebox-runner" prints. Then
-                             "runner run <cmd>" inside the box runs it there.
+  claudebox runner add <host:port> <code>
+                             join a test runner on another machine, using the
+                             eight-character code its "claudebox-runner" prints.
+                             Then "runner run <cmd>" in the box runs it there.
+                             A <token> <fingerprint> pair also works, from
+                             "claudebox-runner join --full".
   claudebox runner show|test|forget
 
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)

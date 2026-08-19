@@ -421,6 +421,8 @@ Each of these is doing real work. Changing one breaks something specific.
 | `runner-shim` | The box's `runner` (baked to `/usr/local/bin/runner`); syncs a project to the remote runner and runs commands there |
 | `runner-relay/Dockerfile`, `runner-relay/relay.mjs` | The relay that holds the runner's credential and forwards to it |
 | `runner/Dockerfile`, `runner/runner.mjs`, `runner/entrypoint.sh` | The runner image (`FROM` the main Dockerfile's `base` stage), its API, and the first-start identity, DDEV and mkcert setup |
+| `runner/open-enrolment.sh` | Baked in as `claudebox-runner-enrol`; opens an enrolment window (a fresh short code and expiry). Called by the entrypoint on a never-joined runner and by `claudebox-runner enrol` |
+| `runner-relay/enrol.mjs` | Run as a one-off container by `claudebox runner add <host:port> <code>`: learns the runner's certificate, trades the code for the token, pins both |
 | `ddev-bridge` | Baked into the runner image as `claudebox-ddev-bridge`; points `db:3306`, `host.docker.internal` and a project's hostnames at a DDEV project running inside the runner's dind |
 | `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
 | `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
@@ -453,9 +455,11 @@ claudebox reload           re-apply allowlist.conf after editing it by hand
 claudebox allowed          show the allowlist
 claudebox denied           show what the proxy has blocked
 
-claudebox runner add <host:port> <token> <fingerprint>
-                           join a remote test runner -- paste the line that
-                           machine's "claudebox-runner" prints on startup
+claudebox runner add <host:port> <code>
+                           join a remote test runner using the 8-character
+                           enrolment code its "claudebox-runner" prints. A
+                           <token> <fingerprint> pair also works, from
+                           "claudebox-runner join --full"
 claudebox runner show      what is joined (the token is not printed)
 claudebox runner test      ask it, through the relay, whether it answers
 claudebox runner forget    un-join
@@ -688,6 +692,45 @@ Self-signed rather than a CA because there is one client on one LAN, and mkcert
 cannot help — its root lives on *this* machine, not the target. The consequence
 is that **a rebuilt runner has a new certificate and must be re-joined**; the
 relay says so by name when the fingerprint does not match.
+
+#### Joining: the enrolment code
+
+The token is 64 hex characters and the fingerprint 95, and the two together are
+not a thing anyone types across a room correctly. So the join line carries an
+eight-character code instead:
+
+```
+claudebox runner add 192.168.1.42:7998 hp3edhrp
+```
+
+`claudebox runner add` with two arguments runs `enrol.mjs` in a one-off container
+from the relay image — the only thing here with both node and a route off this
+machine, since the box has no LAN access by design and the host may have no node.
+It learns the runner's certificate on a handshake that carries nothing, installs
+it as the sole trust anchor, presents the code, receives the token, and writes
+all three settings to `~/.claudebox/config`.
+
+What that model does and does not protect, plainly:
+
+- **It closes the attack worth closing.** The code is single-use and expires in
+  15 minutes, so another host on the LAN cannot connect during the window and
+  walk away with a token that grants it code execution on the runner. Ten wrong
+  codes close the window rather than allowing unlimited guesses — a denial of
+  service anyone on the network can trigger, which is the right trade: reopening
+  is one command on the runner's console, and a window that closed by itself is
+  a thing you want to notice. Every attempt is logged with its peer address.
+- **The certificate is trusted on first sight.** An attacker already on the path
+  at the moment of enrolment could present its own and keep MITMing thereafter.
+  That is the residual risk `ssh` accepts the first time it shows you a host key,
+  and it is why every request after enrolment is pinned rather than
+  re-negotiated. `claudebox-runner join --full` prints the token and fingerprint
+  explicitly for a join that accepts none of it; `claudebox runner add` still
+  takes that three-argument form.
+
+The window opens automatically only on a runner that has **never been joined** —
+a runner that restarts nightly should not re-open one every night.
+`claudebox-runner enrol` opens one deliberately: for a second agent machine, a
+re-install on this side, or a window that expired before anyone got to it.
 
 Be clear about what that boundary is and is not. `/exec` runs `bash -lc` on the
 runner, so a box that can reach the relay has arbitrary code execution on the
@@ -1025,8 +1068,8 @@ claudebox-runner                      # builds base, builds the runner, starts i
 Then on this machine, paste the line it printed:
 
 ```
-claudebox runner add 192.168.1.42:7998 <token> <fingerprint>
-claudebox                             # relaunch to pick it up
+claudebox runner add 192.168.1.42:7998 <code>   # the 8 characters it printed
+claudebox                                       # relaunch to pick it up
 ```
 
 The runner's identity lives in the `claudebox-runner-state` volume, so restarts
@@ -1072,9 +1115,11 @@ is one less difference.
 | `POST /sync/upload` | a tar of what it needs |
 | `POST /exec` | run a command, framed output back |
 | `GET /artifacts` | tar one path back |
+| `POST /enrol` | trade a one-time code for the token — **the one route with no token check**, because it is where the token comes from |
 
-`runner-relay` forwards exactly these and rebuilds the headers rather than
-passing them through.
+`runner-relay` forwards the first five and rebuilds the headers rather than
+passing them through. `/enrol` is not forwarded: it is spoken once, at join time,
+by a one-off container and never by the box.
 
 ## Egress allowlist
 
@@ -1790,6 +1835,23 @@ claudebox shell -c 'node -e "
 # The runner refuses anything without the token, and the relay refuses a
 # certificate that is not the pinned one (run on the host):
 curl -sk -o /dev/null -w '%{http_code}\n' https://<runner>:7998/health   # 401
+
+# The enrolment code is single-use, and ten wrong ones close the window rather
+# than allowing unlimited guesses. On the runner: claudebox-runner enrol
+claudebox runner add <runner>:7998 <code>      # joins
+claudebox runner add <runner>:7998 <code>      # "enrolment is closed"
+for i in $(seq 1 10); do claudebox runner add <runner>:7998 zzzzzzzz; done
+claudebox-runner join                          # window gone; says how to reopen
+
+# /enrol is the one route with no token check, so it must NOT be reachable from
+# the box -- otherwise the box could re-issue itself a token it is not meant to
+# hold. Must print 404, not 403.
+claudebox shell -c 'node -e "
+  const http=require(\"node:http\"), b=JSON.stringify({code:\"x\"});
+  const r=http.request({host:\"runner-relay\",port:7997,path:\"/enrol\",method:\"POST\",
+    headers:{\"content-type\":\"application/json\",\"content-length\":Buffer.byteLength(b)}},
+    res=>console.log(res.statusCode));
+  r.end(b)"'
 ```
 
 DDEV on the runner. The first two are the ones that fail silently rather than

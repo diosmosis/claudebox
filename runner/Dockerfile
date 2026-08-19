@@ -122,7 +122,8 @@ RUN chmod 0644 /usr/local/share/claudebox/ddev-http.conf.template
 
 COPY runner/runner.mjs /app/runner.mjs
 COPY runner/entrypoint.sh /usr/local/bin/runner-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/runner-entrypoint.sh
+COPY runner/open-enrolment.sh /usr/local/bin/claudebox-runner-enrol
+RUN chmod 0755 /usr/local/bin/runner-entrypoint.sh /usr/local/bin/claudebox-runner-enrol
 
 # Fail fast and loudly rather than restarting into a broken state.
 ENV NODE_OPTIONS=--unhandled-rejections=strict
