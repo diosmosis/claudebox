@@ -183,7 +183,7 @@ issue_bytes="$(wc -c < "${issue_file}" | tr -d ' ')"
 # There are two ways to degrade and which is right depends on where the session
 # will run, so both are below.
 prompt_max=100000
-prompt_head="Below is a description of a possible bug or vulnerability. please read it, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
+prompt_head="Below is a description of a possible bug or vulnerability. please read it, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it. do not commit any changes, and make sure the branch name does not mention tests (it will be used to fix the issue later)"
 
 wrap_issue() {
     printf '%s\n\n<issue key="%s">\n%s\n</issue>' "${prompt_head}" "${key}" "${1}"
