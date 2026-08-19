@@ -420,7 +420,8 @@ Each of these is doing real work. Changing one breaks something specific.
 | `ddev-fixups`, `ddev-realip.conf` | Baked in as `claudebox-ddev-fixups`; prepares a DDEV web container for UI tests (client IP, path alias) |
 | `runner-shim` | The box's `runner` (baked to `/usr/local/bin/runner`); syncs a project to the remote runner and runs commands there |
 | `runner-relay/Dockerfile`, `runner-relay/relay.mjs` | The relay that holds the runner's credential and forwards to it |
-| `runner/Dockerfile`, `runner/runner.mjs`, `runner/entrypoint.sh` | The runner image (`FROM` the main Dockerfile's `base` stage), its API, and the first-start identity generation |
+| `runner/Dockerfile`, `runner/runner.mjs`, `runner/entrypoint.sh` | The runner image (`FROM` the main Dockerfile's `base` stage), its API, and the first-start identity, DDEV and mkcert setup |
+| `ddev-bridge` | Baked into the runner image as `claudebox-ddev-bridge`; points `db:3306` and a project's hostnames at a DDEV project running inside the runner's dind |
 | `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
 | `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
@@ -606,9 +607,21 @@ regressions. This is what the `base` stage in `Dockerfile` exists for.
 | `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, PHP + extensions, node, composer, the docker CLI, ImageMagick's raised limits, the box user |
 | `claudebox` | `base` + the agents, the shims, the language servers, `box-CLAUDE.md` |
 
-`runner/Dockerfile` is `FROM claudebox-base:latest` and installs **nothing**. If
-the runner turns out to need a package, it belongs in `base` — putting it in
-`runner/Dockerfile` is a divergence from the box's environment by definition.
+`runner/Dockerfile` is `FROM claudebox-base:latest`, and the rule for what may
+be added there is **what a test can observe**. Fonts, PHP, node, Chromium's
+libraries, ImageMagick's limits — anything that changes how code builds or how a
+pixel comes out — belongs in `base`, where both images get the same layers.
+Something missing for a test is a base problem, never a runner one.
+
+An orchestrator is a different thing. DDEV starts containers from *pulled*
+images, so the environment a DDEV-backed test runs in is `ddev/ddev-webserver`,
+identical wherever it is pulled; the `ddev` binary itself is invisible to a test.
+That is why it, `mkcert` and the single `sudo` rule live in `runner/Dockerfile` —
+and it would be actively wrong to put `ddev` in `base`, since the box has no real
+ddev at all and would end up with a second, conflicting one on its PATH. The
+DDEV *version* is not invisible, though: a different ddev pulls different
+webserver and dbserver images, so it is pinned to whatever runs on the machine
+the baselines came from.
 
 `claudebox-runner` builds `--target base` from this same file before building the
 runner image, which is why the base image is a build ARG rather than a fixed tag.
@@ -663,21 +676,36 @@ upload is a tar rather than a file-by-file POST: tar preserves mtimes, so the
 *next* sync sees unchanged files as unchanged instead of re-sending everything.
 
 **What counts as source is decided on this side, by git.** A directory is left
-out only when `git check-ignore` says the project ignores it — never because of
-its name. Matomo commits parts of `node_modules` and several plugins commit
-`vue/dist`; a name list would silently drop those and leave the runner testing
-something subtly different. Same rule as `claudebox-strip-artifacts`.
+out exactly when the project ignores it — never because of its name. Matomo
+commits parts of `node_modules` and several plugins commit `vue/dist`; a name
+list would silently drop those and leave the runner testing something subtly
+different.
+
+Asked once per repository, with `git status --porcelain -z --ignored`, which
+collapses a wholly-ignored directory into a single `!! dir/` entry. One process
+answers for the whole tree instead of a `check-ignore` per candidate, and that
+is what makes it affordable to apply the rule to *every* directory rather than
+to a shortlist of likely names — which matters, because the interesting cases
+are not the obvious ones: `wp-matomo` ignores `wp/`, a whole WordPress install,
+and a DDEV project ignores a dozen generated directories under `.ddev/`.
+Directories only: an ignored *file* still goes, so nothing a checkout needs is
+quietly withheld. The walk switches repository when it descends into a nested
+checkout, so that project's own `.gitignore` is the one that applies inside it.
 
 The client sends that exclusion list along with the manifest, and this is
 load-bearing rather than an optimisation: without it the runner walks into its
-own `vendor/` and `node_modules/`, sees files the manifest does not mention, and
-**deletes them** — wiping the build output the runner exists to keep. The runner
-does not descend into an excluded directory at all, and refuses a delete under
-one even if asked directly.
+own `vendor/`, sees files the manifest does not mention, and **deletes them** —
+wiping the build output the runner exists to keep. The runner does not descend
+into an excluded directory at all, and refuses a delete under one even if asked
+directly. Everything the runner builds for itself therefore lives, by
+construction, exactly where the sync does not look: `vendor/` from a composer
+install run over there, `wp/` from a WordPress its DDEV project downloaded,
+`.ddev/`'s generated configuration.
 
-Measured here: `wp-matomo` 11510 files in 5.4s first sync, 0.9s when nothing
-changed; `matomo` 46570 files in 31s. `.git` is included by default (`--no-git`
-skips it) so the runner's tree is a real checkout.
+Measured here: `matomo` 46570 files in 31s first sync; `wp-matomo` 769 files in
+0.3s once `wp/` is recognised as ignored (11510 and 5.4s before that). `.git` is
+included by default (`--no-git` skips it) so the runner's tree is a real
+checkout.
 
 Build output never crosses the network. `composer install` / `npm ci` are run
 once **on the runner** and stay there.
@@ -691,6 +719,12 @@ runner run <cmd...>    sync, then run <cmd> there (the usual one)
 runner exec <cmd...>   run without syncing first
 ```
 
+A DDEV-backed suite is one line, because the runner has a real `ddev`:
+
+```
+runner run "ddev start -y && claudebox-ddev-bridge && ddev <the project's test command>"
+```
+
 A project is the nearest ancestor with `.ddev/config.yaml` or `.git`, climbing no
 further than the workspace root — the same shape of check `ddev-relay` does. Both
 the project and the workdir are sent *relative*, so the two machines need not
@@ -700,6 +734,111 @@ the workspace root on the far side.
 Output streams back frame by frame using the same `[1 byte channel][4 byte BE
 length][payload]` framing `ddev-relay` uses (1 stdout, 2 stderr, 3 meta JSON), and
 the exit code is the remote command's.
+
+### DDEV on the runner
+
+DDEV runs **inside the runner container**, driving the runner's own rootless
+dind. `ddev` is a Docker client, so pointing `DOCKER_HOST` at the sidecar is the
+whole of it: every project container it starts lives in there.
+
+The runner image takes `ddev`, `ddev-hostname` and `mkcert` out of one pinned
+DDEV release tarball. Three things had to be true before `ddev start` worked,
+and each failed in its own way:
+
+| | |
+|---|---|
+| `ddev-hostname` must be present | `ddev start` shells out to it and fails hard: *"Binary not found: ddev-hostname is not installed"*. It ships in the same tarball. |
+| It must be able to elevate | It checks its own euid rather than whether it can write the file, so making `/etc/hosts` writable does not satisfy it. The image installs `sudo` with **one** rule: `NOPASSWD: /usr/local/bin/ddev-hostname`. |
+| `router_bind_all_interfaces: true` | Project ports are published on the *daemon's* interface, and the daemon is a different container. Bound to `127.0.0.1` (the default) they are reachable only from inside the sidecar, and every request to a project is refused in a way that looks like the project failing to start. |
+
+DDEV's install script is not usable in a Dockerfile — it refuses to run as root,
+which is what a `RUN` is — so the tarball is fetched and verified against the
+release's `checksums.txt` instead. There is no `ddev version` smoke test in the
+build: every ddev subcommand connects to a daemon first, and there is none
+during a build.
+
+**mkcert.** The box trusts the *host's* mkcert root, because the projects it
+talks to are started by that host. The runner starts its own, so there is no
+other root to agree with: `entrypoint.sh` generates one into the persistent HOME
+volume on first start, installs it into the system store on every start (the
+store is an image layer, the CA is a volume), and `NODE_EXTRA_CA_CERTS` points
+at the same file. `https://<project>.ddev.site` from the runner verifies.
+
+**The HOME volume is mounted into the sidecar too**, at the same path, and that
+is not optional: `ddev start` binds several things out of `~/.ddev` into the
+containers it creates — `homeadditions`, and the directory it pushes the mkcert
+root out of — and those binds are resolved by the sidecar's daemon. A bind
+source that does not exist there is not an error; Docker silently creates an
+empty directory, so the certificates would simply never arrive.
+
+#### How the database and the hostnames are reached
+
+The plan left this open, because the box's answer does not port: `ddev-db` is a
+compose service that socats to a *sibling* container, and here the project's
+containers are a level down inside the sidecar where no sibling can see them.
+
+What reaches into that level is port publishing, so the sidecar has a **fixed
+address** (`10.99.2.10`) on the runner network and everything published inside
+it is reachable there:
+
+```
+https://<project>.ddev.site  ->  10.99.2.10:443   ->  ddev-router  ->  web
+db:3306                      ->  10.99.2.10:3306  ->  a socat container started
+                                                      INSIDE the sidecar
+                                                      -> ddev-<project>-db:3306
+```
+
+`claudebox-ddev-bridge` (in the runner image, run from a project directory) sets
+both up:
+
+- **The database.** DDEV publishes it on a port it picks per start, which is no
+  use to a config file that says `host = "db"`. So the bridge starts a forwarder
+  on a fixed port with **one hard-coded destination** — the same constraint the
+  box's `ddev-db` has, and for the same reason: one that took its target from
+  the request would be a general TCP proxy into the sidecar's network. The
+  runner's `extra_hosts` maps `db` to the sidecar, so `db:3306` from the runner
+  means what it means in the box.
+- **The hostnames.** `*.ddev.site` resolves to `127.0.0.1` in public DNS, which
+  in the runner container is the runner. `ddev start` writes the right entries
+  itself — it aims them at the *daemon's* address, which is already the sidecar —
+  but `/etc/hosts` is container-local and Docker writes a fresh one on every
+  start, so **a runner container recreate leaves them behind** even though the
+  projects inside the sidecar are untouched. The bridge repairs that with DDEV's
+  own `ddev-hostname`, which is what the one sudo rule is for.
+
+Run `ddev start -y && claudebox-ddev-bridge` together, always. Restarting the
+runner stops the sidecar and therefore every project inside it — DDEV's
+containers carry no restart policy, so they do not come back on their own — and
+it also discards the runner's `/etc/hosts`. Both halves of that are what the one
+pair of commands fixes, which is why the bridge refuses with those exact
+commands rather than trying to guess.
+
+`claudebox-ddev-fixups` ports unchanged: it drives `ddev exec`, which on the
+runner is the real thing rather than the box's shim onto the host.
+
+#### The one environment difference: DDEV containers run as root
+
+On a **rootless** Docker daemon, DDEV runs its containers as root — container
+root maps to the unprivileged user outside, so files in the tree still come out
+owned correctly, and this is DDEV's documented behaviour rather than a
+misconfiguration. It is not configurable: `DDEV_UID`/`DDEV_GID` in the
+environment do not change it.
+
+The box's DDEV projects run on the host's **rootful** daemon, where DDEV uses
+uid 1000. So this is a genuine divergence between the two, and it surfaces as
+tools that refuse to be root. The one that shows up immediately:
+
+```
+If you'd like to continue as root, please run this again, adding this flag: --allow-root
+```
+
+— wp-cli, invoked from `wp-matomo`'s test harness. Nothing about rendering or
+file ownership is affected, and CI runners generally run as root too, so for
+baseline fidelity this is arguably the closer match. The alternative is a
+**rootful** dind on the runner, which means `--privileged`: on a machine the box
+already has arbitrary code execution on, that turns container escape into root
+on the runner machine itself. Rootless is the deliberate choice; the difference
+is documented rather than designed away.
 
 ### Setting up a runner machine
 
@@ -723,10 +862,12 @@ workspace (costing a re-sync) and keeps the identity.
 ### Not yet done
 
 `/artifacts` — pulling screenshots, diffs and logs back — is not implemented;
-anything a test writes on the runner stays there. DDEV on the runner and the
-`host.docker.internal` / port-forwarding arrangement the UI tests need are also
-still to come. Until then the runner is good for suites that need only a
-checkout and its own dependencies.
+anything a test writes on the runner stays there. wp-env under the runner's
+dind, the `CLAUDEBOX_DIND_PORTS` socat forwarders and the `--host-gateway-ip` /
+`ddev-http` arrangement that lets nested containers reach Matomo are still to
+come, and with them the `X-Real-IP: 127.0.0.1` that makes the client-IP half of
+`claudebox-ddev-fixups` mean anything on the runner. Until then the runner
+handles suites that need a checkout, its own dependencies, and a DDEV project.
 
 ## Egress allowlist
 
@@ -1387,6 +1528,39 @@ claudebox shell -c 'node -e "
 curl -sk -o /dev/null -w '%{http_code}\n' https://<runner>:7998/health   # 401
 ```
 
+DDEV on the runner. The first two are the ones that fail silently rather than
+loudly, so check them by value and not by "the project started":
+
+```bash
+cd ~/Projects/<a ddev project>
+claudebox shell -c 'runner run "ddev start -y && claudebox-ddev-bridge"'
+
+# The project answers, and its certificate verifies against the runner's own
+# mkcert root. ssl_verify_result must be 0.
+claudebox shell -c 'runner exec "curl -sS -o /dev/null \
+  -w \"%{http_code} %{ssl_verify_result}\n\" https://<project>.ddev.site/"'
+
+# Every project hostname points at the sidecar, NOT at 127.0.0.1 -- 127.0.0.1
+# means requests are landing on the runner container itself and the project
+# looks dead for no visible reason.
+claudebox shell -c 'runner exec "claudebox-ddev-bridge --status"'
+
+# db:3306 from the runner container, which is the path a test fixture uses when
+# it needs the database and Docker in the same process. Through PHP, because
+# there is no mysql CLI in the image -- php-mysql is the extension.
+claudebox shell -c 'runner exec "php -r \'\''\$m=new mysqli(\"db\",\"db\",\"db\",\"db\",3306);
+  echo \$m->connect_errno ? \"FAIL \".\$m->connect_error.\"\\n\" : \"ok\\n\";\'\''"'
+
+# Both fixups apply and then report ok. Idempotent, so run it twice.
+claudebox shell -c 'runner exec "claudebox-ddev-fixups && claudebox-ddev-fixups --check"'
+
+# A recreate of the runner throws /etc/hosts away; the bridge must put it back
+# rather than leaving a running project unreachable by name.
+claudebox-runner stop && claudebox-runner >/dev/null
+claudebox shell -c 'runner exec "claudebox-ddev-bridge --status"'   # 127.0.0.1
+claudebox shell -c 'runner exec "claudebox-ddev-bridge && claudebox-ddev-bridge --status"'
+```
+
 With a DDEV project running, also check TLS still validates through the proxy
 (`ssl_verify_result` must be 0) and that file ownership is preserved:
 
@@ -1422,11 +1596,12 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   publishes. `ldd` cannot see libraries opened with `dlopen` at runtime, so
   finish by actually launching the browser.
 - **Add something the tests need (a font, a PHP extension, a library)** → the
-  `base` stage of `Dockerfile`, not the `claudebox` stage and never
+  `base` stage of `Dockerfile`, not the `claudebox` stage and not
   `runner/Dockerfile`. Both images come off `base`, which is what keeps
   screenshot baselines comparable between the box and the runner; anything added
-  below that boundary is by construction invisible to a test, and anything added
-  in `runner/Dockerfile` is a divergence by definition.
+  below that boundary is by construction invisible to a test. `runner/Dockerfile`
+  is for the runner's *role* — ddev, mkcert, its one sudo rule — never for the
+  environment a test runs in.
 - **Change what the box's agent knows about its environment** → `box-CLAUDE.md`,
   then `claudebox rebuild`. It lands at `/etc/claude-code/CLAUDE.md`, Claude
   Code's managed-policy memory path (loaded in every session in every directory,

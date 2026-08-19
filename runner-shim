@@ -13,11 +13,17 @@
 // runner-relay/relay.mjs.
 //
 // WHAT COUNTS AS SOURCE is decided here, because this is the side git lives on,
-// and the rule is the same one claudebox-strip-artifacts uses: a directory is
-// excluded only if `git check-ignore` says the project ignores it -- never
-// because of its name. Matomo commits parts of node_modules and several plugins
-// commit vue/dist, and a name list would silently drop them and leave the runner
-// testing something subtly different from what is here.
+// and the rule is git's own: a directory is excluded exactly when the project
+// ignores it -- never because of its name. Matomo commits parts of node_modules
+// and several plugins commit vue/dist, and a name list would silently drop them
+// and leave the runner testing something subtly different from what is here.
+//
+// The same list is what stops a sync DELETING the runner's side of those
+// directories, which is how they come to hold things this machine never had:
+// vendor/ from a composer install run over there, wp/ from a WordPress the DDEV
+// project downloaded, .ddev/'s generated configuration. Everything the runner
+// builds for itself lives, by construction, exactly where the sync does not
+// look.
 'use strict';
 
 const http = require('node:http');
@@ -29,19 +35,6 @@ const { spawn, spawnSync } = require('node:child_process');
 const RELAY = process.env.CLAUDEBOX_RUNNER_RELAY || 'http://runner-relay:7997';
 const WORKSPACE = path.resolve(process.env.CLAUDEBOX_WORKSPACE || '/home/dizzy/Projects');
 
-// Names worth ASKING git about. Not a list of things to delete -- git has the
-// final say on every one of them -- just a way to keep the walk from running
-// check-ignore on all 200k paths in a checkout.
-const CANDIDATES = new Set([
-	'node_modules',
-	'vendor',
-	'target',
-	'.venv',
-	'__pycache__',
-	'dist',
-	'build',
-	'coverage',
-]);
 
 function die(msg, code) {
 	process.stderr.write('runner: ' + msg + '\n');
@@ -86,18 +79,49 @@ function resolveProject(cwd) {
 // ---------------------------------------------------------------------------
 // The manifest
 // ---------------------------------------------------------------------------
-const ignoredCache = new Map();
-function gitIgnores(dir) {
-	if (ignoredCache.has(dir)) return ignoredCache.get(dir);
-	const parent = path.dirname(dir);
-	const inRepo = spawnSync('git', ['-C', parent, 'rev-parse', '--git-dir'], { stdio: 'ignore' });
-	// Outside a repository nothing can be called ignored, so it is kept. Same
-	// conservative answer strip-artifacts gives.
-	const answer =
-		inRepo.status === 0 &&
-		spawnSync('git', ['-C', parent, 'check-ignore', '-q', dir], { stdio: 'ignore' }).status === 0;
-	ignoredCache.set(dir, answer);
-	return answer;
+// Which directories a repository ignores, asked ONCE per repository.
+//
+// `git status --porcelain --ignored` collapses a wholly-ignored directory into a
+// single "!! dir/" entry, which is exactly the question being asked -- so one
+// process answers it for the whole tree instead of a `check-ignore` per
+// candidate. That is what makes it affordable to apply the rule to EVERY
+// directory rather than to a list of likely names: node_modules and vendor are
+// the obvious cases, but wp-matomo ignores `wp/` (a whole WordPress install that
+// DDEV puts there) and a DDEV project ignores a dozen generated directories
+// under .ddev/, and none of those are names anyone would think to list.
+//
+// Directories only, deliberately. An ignored FILE still goes -- the rule this
+// implements is about not carrying build output, and a per-file rule would
+// start quietly withholding things a checkout needs.
+//
+// -z, so a path with a newline or a space in it arrives intact.
+const ignoreCache = new Map();
+function ignoredDirs(repoRoot) {
+	if (ignoreCache.has(repoRoot)) return ignoreCache.get(repoRoot);
+	const set = new Set();
+	const r = spawnSync(
+		'git',
+		['-C', repoRoot, 'status', '--porcelain', '-z', '--ignored'],
+		{ encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 }
+	);
+	if (r.status === 0 && r.stdout) {
+		for (const rec of r.stdout.toString('utf8').split('\0')) {
+			// "!! path/" -- the two status letters, a space, then the path.
+			if (!rec.startsWith('!! ')) continue;
+			const p = rec.slice(3);
+			if (p.endsWith('/')) set.add(p.slice(0, -1));
+		}
+	}
+	ignoreCache.set(repoRoot, set);
+	return set;
+}
+
+// The repository a directory belongs to. A project can contain others -- a
+// plugin with its own checkout -- and their .gitignore is the one that applies
+// inside them, so the walk switches context on the way down rather than asking
+// the outermost repository about paths it knows nothing about.
+function repoContext(dir) {
+	return { root: dir, ignored: ignoredDirs(dir) };
 }
 
 // [relative path, size, mtime in whole seconds]. Seconds, not milliseconds:
@@ -106,13 +130,19 @@ function gitIgnores(dir) {
 function buildManifest(root, opts) {
 	const out = [];
 	// Directories deliberately NOT sent. This list goes to the runner with the
-	// manifest, and it is what stops a sync deleting the runner's own vendor/ and
-	// node_modules/: without it those look to the far side like files that were
-	// removed here, and the whole point of the runner is that build output lives
-	// and rebuilds THERE.
+	// manifest, and it is what stops a sync deleting the runner's own vendor/,
+	// node_modules/ and DDEV-generated .ddev/ directories: without it those look
+	// to the far side like files that were removed here, and the whole point of
+	// the runner is that build output lives and rebuilds THERE.
 	const exclude = [];
 	const skipped = [];
-	(function walk(dir, prefix) {
+	// A project with no git at all can have nothing called ignored, so nothing is
+	// withheld from it -- the same conservative answer strip-artifacts gives.
+	const rootRepo = fs.existsSync(path.join(root, '.git'))
+		? repoContext(root)
+		: { root, ignored: new Set() };
+
+	(function walk(dir, prefix, repo) {
 		let entries;
 		try {
 			entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -129,12 +159,16 @@ function buildManifest(root, opts) {
 					skipped.push(rel + '/  (--no-git)');
 					continue;
 				}
-				if (CANDIDATES.has(e.name) && gitIgnores(full)) {
+				if (repo.ignored.has(path.relative(repo.root, full).split(path.sep).join('/'))) {
 					exclude.push(rel);
 					skipped.push(rel + '/  (gitignored)');
 					continue;
 				}
-				walk(full, rel);
+				const nested =
+					e.name !== '.git' && fs.existsSync(path.join(full, '.git'))
+						? repoContext(full)
+						: repo;
+				walk(full, rel, nested);
 			} else if (e.isFile() || e.isSymbolicLink()) {
 				let st;
 				try {
@@ -145,7 +179,7 @@ function buildManifest(root, opts) {
 				out.push([rel, st.size, Math.floor(st.mtimeMs / 1000)]);
 			}
 		}
-	})(root, '');
+	})(root, '', rootRepo);
 	return { manifest: out, exclude, skipped };
 }
 

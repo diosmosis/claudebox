@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# Point the runner at a running DDEV project.
+#
+# On the box's machine this is the `ddev-db` compose service: a fixed socat
+# forward that puts one project's database at `db:3306`, which exists because a
+# test process running OUTSIDE the web container -- Matomo's UI-test fixture,
+# which needs the database and Docker in the same PHP process -- has no other
+# way to reach it. That service does not apply unchanged here, because DDEV's
+# containers are not siblings of this one: they live inside the dind sidecar's
+# daemon, a level down, where a compose service on this network cannot see them.
+#
+# What reaches into that level is port publishing. The sidecar's address on the
+# runner network is fixed (10.99.2.10), so anything published inside it is
+# reachable from here at that address:
+#
+#   https://<project>.ddev.site  ->  10.99.2.10:443  ->  ddev-router  ->  web
+#   db:3306                      ->  10.99.2.10:3306 ->  this forwarder, started
+#                                                        INSIDE the sidecar
+#                                                        -> ddev-<p>-db:3306
+#
+# The first line needs nothing from this script. `ddev start` publishes the
+# router itself (given router_bind_all_interfaces, which the entrypoint sets),
+# and DDEV writes the project's hostnames into /etc/hosts pointed at the DAEMON's
+# address -- which, the daemon being the sidecar, is already the right answer.
+# `--status` reports it so a mismatch is visible rather than mysterious.
+#
+# The second line is what this exists for. DDEV publishes the database on a port
+# it picks per start, which is no use to a config file that says `host = "db"`.
+# So: a forwarder on a fixed port, with ONE hard-coded destination -- the same
+# constraint the box's ddev-db has, and for the same reason. One that took its
+# target from the request would be a general TCP proxy into the sidecar's
+# network.
+#
+#   claudebox-ddev-bridge            bridge the project in the current directory
+#   claudebox-ddev-bridge --status   what is bridged now
+#   claudebox-ddev-bridge --down     tear the database forward down
+#
+# Re-runnable, and re-running it in another project moves the bridge there.
+set -euo pipefail
+
+FORWARDER=claudebox-ddev-db
+SIDECAR_ADDR="${CLAUDEBOX_RUNNER_DIND_ADDR:-10.99.2.10}"
+
+die() { echo "claudebox-ddev-bridge: $*" >&2; exit 1; }
+
+# Everything below drives the sidecar's daemon, never this machine's.
+command -v docker >/dev/null 2>&1 || die "no docker client in this image"
+
+case "${1:-}" in
+    --status)
+        if target="$(docker inspect -f '{{index .Config.Cmd 1}}' "${FORWARDER}" 2>/dev/null)"; then
+            echo "database:  db:3306 -> ${target##*tcp-connect:}"
+        else
+            echo "database:  not bridged"
+        fi
+        # DDEV's own doing, not this script's -- but the single most useful
+        # thing to see when a project "is running" and every request to it lands
+        # nowhere. Anything pointing at 127.0.0.1 means the hostname resolved
+        # before DDEV could correct it, and requests are hitting this container.
+        echo "hostnames:"
+        grep -E '\.ddev\.site' /etc/hosts 2>/dev/null | sed 's/^/  /' \
+            || echo "  none in /etc/hosts (they will resolve to 127.0.0.1, i.e. here)"
+        exit 0
+        ;;
+    --down)
+        docker rm -f "${FORWARDER}" >/dev/null 2>&1 || true
+        # Leave the hostnames: they cost nothing, they point at a router that is
+        # still there, and removing them would break a project that is up.
+        echo "claudebox-ddev-bridge: database forward removed"
+        exit 0
+        ;;
+    "") ;;
+    *) die "usage: $(basename "$0") [--status|--down]" ;;
+esac
+
+# The project is the one the working directory is in -- same rule the runner's
+# /exec and the box's relay use, and the same one `ddev` itself uses.
+[ -n "$(command -v ddev)" ] || die "no ddev in this image"
+describe="$(ddev describe -j 2>/dev/null)" || die "not in a DDEV project, or it has never been started here (\`ddev start\` first)"
+
+name="$(printf '%s' "${describe}" | jq -r '.raw.name // empty')"
+[ -n "${name}" ] || die "could not read the project name from 'ddev describe -j'"
+
+# Two different "not running"s, and they need different answers.
+#
+# The web container not running at all is the common one, and it is what a
+# restart of the RUNNER leaves behind: that takes the sidecar down with it and
+# every project inside, and DDEV's containers have no restart policy, so they
+# stay down until `ddev start` runs again. Nothing to wait for -- say so.
+#
+# The web container running while DDEV still reports the project as starting is
+# a few seconds of container health checks, and worth waiting out rather than
+# failing in a way that reads like the first case.
+status="$(printf '%s' "${describe}" | jq -r '.raw.status // empty')"
+if [ "${status}" != "running" ]; then
+    running="$(docker inspect -f '{{.State.Running}}' "ddev-${name}-web" 2>/dev/null || echo false)"
+    if [ "${running}" != "true" ]; then
+        die "project '${name}' is ${status:-not running}. Start it and bridge it together:
+    ddev start -y && claudebox-ddev-bridge
+  (a runner restart stops every project inside the sidecar, so this is expected
+  after one -- 'ddev start' is fast on a project that has run here before.)"
+    fi
+    printf 'claudebox-ddev-bridge: %s is %s, waiting' "${name}" "${status:-down}" >&2
+    for _ in $(seq 1 10); do
+        sleep 2
+        printf '.' >&2
+        describe="$(ddev describe -j 2>/dev/null)" || continue
+        status="$(printf '%s' "${describe}" | jq -r '.raw.status // empty')"
+        [ "${status}" = "running" ] && break
+    done
+    printf '\n' >&2
+    [ "${status}" = "running" ] || die "project '${name}' is still ${status:-not running}; try 'ddev restart'"
+fi
+
+# ---------------------------------------------------------------------------
+# The database forward
+# ---------------------------------------------------------------------------
+db="ddev-${name}-db"
+if docker inspect -f '{{.State.Running}}' "${db}" 2>/dev/null | grep -qx true; then
+    # Attach to the same network the database is on rather than assuming
+    # ddev_default: DDEV's network naming has changed before.
+    net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "${db}" | head -1)"
+    [ -n "${net}" ] || die "${db} is on no network"
+
+    docker rm -f "${FORWARDER}" >/dev/null 2>&1 || true
+    docker run -d --name "${FORWARDER}" \
+        --network "${net}" \
+        --restart unless-stopped \
+        -p 3306:3306 \
+        alpine/socat:latest \
+        tcp-listen:3306,fork,reuseaddr "tcp-connect:${db}:3306" >/dev/null \
+        || die "could not start the database forward"
+    echo "claudebox-ddev-bridge: db:3306 -> ${db}:3306"
+else
+    echo "claudebox-ddev-bridge: ${db} is not running; no database to bridge" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# The hostnames
+#
+# *.ddev.site resolves to 127.0.0.1 in public DNS, which in this container is
+# this container, so every project name needs an /etc/hosts entry pointing at
+# the sidecar instead. `ddev start` writes those itself, aimed at the Docker
+# daemon's address -- which, the daemon being the sidecar, is already right.
+#
+# They do not survive this container being recreated, though. /etc/hosts is
+# container-local and Docker writes a fresh one on every start, so a runner
+# restart leaves every project that is still up unreachable BY NAME while
+# `ddev list` cheerfully reports it running -- the same shape of trap as
+# `ddev restart` discarding the web-container fixups, and just as silent.
+#
+# Repaired here rather than reported, with DDEV's own tool: ddev-hostname is
+# what wrote them in the first place and the image already grants it the one
+# sudo rule it needs.
+# ---------------------------------------------------------------------------
+for h in $(printf '%s' "${describe}" | jq -r '.raw.hostnames[]?'); do
+    got="$(getent hosts "${h}" 2>/dev/null | awk '{print $1; exit}')"
+    [ "${got}" = "${SIDECAR_ADDR}" ] && continue
+    if sudo -n /usr/local/bin/ddev-hostname "${h}" "${SIDECAR_ADDR}" >/dev/null 2>&1; then
+        echo "claudebox-ddev-bridge: ${h} -> ${SIDECAR_ADDR}"
+    else
+        echo "claudebox-ddev-bridge: warning: could not point ${h} at ${SIDECAR_ADDR};" >&2
+        echo "claudebox-ddev-bridge: it resolves to ${got:-nothing}, so requests to it land here" >&2
+        echo "claudebox-ddev-bridge: rather than at the project. 'ddev restart' also rewrites it." >&2
+    fi
+done
+
+echo "claudebox-ddev-bridge: '${name}' is bridged"

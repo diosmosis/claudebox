@@ -155,11 +155,15 @@ runner exec <cmd...>   run <cmd> there WITHOUT syncing first
 code is the remote command's, so it behaves like running it here.
 
 What crosses the network is **source only**. A directory is left behind exactly
-when `git check-ignore` says the project ignores it — so `vendor/`,
-`node_modules/` and `target/` stay on the runner, where they are installed once
-and reused, and a committed `vendor/` (some WordPress plugins) still goes. The
-first thing to do with a new project there is therefore `runner exec "composer
-install"` / `npm ci`; those are not synced and not deleted by later syncs.
+when the project's git ignores it — so `vendor/`, `node_modules/`, a gitignored
+`wp/` holding a whole WordPress install, and `.ddev/`'s generated directories
+all stay on the runner side, while a *committed* `vendor/` (some WordPress
+plugins) still goes. Nothing is decided by directory name.
+
+That same list is why the runner accumulates its own build: those paths are
+invisible to the sync, so nothing there is ever deleted by it. The first thing
+to do with a new project on the runner is therefore install into it —
+`runner exec "composer install"`, `npm ci`, `ddev wp-matomo:install` — once.
 
 Two consequences worth remembering:
 
@@ -168,6 +172,37 @@ Two consequences worth remembering:
   not finished by running it remotely — read what you need with `runner exec`.
 - The runner has ordinary internet access; it is not behind this box's
   allowlist. A `composer install` that fails here may well work there.
+
+### DDEV on the runner
+
+The runner has a **real `ddev`**, not the shim you have here, driving its own
+private Docker daemon. So a DDEV-backed suite runs there in one command:
+
+```
+runner run "ddev start -y && claudebox-ddev-bridge && ddev <the project's test command>"
+```
+
+`claudebox-ddev-bridge` is the runner's counterpart to what the launcher does
+for you on this side. It points `db:3306` at the project's database and makes
+`https://<project>.ddev.site` resolve to the project rather than to the runner
+itself. Run it after every `ddev start` and after a runner restart; it is
+idempotent, and `claudebox-ddev-bridge --status` shows what is pointed where.
+
+`claudebox-ddev-fixups` is there too and behaves exactly as it does here.
+
+One real difference from a DDEV project on this machine, worth knowing before it
+confuses you: **the runner's DDEV containers run as root inside**. That is DDEV's
+own behaviour on a rootless Docker daemon — container root maps to the unprivileged
+user outside, so it is safe, and file ownership in the tree comes out the same.
+What it changes is tools that refuse to be root. The one you will meet is
+wp-cli:
+
+```
+If you'd like to continue as root, please run this again, adding this flag: --allow-root
+```
+
+That is not a broken runner and not something to fix by changing permissions;
+the command needs `--allow-root` when it runs there.
 
 Reaching it goes through `runner-relay` on the internal network, which is the
 only thing that holds its address, its token and its certificate. This box has

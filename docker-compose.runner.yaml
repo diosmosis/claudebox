@@ -20,7 +20,10 @@ services:
     hostname: claudebox-runner
     image: claudebox-runner:latest
     build:
-      context: ./runner
+      # The repo root, not runner/: this image also takes ddev-fixups and
+      # ddev-realip.conf, which are shared with the box's image and live there.
+      context: .
+      dockerfile: runner/Dockerfile
       args:
         # Built from this checkout's Dockerfile by the launcher, immediately
         # before this. See runner/Dockerfile for why it is a separate image.
@@ -33,8 +36,32 @@ services:
       BOX_USER: ${BOX_USER:-dizzy}
       CLAUDEBOX_RUNNER_WORKSPACE: ${BOX_RUNNER_WORKSPACE:-/home/dizzy/Projects}
       CLAUDEBOX_RUNNER_STATE: /var/lib/claudebox-runner
-      # "docker" here drives the sidecar daemon, never this machine's own.
+      # "docker" here drives the sidecar daemon, never this machine's own --
+      # and so does the ddev in this image, which is the whole of "DDEV on the
+      # runner": ddev is a docker client, so pointing it at the sidecar puts
+      # every project container inside it.
       DOCKER_HOST: tcp://dind:2375
+      # Node has its own CA bundle and ignores the system store, so point it at
+      # the mkcert root the entrypoint generates for this machine's own DDEV
+      # projects.
+      NODE_EXTRA_CA_CERTS: /usr/local/share/ca-certificates/ddev-rootCA.crt
+    extra_hosts:
+      # The database of whichever DDEV project has been bridged
+      # ("claudebox-runner-db <project>"), under the name a project's own config
+      # already uses -- so Matomo's config.ini.php, which says host = "db",
+      # works here and in the web container with nothing to switch. Exactly what
+      # the box's ddev-db service provides, arrived at differently: DDEV's
+      # containers live inside the sidecar's daemon, so what this points at is
+      # the sidecar's own address, where a forwarder started INSIDE it publishes
+      # port 3306. Fixed address because extra_hosts is resolved at container
+      # create, before any name would.
+      - "db:10.99.2.10"
+      # Where the sidecar publishes the DDEV router's ports, so
+      # https://<project>.ddev.site resolves here to the same place a browser on
+      # this machine would find it. Written per project by claudebox-runner-db,
+      # which is when the project's hostnames are known; this is the router
+      # itself, for anything that wants the address rather than a name.
+      - "ddev-router:10.99.2.10"
     ports:
       # On every interface on purpose: the whole point is that the other machine
       # can reach it. What protects it is what is in front of it -- TLS with a
@@ -51,6 +78,11 @@ services:
       # the tree does not re-issue the runner's identity, and deleting this
       # volume is the way to rotate it.
       - runner-state:/var/lib/claudebox-runner
+      # A persistent HOME, for the same reason the box has one: ~/.ddev holds
+      # the global DDEV configuration and the project registry, and the mkcert
+      # root CA generated on first start lives under it too. Regenerating that
+      # CA on every container recreate would re-issue every project certificate.
+      - runner-home:/home/${BOX_USER:-dizzy}
     healthcheck:
       # Against the real TLS listener, so this covers the certificate too. -k
       # because the certificate is self-signed and identity here is the pinned
@@ -104,6 +136,14 @@ services:
       # so a mount only lines up if this daemon sees the tree where the runner
       # does.
       - runner-workspace:${BOX_RUNNER_WORKSPACE:-/home/dizzy/Projects}
+      # The runner's HOME, at its own path, for exactly the same reason and it
+      # is not optional: `ddev start` binds several things out of ~/.ddev into
+      # the containers it creates -- homeadditions, and the directory it pushes
+      # the mkcert root out of. Those binds are resolved by THIS daemon, and a
+      # bind source that does not exist here is not an error: Docker silently
+      # creates an empty directory, so the certificates would simply never
+      # arrive and TLS would fail with nothing to explain it.
+      - runner-home:/home/${BOX_USER:-dizzy}
     healthcheck:
       test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
       interval: 3s
@@ -111,9 +151,17 @@ services:
       retries: 30
       start_period: 10s
     networks:
-      - runner
+      # A fixed address, because the runner's extra_hosts entries have to name
+      # it and those are resolved at container create. Everything DDEV publishes
+      # -- the router's 80/443, the database forwarder -- is published on this
+      # container's interface, so this address IS "the DDEV machine" as far as
+      # the runner is concerned.
+      runner:
+        ipv4_address: 10.99.2.10
 
 volumes:
+  runner-home:
+    name: claudebox-runner-home
   runner-workspace:
     name: claudebox-runner-workspace
   runner-state:

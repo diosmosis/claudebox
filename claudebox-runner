@@ -134,6 +134,13 @@ case "${1:-}" in
             echo "workspace volume: $(docker exec "${STATE_CONTAINER}" du -sh "${BOX_RUNNER_WORKSPACE}" 2>/dev/null | cut -f1) in ${BOX_RUNNER_WORKSPACE}"
             echo "projects synced:"
             docker exec "${STATE_CONTAINER}" ls -1 "${BOX_RUNNER_WORKSPACE}" 2>/dev/null | sed 's/^/  /'
+            echo
+            # DDEV projects live inside the sidecar's daemon, so this is the
+            # only place they show up -- `ddev list` on this machine, if there
+            # is a ddev on this machine at all, knows nothing about them.
+            echo "DDEV projects (inside the sidecar):"
+            docker exec -u "${BOX_USER}" -e HOME="/home/${BOX_USER}" "${STATE_CONTAINER}" \
+                ddev list 2>/dev/null | sed 's/^/  /' || echo "  (none)"
         fi
         exit 0
         ;;
