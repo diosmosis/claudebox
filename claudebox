@@ -18,8 +18,11 @@
 #   claudebox allowed         show the egress allowlist
 #   claudebox denied          show requests the proxy has blocked
 #
+#   claudebox plugins         list the commands plugins add
+#   claudebox <p>:<cmd> ...   run one (plugins/<p>/commands/<cmd>)
+#
 # Env overrides: BOX_WORKSPACE, BOX_WORKSPACE_HOST, BOX_USER, BOX_HOST_HOME,
-#               BOX_MKCERT_CA,
+#               BOX_MKCERT_CA, BOX_PLUGIN_PATH,
 #               BOX_DDEV_PROJECT (which project's database is reachable as db:3306)
 set -euo pipefail
 
@@ -50,6 +53,24 @@ DIND_APPARMOR_CONTAINER=claudebox-dind
 # shellcheck source=dind-apparmor.sh
 . "${BOX_DIR}/dind-apparmor.sh"
 
+# The half of this launcher that plugin commands also need: path translation,
+# the flags a session is attached with, and the small vocabulary a plugin talks
+# to the box in. Sourced here rather than copied there so there is one
+# implementation; exported below so a plugin, which is a separate process, can
+# source the same file. Functions only, so sourcing it this early is safe --
+# nothing in it reads a setting until it is called.
+# shellcheck source=plugin-api.sh
+export CLAUDEBOX_PLUGIN_API="${BOX_DIR}/plugin-api.sh"
+export CLAUDEBOX_DIR="${BOX_DIR}"
+export CLAUDEBOX_CONTAINER="${CONTAINER}"
+export CLAUDEBOX_PROXY_CONTAINER="${PROXY}"
+# Newline-separated, because an array cannot be exported. box_compose in the API
+# turns it back into "-f <file>" pairs.
+export CLAUDEBOX_COMPOSE_FILES="${BOX_DIR}/docker-compose.yaml
+${BOX_DIR}/docker-compose.override.yaml"
+# shellcheck source=/dev/null
+. "${CLAUDEBOX_PLUGIN_API}"
+
 # ---------------------------------------------------------------------------
 # Settings file
 #
@@ -74,6 +95,7 @@ BOX_SETTINGS=(
     BOX_USER BOX_UID BOX_GID BOX_HOST_HOME
     BOX_MKCERT_CA BOX_DDEV_PROJECT BOX_DIND_APPARMOR
     BOX_RUNNER BOX_RUNNER_TOKEN BOX_RUNNER_FINGERPRINT
+    BOX_PLUGIN_PATH
 )
 if [ -f "${BOX_CONFIG}" ]; then
     declare -A _from_env=()
@@ -140,6 +162,19 @@ export BOX_USER="${BOX_USER:-$(id -un)}"
 export BOX_UID="${BOX_UID:-$(id -u)}"
 export BOX_GID="${BOX_GID:-$(id -g)}"
 export BOX_MKCERT_CA="${BOX_MKCERT_CA:-$(mkcert -CAROOT 2>/dev/null || echo "${HOME}/.local/share/mkcert")/rootCA.pem}"
+
+# Where "claudebox <plugin>:<command>" looks, colon-separated, earliest wins.
+#
+# One default: plugins/ beside this script, which is tracked and holds the
+# plugins claudebox ships. A plugin there is a command that arrives with the
+# tool and is reviewed, versioned and rebuilt with it, rather than something
+# each machine grows its own copy of.
+#
+# The setting exists for the case that is not that -- a plugin kept in its own
+# checkout, or one local to a machine and not meant for the repository. Adding a
+# directory rather than replacing this one means listing both:
+#   BOX_PLUGIN_PATH="${HOME}/my-plugins:${BOX_DIR}/plugins"
+export BOX_PLUGIN_PATH="${BOX_PLUGIN_PATH:-${BOX_DIR}/plugins}"
 
 # The remote test runner, if one has been joined: address, shared token and the
 # certificate fingerprint to pin. These go to runner-relay and ONLY to
@@ -211,18 +246,6 @@ fi
     printf 'services:\n  claude:\n    volumes:\n'
     printf '      - %s\n' "${mounts[@]}"
 } > "${BOX_DIR}/docker-compose.override.yaml"
-
-# Translate a host path into the path the box sees, or fail if it is outside the
-# workspace -- which is the same thing as "the box cannot see it at all", since
-# the workspace is the only host tree bound in. Identity when the two workspace
-# roots are equal, so the default configuration passes everything through.
-box_path() {
-    case "${1}" in
-        "${BOX_WORKSPACE_HOST}")   printf '%s\n' "${BOX_WORKSPACE}" ;;
-        "${BOX_WORKSPACE_HOST}"/*) printf '%s\n' "${BOX_WORKSPACE}${1#"${BOX_WORKSPACE_HOST}"}" ;;
-        *) return 1 ;;
-    esac
-}
 
 # Refuse to bring the box up against a workspace that is not really there.
 #
@@ -761,6 +784,191 @@ runner_cmd() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# Plugins
+#
+# A plugin is a directory on BOX_PLUGIN_PATH holding executables:
+#
+#   plugins/my-plugin/commands/thing      ->  claudebox my-plugin:thing [args]
+#
+# The colon is what makes this safe to bolt onto a launcher whose real job is
+# forwarding arguments to claude. No built-in subcommand contains one, so a
+# plugin can never shadow one; and an argument that merely looks like a plugin
+# reference -- a prompt beginning "TODO: ..." -- is only intercepted if a plugin
+# by that name is actually installed. Anything else falls through to claude
+# unchanged, which is the behaviour every unrecognised argument already has.
+#
+# Commands are ordinary executables in any language, run ON THE HOST with the
+# launcher's environment exported (BOX_*, CLAUDEBOX_*). A shell one can source
+# "${CLAUDEBOX_PLUGIN_API}" for box_exec and friends and reach into the box in
+# one line; anything else gets the same information from the variables.
+#
+# Nothing is installed, registered or generated: the directory being on the path
+# is the whole of it. plugins/ in this repository is where the ones claudebox
+# ships live, so adding a command means adding a directory of scripts and
+# nothing else -- no dispatch arm here, no entry in a list, nothing to keep in
+# step. BOX_PLUGIN_PATH is how a plugin from somewhere else joins them.
+#
+# What this buys, over adding another arm to the case below: a plugin cannot
+# shadow a built-in or take a name away from claude (see the colon, above), it
+# is self-contained enough to move between checkouts, and it reaches the box
+# through box_exec in plugin-api.sh rather than through a second copy of the
+# exec flags.
+# ---------------------------------------------------------------------------
+
+# A plugin or command name. Restrictive on purpose: this becomes a path
+# component, and "../" reaching out of the plugin directory would make
+# "claudebox ..:/etc/whatever" a way to run an arbitrary executable.
+plugin_name_ok() {
+    [[ "${1}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]
+}
+
+# Every configured entry, in order, deduplicated -- whether or not it exists.
+# Deduplicated because the usual way to add a directory to BOX_PLUGIN_PATH is to
+# write it out with the default appended, and naming the same directory twice
+# should not report every plugin in it twice.
+#
+# read -ra rather than an unquoted expansion so a path containing a glob
+# character is not expanded against the filesystem.
+plugin_path_entries() {
+    local -a dirs=()
+    local dir seen=$'\n'
+    IFS=: read -ra dirs <<< "${BOX_PLUGIN_PATH}"
+    for dir in "${dirs[@]}"; do
+        [ -n "${dir}" ] || continue
+        dir="${dir%/}"
+        case "${seen}" in *$'\n'"${dir}"$'\n'*) continue ;; esac
+        seen="${seen}${dir}"$'\n'
+        printf '%s\n' "${dir}"
+    done
+}
+
+# The same, narrowed to the ones that are actually there. A missing entry is
+# normal -- neither default has to exist -- so it is skipped silently here and
+# only mentioned by "claudebox plugins", where "put one here" is the answer.
+plugin_dirs() {
+    local dir
+    while IFS= read -r dir; do
+        [ -d "${dir}" ] && printf '%s\n' "${dir}"
+    done < <(plugin_path_entries)
+}
+
+# Where a named plugin lives, first match on the path wins. A directory without
+# commands/ is not a plugin -- that is what keeps a stray README or a checkout
+# of something else from being reported as one.
+plugin_find() {
+    local name="${1}" dir
+    plugin_name_ok "${name}" || return 1
+    while IFS= read -r dir; do
+        if [ -d "${dir}/${name}/commands" ]; then
+            printf '%s\n' "${dir}/${name}"
+            return 0
+        fi
+    done < <(plugin_dirs)
+    return 1
+}
+
+plugin_commands() {
+    local dir="${1}" f
+    for f in "${dir}"/commands/*; do
+        [ -f "${f}" ] || continue
+        printf '%s\n' "${f##*/}"
+    done
+}
+
+# A command's one-line summary, taken from a "# description: ..." comment in its
+# first few lines. A convention rather than a manifest: a plugin should be a
+# directory of scripts and nothing else, and a script can describe itself.
+plugin_describe() {
+    sed -n '1,20{s/^#[[:space:]]*description:[[:space:]]*//p;}' "${1}" 2>/dev/null | head -1
+}
+
+plugins_list() {
+    local dir name path cmd desc found="" seen=" "
+    while IFS= read -r dir; do
+        for path in "${dir}"/*/; do
+            [ -d "${path}commands" ] || continue
+            name="$(basename -- "${path}")"
+            plugin_name_ok "${name}" || continue
+            # Earlier entries on the path shadow later ones, so a name already
+            # printed is not printed again from further along.
+            case "${seen}" in *" ${name} "*) continue ;; esac
+            seen="${seen}${name} "
+            found=1
+            printf '%s  (%s)\n' "${name}" "${path%/}"
+            while IFS= read -r cmd; do
+                desc="$(plugin_describe "${path}commands/${cmd}")"
+                if [ -x "${path}commands/${cmd}" ]; then
+                    printf '  claudebox %s:%-20s %s\n' "${name}" "${cmd}" "${desc}"
+                else
+                    printf '  claudebox %s:%-20s %s\n' "${name}" "${cmd}" \
+                        "(not executable -- chmod +x)"
+                fi
+            done < <(plugin_commands "${path%/}")
+        done
+    done < <(plugin_dirs)
+
+    if [ -z "${found}" ]; then
+        echo "claudebox: no plugins installed" >&2
+    fi
+    {
+        echo
+        echo "searched (earliest wins, set BOX_PLUGIN_PATH to change):"
+        while IFS= read -r dir; do
+            if [ -d "${dir}" ]; then
+                printf '  %s\n' "${dir}"
+            else
+                printf '  %s  (does not exist)\n' "${dir}"
+            fi
+        done < <(plugin_path_entries)
+        echo
+        echo "a plugin is a directory of executables:"
+        echo "  <dir>/my-plugin/commands/thing   ->  claudebox my-plugin:thing [args]"
+        echo "see ${BOX_DIR}/plugins/example for a worked one, and CLAUDEBOX.md for"
+        echo "the environment and helpers a command is handed."
+    } >&2
+}
+
+# Run "<plugin>:<command>", or return so the caller falls through to claude.
+#
+# Three outcomes, and the difference between the last two is the whole design:
+# an unknown PLUGIN is not this launcher's business (it is an argument for
+# claude), while a known plugin with an unknown COMMAND is a typo, and saying so
+# -- with the list -- beats sending it to an agent as a prompt.
+plugin_dispatch() {
+    local spec="${1}" name cmd dir exe
+    [[ "${spec}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || return 0
+    name="${spec%%:*}"
+    cmd="${spec#*:}"
+    dir="$(plugin_find "${name}")" || return 0
+    shift
+
+    exe="${dir}/commands/${cmd}"
+    if [ ! -f "${exe}" ]; then
+        echo "claudebox: plugin '${name}' has no command '${cmd}'. It has:" >&2
+        plugin_commands "${dir}" | sed "s/^/  claudebox ${name}:/" >&2
+        exit 2
+    fi
+    if [ ! -x "${exe}" ]; then
+        echo "claudebox: ${exe} is not executable -- chmod +x it" >&2
+        exit 126
+    fi
+
+    # What a command is handed, beyond the exported BOX_*/CLAUDEBOX_* settings.
+    # CLAUDEBOX_PLUGIN_STATE is a path, not a directory: it is created only if
+    # the command asks for it, via plugin_state in the API. It sits outside
+    # plugins/ -- that directory is tracked, and generated state does not belong
+    # in it -- and outside the plugin's own directory, which may be read-only or
+    # someone else's checkout.
+    export CLAUDEBOX_PLUGIN="${name}"
+    export CLAUDEBOX_PLUGIN_COMMAND="${cmd}"
+    export CLAUDEBOX_PLUGIN_DIR="${dir}"
+    export CLAUDEBOX_PLUGIN_STATE="${BOX_DIR}/plugin-state/${name}"
+    # exec, so the command owns the terminal and its exit status is the
+    # launcher's -- a plugin should be indistinguishable from a built-in.
+    exec "${exe}" "$@"
+}
+
 case "${1:-}" in
     help|-h|--help)
         cat >&2 <<'USAGE'
@@ -811,6 +1019,13 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
 
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
+
+  claudebox plugins          list the commands plugins add, and where they are
+                             looked for. A plugin is a directory of executables
+                             in plugins/, run as "claudebox <plugin>:<command>
+                             [args]"; adding one means adding the directory and
+                             nothing else. See plugins/example, and set
+                             BOX_PLUGIN_PATH to look somewhere as well.
 
 Env overrides: BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
                BOX_WORKSPACE       where the box sees the tree  (default ~/Projects)
@@ -1143,6 +1358,20 @@ USAGE
         reload_proxy
         exit $?
         ;;
+
+    plugins)
+        plugins_list
+        exit 0
+        ;;
+
+    # User-installed commands: "claudebox my-plugin:thing". Last in the case so
+    # it cannot shadow anything above -- and no built-in name contains a colon,
+    # so it never could. plugin_dispatch execs when the reference names an
+    # installed command and RETURNS otherwise, leaving the argument to fall
+    # through to claude, which is what any other unrecognised argument does.
+    *:*)
+        plugin_dispatch "$@"
+        ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -1201,45 +1430,15 @@ if mapped_pwd="$(box_path "${PWD}")"; then
     workdir="${mapped_pwd}"
 fi
 
-exec_flags=(-i -u "${BOX_UID}:${BOX_GID}" -w "${workdir}")
-if [ -t 0 ] && [ -t 1 ]; then
-    exec_flags+=(-t)
-fi
-
-# Terminal capabilities. "docker exec -t" sets TERM=xterm and nothing else,
-# which leaves a full-screen TUI (opencode's especially) drawing in eight
-# colours.
-#
-# The host's TERM is only passed through when the image has a terminfo entry for
-# it. Modern terminals ship their own -- ghostty is xterm-ghostty, kitty is
-# xterm-kitty -- and Debian's ncurses has neither, so forwarding blindly would
-# trade dull colours for curses programs in the box (less, nano) failing on an
-# unknown terminal type. COLORTERM carries the truecolor answer both agents
-# actually look at, and needs no terminfo at all.
-if [ -n "${TERM:-}" ] && docker exec "${CONTAINER}" infocmp "${TERM}" >/dev/null 2>&1; then
-    exec_flags+=(-e "TERM=${TERM}")
-else
-    exec_flags+=(-e "TERM=xterm-256color")
-fi
-if [ -n "${COLORTERM:-}" ]; then
-    exec_flags+=(-e "COLORTERM=${COLORTERM}")
-fi
-
-# Nested containers route out through the dind sidecar's network namespace, so
-# they can reach the proxy but can't resolve its name (dind's embedded DNS
-# doesn't know about it). Hand the box the address so it can pass the proxy to
-# "docker run" when a nested container needs egress:
-#   docker run -e HTTPS_PROXY=$CLAUDEBOX_PROXY ...
-proxy_ip="$(docker inspect -f \
-    '{{ with index .NetworkSettings.Networks "claudebox_inner" }}{{ .IPAddress }}{{ end }}' \
-    "${PROXY}" 2>/dev/null || true)"
-if [ -n "${proxy_ip}" ]; then
-    exec_flags+=(-e "CLAUDEBOX_PROXY=http://${proxy_ip}:3128")
-fi
+# The flags a session is attached with -- uid/gid, working directory, a tty when
+# there is one, terminal capabilities and the proxy address for nested
+# containers. Built by box_exec_flags in plugin-api.sh, because a plugin running
+# something in the box needs exactly the same set and two copies would drift.
+box_exec_flags "${workdir}"
 
 if [ "${1:-}" = "shell" ]; then
     shift
-    exec docker exec "${exec_flags[@]}" "${CONTAINER}" bash "$@"
+    exec docker exec "${BOX_EXEC_FLAGS[@]}" "${CONTAINER}" bash "$@"
 fi
 
 # The box's other agent. Everything above is the same for both -- same box, same
@@ -1249,7 +1448,7 @@ fi
 # auth login".
 if [ "${1:-}" = "opencode" ]; then
     shift
-    exec docker exec "${exec_flags[@]}" "${CONTAINER}" opencode "$@"
+    exec docker exec "${BOX_EXEC_FLAGS[@]}" "${CONTAINER}" opencode "$@"
 fi
 
-exec docker exec "${exec_flags[@]}" "${CONTAINER}" claude "$@"
+exec docker exec "${BOX_EXEC_FLAGS[@]}" "${CONTAINER}" claude "$@"

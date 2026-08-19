@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# description: print the arguments and how this command was invoked
+#
+# The smallest possible plugin command: an executable that runs on the host with
+# the launcher's environment exported. It needs nothing from the API.
+set -euo pipefail
+
+echo "invoked as: claudebox ${CLAUDEBOX_PLUGIN}:${CLAUDEBOX_PLUGIN_COMMAND}"
+echo "from:       ${CLAUDEBOX_PLUGIN_DIR}"
+echo "arguments:  $#"
+for arg in "$@"; do
+    printf '  %s\n' "${arg}"
+done

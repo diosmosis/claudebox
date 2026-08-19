@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# description: report what the box has installed (runs inside the container)
+#
+# A command whose work happens in the box. box_exec is the launcher's own attach
+# path minus the agent: same container, same user, same working directory a
+# session would start in, so relative paths mean what they do on the host.
+set -euo pipefail
+. "${CLAUDEBOX_PLUGIN_API}"
+
+# Says what to do rather than failing obscurely if the box is down. Use
+# box_start instead to bring it up -- that runs the full launch path (workspace
+# checks, allowlist resync, DDEV hostnames), which is why it is the launcher's
+# job and not this script's.
+box_require_running
+
+box_exec bash -lc '
+    printf "%-12s %s\n" node    "$(node --version)"
+    printf "%-12s %s\n" claude  "$(claude --version 2>/dev/null || echo "-")"
+    printf "%-12s %s\n" git     "$(git --version | cut -d" " -f3)"
+    printf "%-12s %s\n" pwd     "$(pwd)"
+'

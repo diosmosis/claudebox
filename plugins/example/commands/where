@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# description: show what a host path looks like from inside the box
+#
+# The workspace has two paths and they are only the same by default, so a plugin
+# that hands the box a path has to translate it. box_path fails when the path is
+# outside the workspace, which is the same thing as "the box cannot see it".
+set -euo pipefail
+. "${CLAUDEBOX_PLUGIN_API}"
+
+target="$(cd -- "${1:-.}" 2>/dev/null && pwd)" \
+    || plugin_die "${1:-.}: no such directory"
+
+if mapped="$(box_path "${target}")"; then
+    echo "host: ${target}"
+    echo "box:  ${mapped}"
+else
+    plugin_die "${target} is outside ${BOX_WORKSPACE_HOST}, so the box cannot see it"
+fi

@@ -40,6 +40,12 @@
 # exactly one project is running; pin it when several are.
 #BOX_DDEV_PROJECT=matomo
 
+# Where "claudebox <plugin>:<command>" looks, colon-separated, earliest wins.
+# The default is claudebox's own plugins/, which is where the plugins it ships
+# live. Setting this REPLACES that, so append it when adding a place to look
+# rather than moving -- a plugin of your own, or one kept in its own checkout.
+#BOX_PLUGIN_PATH="${HOME}/my-plugins:${BOX_DIR}/plugins"
+
 # AppArmor profile for the rootless dind sidecar. On Ubuntu 24.04 the named
 # profile is required -- see apparmor/claudebox-dind. On a host with no AppArmor
 # confinement, "unconfined" is right.

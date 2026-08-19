@@ -5,3 +5,8 @@
 # Per-machine settings: which drive holds the workspace, which ids the box runs
 # as. config.example is the documented template and IS tracked.
 /config
+
+# Per-plugin scratch space, one directory per plugin, created on demand by
+# plugin_state. Generated, so it is kept out of plugins/ itself -- that holds
+# the plugins distributed with claudebox and is tracked.
+/plugin-state/
