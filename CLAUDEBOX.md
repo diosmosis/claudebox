@@ -472,8 +472,9 @@ claudebox runner show      what is joined (the token is not printed)
 claudebox runner test      ask it, through the relay, whether it answers
 claudebox runner forget    un-join
 
-claudebox agent enrol      serve the agent door here, for a machine that hosts a
-                           runner (needs BOX_AGENT_SERVE=1); prints the join line
+claudebox agent start      serve the agent door here, for a machine that hosts a
+                           runner: turns it on, brings it up, prints the join line
+claudebox agent enrol      open another enrolment window, for one more machine
 claudebox agent status     whether that door is up, and its fingerprint
 claudebox agent add <host:port> <code>
                            ON a runner machine: join that workstation, so headless
@@ -1340,15 +1341,23 @@ publishes no port.
 ### Setting it up
 
 ```sh
-# On the workstation -- the machine that runs the agent
-echo 'BOX_AGENT_SERVE=1' >> ~/.claudebox/config
-claudebox                       # brings the front door up with the stack
-claudebox agent enrol           # prints the join line and an eight-character code
+# On the workstation -- the machine that runs the agent.
+# One command: sets BOX_AGENT_SERVE=1, brings the box and the front door up,
+# reports, and opens an enrolment window with the code to type over there.
+claudebox agent start
 
 # On the runner machine
 claudebox agent add <workstation>:7996 <code>
 claudebox agent test
 ```
+
+`agent start` is also how to bring the door back up after a restart — it is
+idempotent, and on a machine that is already joined it says so rather than
+opening a window nobody asked for. `claudebox agent enrol` opens one
+deliberately, to join a second machine.
+
+`agent-serve.mjs` is baked into the box image, so a claudebox that predates it
+needs a rebuild before `agent start` will produce a working door.
 
 ### Which project
 
@@ -2052,7 +2061,13 @@ claudebox example:versions
 docker ps --format '{{.Names}}' | grep -q agent-relay && echo BAD || echo ok
 claudebox shell -c 'ss -ltn 2>/dev/null | grep -q 7995' && echo BAD || echo ok
 
-# With BOX_AGENT_SERVE=1 and the stack up: the front door is on the LAN, the box
+# "claudebox agent start" is the whole setup, and refuses on a machine that
+# hosts a runner -- serving a door there is what the feature exists to prevent.
+claudebox agent start
+docker run -d --rm --name claudebox-runner alpine sleep 60
+claudebox agent start; echo "want non-zero, got $?"; docker rm -f claudebox-runner
+
+# With the door up: the front door is on the LAN, the box
 # is NOT, and the door refuses anything without the token. The second line is
 # the one that matters -- publishing the box's own listener would be the easy
 # mistake, and it would give the LAN a socket inside the sandbox.

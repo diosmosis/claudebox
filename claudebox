@@ -845,12 +845,15 @@ runner_hosted_here() {
 
 agent_usage() {
     cat >&2 <<'USAGE'
-usage: claudebox agent <enrol|status>            on a workstation
+usage: claudebox agent <start|enrol|status>      on a workstation
        claudebox agent <add|show|test|forget>    on a runner machine
 
   On the workstation -- the machine that runs the agent:
+    start   Turn the door on and open it: set BOX_AGENT_SERVE=1, bring the box
+            and the front door up, report, and open an enrolment window. The
+            one command to run on a machine that has never served one.
     enrol   Open an enrolment window and print the line to type on the runner
-            machine. Needs BOX_AGENT_SERVE=1 in the config here.
+            machine. For a door that is already up.
     status  Whether the front door is up, and its certificate fingerprint.
 
   On a runner machine -- the machine that must not run one:
@@ -898,6 +901,65 @@ agent_send() {
     agent_image || return 1
     printf '%s\0' "$@" \
         | docker run --rm -i claudebox-agent-relay:latest node /app/send.mjs
+}
+
+# Turn the door on and open it, in one command.
+#
+# The three steps this replaces are the setting, a start, and an enrolment
+# window, and they have to happen in that order: the front door sits behind a
+# compose profile the launcher only enables when the setting is there, so
+# enrolling before starting finds no container to enrol against.
+agent_start() {
+    if runner_hosted_here; then
+        {
+            echo "claudebox: this machine hosts a runner, and the door is what a WORKSTATION"
+            echo "claudebox: serves -- turning it on here would put an agent on the one machine"
+            echo "claudebox: built not to run one. Run this on the machine that should run"
+            echo "claudebox: claude, then join it from here:"
+            echo "claudebox:   claudebox agent add <host:port> <code>"
+        } >&2
+        return 1
+    fi
+
+    if [ -z "${BOX_AGENT_SERVE}" ]; then
+        config_set BOX_AGENT_SERVE 1
+        echo "claudebox: agent door turned on (BOX_AGENT_SERVE=1 in ${BOX_CONFIG})" >&2
+    fi
+    # This process resolved its settings before that write, and everything below
+    # reads them. Exporting also hands the value to the child below, where the
+    # environment wins over the file -- so it takes effect even on the run that
+    # turned it on.
+    export BOX_AGENT_SERVE=1
+
+    # Through the launcher rather than compose_up here: starting the box is also
+    # the workspace checks, the dind AppArmor preflight, the allowlist resync and
+    # the DDEV hostname rewrite, and a box brought up around those is a box that
+    # is only almost right. The child re-reads the config, so it is the one that
+    # adds --profile agent and creates the front door. Same reasoning as
+    # box_start in plugin-api.sh.
+    echo "claudebox: starting the box and the front door..." >&2
+    "${BOX_DIR}/claudebox" shell -c true >/dev/null || return 1
+
+    agent_status || return 1
+
+    # The front door's entrypoint opens a window itself the first time, but it
+    # prints the code to the container log, where nobody is looking. Open one
+    # here so the code lands in front of the person who asked for it.
+    #
+    # Not when this machine is already joined, for the reason the entrypoint has
+    # the same rule: a window is exposure, a machine that starts every morning
+    # should not open one every morning, and "claudebox agent enrol" is how you
+    # open one deliberately.
+    if docker exec claudebox-agent-relay test -f /var/lib/claudebox-agent/enrolled 2>/dev/null; then
+        {
+            echo
+            echo "claudebox: already joined -- no enrolment window opened."
+            echo "claudebox: 'claudebox agent enrol' opens one, to join another machine."
+        } >&2
+        return 0
+    fi
+    echo >&2
+    agent_enrol
 }
 
 agent_enrol() {
@@ -963,6 +1025,7 @@ agent_cmd() {
     local sub="${1:-}"
     shift || true
     case "${sub}" in
+        start)        agent_start ;;
         enrol|enroll) agent_enrol ;;
         status)       agent_status ;;
         add)
@@ -1356,10 +1419,11 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              "claudebox-runner join --full".
   claudebox runner show|test|forget
 
-  claudebox agent enrol      let a machine that HOSTS a runner send its headless
+  claudebox agent start      let a machine that HOSTS a runner send its headless
                              one-off runs here to be answered, instead of running
-                             an agent on itself. Needs BOX_AGENT_SERVE=1 here;
-                             prints the line to type over there.
+                             an agent on itself. Turns the door on, brings it up
+                             and prints the line to type over there.
+  claudebox agent enrol      open another enrolment window, for one more machine
   claudebox agent status     whether that front door is up, and its fingerprint
   claudebox agent add <host:port> <code>
                              the other side of it, run ON a runner machine

@@ -60,7 +60,10 @@
 #
 # On the WORKSTATION -- the machine that runs the agent. Off by default; setting
 # this creates the front door (agent-relay), publishes the port below, and
-# starts a listener in the box behind it. Then "claudebox agent enrol".
+# starts a listener in the box behind it.
+#
+# "claudebox agent start" writes this for you, brings both up and opens an
+# enrolment window, which is easier than setting it here and restarting by hand.
 #BOX_AGENT_SERVE=1
 #BOX_AGENT_PORT=7996
 
