@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# description: fetch a JIRA issue and have the box verify it and write a failing test
+#
+# Two halves, and the split between them is the point:
+#
+#   on the host   fetch the issue with the API token and write it into the
+#                 project as markdown;
+#   in the box    a headless session that reads that file, decides whether the
+#                 bug is real, and writes a failing regression test on a branch.
+#
+# The token never crosses the line. The box is handed a markdown file, which is
+# issue text and nothing else -- see lib/jira.sh.
+set -euo pipefail
+. "${CLAUDEBOX_PLUGIN_API}"
+. "${CLAUDEBOX_PLUGIN_DIR}/lib/jira.sh"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox jira:triage-issue <ISSUE-KEY> [options]
+
+  <ISSUE-KEY>          e.g. AS-345, MWP-123
+  --project <path>     the git project to work in (default: the current
+                       directory). Must be inside the workspace -- it is the
+                       only host tree the box can see.
+  --dir <path>         where to write <KEY>.md, relative to the project.
+                       Default: "claudebox jira:config"'s issue dir, or the
+                       project root.
+  --fetch-only         write the markdown and stop, without starting a session.
+
+Fetches the issue on THIS machine and writes <KEY>.md into the project, then
+runs a claude session in the box, in auto mode, asking it to verify the report
+and write a failing regression test on a new branch. Claude's answer is printed
+when it finishes.
+USAGE
+}
+
+key="" project="" issue_dir="" issue_dir_given="" fetch_only=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        --project)   project="${2:-}"; shift 2 ;;
+        --dir)       issue_dir="${2:-}"; issue_dir_given=1; shift 2 ;;
+        --fetch-only) fetch_only=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)          plugin_say "unknown option '${1}'"; usage; exit 2 ;;
+        *)
+            [ -z "${key}" ] || { plugin_say "one issue at a time (got '${key}' and '${1}')"; exit 2; }
+            key="${1}"; shift ;;
+    esac
+done
+
+[ -n "${key}" ] || { usage; exit 2; }
+
+# Upper-case, then check. JIRA keys are upper-case and the API is case-sensitive
+# about them; accepting "as-345" and fixing it is kinder than a 404. The pattern
+# is also what makes the key safe to put in a URL and in a filename.
+key="$(printf '%s' "${key}" | tr '[:lower:]' '[:upper:]')"
+case "${key}" in
+    [A-Z]*-[0-9]*)
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*-[0-9]+$ ]] || { plugin_die "'${key}' is not an issue key (expected something like AS-345)"; } ;;
+    *) plugin_die "'${key}' is not an issue key (expected something like AS-345)" ;;
+esac
+
+jira_require_config
+
+# ---------------------------------------------------------------------------
+# Where the work happens
+# ---------------------------------------------------------------------------
+project="${project:-${PWD}}"
+project="$(cd -- "${project}" 2>/dev/null && pwd)" \
+    || plugin_die "${project}: no such directory"
+
+# The box only has the workspace bound in. A project outside it is not "hard to
+# reach" -- it is invisible to the session that is about to be started, so the
+# file would be written somewhere the agent can never open.
+project_box="$(box_path "${project}")" || plugin_die \
+    "${project} is outside ${BOX_WORKSPACE_HOST}, which is the only host tree the box can see"
+
+# Claude is asked to work on a new branch, which needs a repository to branch in.
+git -C "${project}" rev-parse --git-dir >/dev/null 2>&1 \
+    || plugin_die "${project} is not a git repository, so there is no branch to create"
+
+# Not fatal: plenty of people triage with work in progress. But a session that
+# creates a branch over a dirty tree drags those changes onto it, and that is
+# worth knowing before it happens rather than afterwards.
+if [ -n "$(git -C "${project}" status --porcelain 2>/dev/null)" ]; then
+    plugin_say "warning: ${project} has uncommitted changes; a new branch will carry them along"
+fi
+
+jira_config_load
+[ -n "${issue_dir_given}" ] || issue_dir="${JIRA_ISSUE_DIR:-}"
+case "${issue_dir}" in
+    "")  target_dir="${project}" ;;
+    /*)  target_dir="${issue_dir%/}" ;;
+    *)   target_dir="${project}/${issue_dir%/}" ;;
+esac
+mkdir -p -- "${target_dir}" || plugin_die "cannot create ${target_dir}"
+target_dir="$(cd -- "${target_dir}" && pwd)"
+box_path "${target_dir}" >/dev/null || plugin_die \
+    "${target_dir} is outside ${BOX_WORKSPACE_HOST}, so the box could not read the file there"
+
+issue_file="${target_dir}/${key}.md"
+
+# What the prompt names. Claude's working directory is the project, so the file
+# is named the way someone standing in that directory would name it.
+issue_rel="${issue_file#"${project}"/}"
+
+# ---------------------------------------------------------------------------
+# Fetch, on this machine
+# ---------------------------------------------------------------------------
+plugin_say "fetching ${key} from ${JIRA_URL}"
+issue_json="$(jira_api "/rest/api/3/issue/${key}?fields=summary,description,issuetype,status,priority,reporter,created")" \
+    || exit 1
+
+# Render with whatever node is available.
+#
+# The host's is the normal path. The fallback matters more than it looks: node
+# is often installed through nvm, which puts it on PATH only in a shell that
+# sourced nvm, and the launcher assumes elsewhere that a host may have no node
+# at all. The box's node 22 is always there, and the issue text is going into
+# the box in the next step regardless, so nothing is exposed by using it. The
+# token is not involved either way -- this is formatting, on JSON already
+# fetched.
+render_issue() {
+    if command -v node >/dev/null 2>&1; then
+        node "${CLAUDEBOX_PLUGIN_DIR}/lib/render-issue.js"
+    elif box_running; then
+        docker exec -i "${CLAUDEBOX_CONTAINER}" \
+            node -e "$(cat "${CLAUDEBOX_PLUGIN_DIR}/lib/render-issue.js")"
+    else
+        plugin_say "no node on this machine and the box is not running, so there is nothing"
+        plugin_say "to render the issue with. Install node, or start the box ('claudebox')"
+        plugin_say "and run this again."
+        return 1
+    fi
+}
+
+# Via a temporary file in the same directory, so a failed render leaves the
+# previous <KEY>.md intact instead of truncating it.
+tmp_file="$(mktemp "${issue_file}.XXXXXX")"
+trap 'rm -f -- "${tmp_file}"' EXIT
+if ! printf '%s' "${issue_json}" | render_issue > "${tmp_file}"; then
+    exit 1
+fi
+chmod 0644 "${tmp_file}"
+mv -- "${tmp_file}" "${issue_file}"
+trap - EXIT
+plugin_say "wrote ${issue_file}"
+
+if [ -n "${fetch_only}" ]; then
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Triage, in the box
+# ---------------------------------------------------------------------------
+
+# Through the launcher, not box_exec: starting a session is also the workspace
+# checks, the dind AppArmor preflight, the allowlist resync and the DDEV
+# hostname rewrite, and a session started around those is a session in a box
+# that is only almost right. Running it from the project directory is what puts
+# claude in that project's counterpart inside the box.
+prompt="In the ${issue_rel}, there is a description of a possible bug or vulnerability. please read the file, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
+
+log_dir="$(plugin_state)/runs"
+mkdir -p -- "${log_dir}"
+log_file="${log_dir}/${key}-$(date +%Y%m%d-%H%M%S).log"
+
+plugin_say "starting a session in the box (auto mode); this takes a while"
+plugin_say "output is also being written to ${log_file}"
+
+# stdout captured, stderr left alone: the launcher's own progress lines and
+# claude's stderr arrive as they happen, so a long run does not look hung, while
+# the answer is held back to be printed in one piece at the end. Capturing
+# stdout also means it is not a terminal, so the launcher attaches no tty --
+# which is what makes this safe to run non-interactively.
+set +e
+answer="$(cd "${project}" && "${CLAUDEBOX_DIR}/claudebox" \
+    -p "${prompt}" --permission-mode auto </dev/null)"
+status=$?
+set -e
+
+printf '%s\n' "${answer}" > "${log_file}"
+
+if [ -n "${answer}" ]; then
+    echo
+    printf '%s\n' "${answer}"
+fi
+
+if [ "${status}" -ne 0 ]; then
+    plugin_say "the session exited ${status}"
+    exit "${status}"
+fi
+
+plugin_say "done. 'git -C ${project} branch' shows what it created, if anything"

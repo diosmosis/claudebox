@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# description: set or show the JIRA site, account and API token (host only)
+#
+# The credential this writes is the reason the plugin exists on the host rather
+# than in the box. See lib/jira.sh for where it goes and what keeps the
+# containers away from it.
+set -euo pipefail
+. "${CLAUDEBOX_PLUGIN_API}"
+. "${CLAUDEBOX_PLUGIN_DIR}/lib/jira.sh"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox jira:config [show|set|test|forget]
+
+  show    What is configured. The token is never printed. (the default)
+  set     Set it, prompting for whatever is not given:
+            --url <https://you.atlassian.net>
+            --email <the account's own address>
+            --issue-dir <path>   where jira:triage-issue writes <KEY>.md,
+                                 relative to the project. Empty = its root.
+            --token-stdin        read the token from stdin instead of prompting
+  test    Ask JIRA who the credential belongs to.
+  forget  Delete it.
+
+The token is an API token from https://id.atlassian.com/manage-profile/security/api-tokens
+-- not the account password. There is deliberately no --token flag: every
+process's arguments are readable by every process on this machine, and a
+credential typed on a command line is also in the shell history.
+USAGE
+}
+
+# Trailing slash removed: every path is concatenated onto this, and
+# "https://x.atlassian.net//rest/..." is a 404 that looks like a wrong token.
+normalise_url() {
+    local url="${1%/}"
+    case "${url}" in
+        https://*) ;;
+        http://*)  plugin_say "warning: ${url} is plain HTTP -- the token will cross the network in the clear" ;;
+        *)         url="https://${url}" ;;
+    esac
+    printf '%s\n' "${url}"
+}
+
+cmd_show() {
+    jira_config_load
+    if [ -z "${JIRA_URL}" ] && [ -z "${JIRA_TOKEN}" ]; then
+        plugin_say "nothing configured yet -- run 'claudebox jira:config set'"
+        return 0
+    fi
+    printf 'site:      %s\n' "${JIRA_URL:-(unset)}"
+    printf 'account:   %s\n' "${JIRA_EMAIL:-(unset)}"
+    printf 'token:     %s\n' "$([ -n "${JIRA_TOKEN}" ] && echo '(set)' || echo '(unset)')"
+    printf 'issue dir: %s\n' "${JIRA_ISSUE_DIR:-(the project root)}"
+    {
+        echo
+        echo "stored in ${JIRA_CREDENTIALS}"
+        echo "No container mounts that directory and no compose file names these"
+        echo "settings, so the box cannot read the token -- and with no Atlassian"
+        echo "entry in allowlist.conf it has no route to JIRA to spend it on."
+    } >&2
+}
+
+cmd_set() {
+    local url="" email="" issue_dir="" issue_dir_given="" token="" token_stdin=""
+    while [ $# -gt 0 ]; do
+        case "${1}" in
+            --url)        url="${2:-}"; shift 2 ;;
+            --email)      email="${2:-}"; shift 2 ;;
+            --issue-dir)  issue_dir="${2:-}"; issue_dir_given=1; shift 2 ;;
+            --token-stdin) token_stdin=1; shift ;;
+            -h|--help)    usage; return 0 ;;
+            *) plugin_say "unknown option '${1}'"; usage; return 2 ;;
+        esac
+    done
+
+    jira_config_load
+
+    # Prompt for what is missing, showing the current value as the default so
+    # that changing one setting does not mean retyping the others.
+    if [ -z "${url}" ]; then
+        if [ -t 0 ]; then
+            printf 'JIRA site URL [%s]: ' "${JIRA_URL:-https://you.atlassian.net}" >&2
+            read -r url
+        fi
+        url="${url:-${JIRA_URL}}"
+    fi
+    [ -n "${url}" ] || plugin_die "a site URL is required"
+    url="$(normalise_url "${url}")"
+
+    if [ -z "${email}" ]; then
+        if [ -t 0 ]; then
+            printf 'Account email [%s]: ' "${JIRA_EMAIL:-you@example.com}" >&2
+            read -r email
+        fi
+        email="${email:-${JIRA_EMAIL}}"
+    fi
+    [ -n "${email}" ] || plugin_die "an account email is required (Basic auth is email:token)"
+
+    if [ -n "${token_stdin}" ]; then
+        IFS= read -r token || true
+    elif [ -t 0 ]; then
+        # -s so it is not echoed: this is typed in front of whoever is looking at
+        # the screen, and it ends up in no scrollback either.
+        printf 'API token (not echoed)%s: ' "$([ -n "${JIRA_TOKEN}" ] && echo ' [keep existing]')" >&2
+        read -rs token
+        echo >&2
+        token="${token:-${JIRA_TOKEN}}"
+    else
+        token="${JIRA_TOKEN}"
+    fi
+    [ -n "${token}" ] || plugin_die "an API token is required -- get one at https://id.atlassian.com/manage-profile/security/api-tokens"
+
+    jira_config_set JIRA_URL "${url}"
+    jira_config_set JIRA_EMAIL "${email}"
+    jira_config_set JIRA_TOKEN "${token}"
+    if [ -n "${issue_dir_given}" ]; then
+        jira_config_set JIRA_ISSUE_DIR "${issue_dir%/}"
+    fi
+
+    plugin_say "saved to ${JIRA_CREDENTIALS} (0600, mounted into no container)"
+
+    # Verify immediately rather than at the next triage: a typo in the email is
+    # indistinguishable from a bad token later on, and this is the moment the
+    # user still has both in front of them.
+    jira_config_load
+    cmd_test || plugin_say "saved anyway -- fix it with 'claudebox jira:config set'"
+}
+
+cmd_test() {
+    local out name
+    jira_require_config
+    out="$(jira_api /rest/api/3/myself)" || return 1
+    name="$(printf '%s' "${out}" | sed -n 's/.*"displayName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    plugin_say "${JIRA_URL} answers as ${name:-that account}"
+}
+
+cmd_forget() {
+    if [ ! -f "${JIRA_CREDENTIALS}" ]; then
+        plugin_say "nothing to forget"
+        return 0
+    fi
+    rm -f -- "${JIRA_CREDENTIALS}"
+    plugin_say "deleted ${JIRA_CREDENTIALS}"
+    plugin_say "the token itself is still live -- revoke it at id.atlassian.com if that is the intent"
+}
+
+sub="${1:-show}"
+shift || true
+case "${sub}" in
+    show)          cmd_show "$@" ;;
+    set)           cmd_set "$@" ;;
+    test)          cmd_test "$@" ;;
+    forget)        cmd_forget "$@" ;;
+    -h|--help|help) usage ;;
+    *)             plugin_say "unknown subcommand '${sub}'"; usage; exit 2 ;;
+esac
