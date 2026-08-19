@@ -2,6 +2,15 @@
 #
 # An isolated container for running Claude Code against everything under
 # ~/Projects, with network access to DDEV projects via ddev-router.
+#
+# Two images come out of this file:
+#
+#   base              everything that decides how code builds and renders
+#   claudebox:latest  base + the agent            (the default build target)
+#
+# and a third out of runner/Dockerfile: claudebox-runner:latest, which is base
+# plus a network service, for running tests on another machine. See the comment
+# on the base stage for why the boundary is where it is.
 
 # ---------------------------------------------------------------------------
 # Ubuntu 24.04's font binaries, for screenshot testing.
@@ -61,7 +70,25 @@ RUN git clone --depth 1 --branch "${PHPANTOM_LSP_VERSION}" \
  && PHPANTOM_GIT_VERSION="${PHPANTOM_LSP_VERSION}" cargo build --release --locked \
  && strip target/release/phpantom_lsp
 
-FROM node:22-bookworm-slim
+# ---------------------------------------------------------------------------
+# base -- the environment the box and the remote runner share.
+#
+# Everything that decides how a test RENDERS or RUNS belongs in here: the fonts
+# and the fontconfig rules that select them, Chromium's shared libraries, PHP
+# and its extensions, node, composer, the docker CLI, and the ImageMagick limits
+# a full-page screenshot comparison needs.
+#
+# claudebox:latest is this plus the agent. claudebox-runner:latest
+# (runner/Dockerfile) is this plus a network service, built and run on another
+# machine. That split is what makes screenshot-baseline parity between the two
+# STRUCTURAL rather than a matter of keeping two package lists in step: they
+# come off the same layers, and anything added past this stage boundary is by
+# construction something a test cannot see.
+#
+# So the rule for editing below this point is: if a test could observe it, it
+# goes above the boundary, not below.
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS base
 
 ARG USERNAME=dizzy
 ARG UID=1000
@@ -217,6 +244,29 @@ RUN sed -i -E \
         -e 's/name="disk" value="[^"]+"/name="disk" value="4GiB"/' \
         /etc/ImageMagick-6/policy.xml
 
+# The node image already owns uid/gid 1000. Replace that user with one matching
+# the host user, so files written into the bind-mounted source tree keep the
+# right ownership instead of coming out root-owned.
+RUN userdel -r node >/dev/null 2>&1 || true; \
+    groupadd -g "${GID}" "${USERNAME}"; \
+    useradd -m -d "/home/${USERNAME}" -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"
+
+ENV BOX_USER=${USERNAME}
+ENV HOME=/home/${USERNAME}
+
+# ---------------------------------------------------------------------------
+# claudebox -- base plus the agent and the tooling only an agent needs.
+#
+# Nothing here may change how anything renders; see the note on the base stage.
+# ---------------------------------------------------------------------------
+FROM base AS claudebox
+
+# Re-declared because ARGs do not cross a FROM. The values compose passes are
+# applied to every stage that declares them, so these stay the same user.
+ARG USERNAME=dizzy
+ARG UID=1000
+ARG GID=1000
+
 RUN npm install -g @anthropic-ai/claude-code
 
 # opencode, the box's second agent ("claudebox opencode"). The npm package is a
@@ -248,13 +298,6 @@ RUN npm install -g opencode-ai
 # build time on the host's network but only through the allowlist afterwards.
 RUN npm install -g typescript-language-server typescript
 
-# The node image already owns uid/gid 1000. Replace that user with one matching
-# the host user, so files written into the bind-mounted source tree keep the
-# right ownership instead of coming out root-owned.
-RUN userdel -r node >/dev/null 2>&1 || true; \
-    groupadd -g "${GID}" "${USERNAME}"; \
-    useradd -m -d "/home/${USERNAME}" -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"
-
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
@@ -280,6 +323,13 @@ COPY ddev-fixups /usr/local/bin/claudebox-ddev-fixups
 COPY ddev-realip.conf /usr/local/share/claudebox/ddev-realip.conf
 RUN chmod 0755 /usr/local/bin/claudebox-ddev-fixups \
  && chmod 0644 /usr/local/share/claudebox/ddev-realip.conf
+
+# `runner` in the box pushes a project's source to the test runner on the other
+# machine and runs commands there, forwarding to runner-relay over the internal
+# network. Baked in for the same reason the ddev shim is: it must always be on
+# PATH, and a bind-mounted single file goes stale in the container.
+COPY runner-shim /usr/local/bin/runner
+RUN chmod 0755 /usr/local/bin/runner
 
 # Deletes gitignored build output from the workspace, which matters when the
 # workspace is a removable drive carrying source between machines. In here
@@ -325,8 +375,6 @@ RUN chmod 0644 /etc/claude-code/CLAUDE.md \
 # Node has its own CA bundle and ignores the system store, so point it at the
 # DDEV root CA that entrypoint.sh installs.
 ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/ddev-rootCA.crt
-ENV BOX_USER=${USERNAME}
-ENV HOME=/home/${USERNAME}
 
 WORKDIR /home/${USERNAME}/Projects
 

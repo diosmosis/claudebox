@@ -50,8 +50,8 @@ services:
       # runs in this container and loads Matomo's tracker from that URL, so
       # without it the JS pageviews never fire and screenshots of visit data
       # come out short. Kept identical to the nested list on purpose.
-      NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay
-      no_proxy: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay
+      NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay,runner-relay
+      no_proxy: localhost,127.0.0.1,::1,host.docker.internal,dind,proxy,ddev-relay,runner-relay
 
       # Node ignores the proxy variables by default -- fetch() and the http/https
       # core clients both do -- so ordinary node code fails with EAI_AGAIN in a
@@ -94,6 +94,12 @@ services:
       # Where the `ddev` shim (baked into the image) sends `ddev exec` requests.
       # ddev-relay is in NO_PROXY above, so this goes direct, not via squid.
       CLAUDEBOX_DDEV_RELAY: http://ddev-relay:7999
+
+      # Where the `runner` shim (also baked in) sends sync and exec requests for
+      # the remote test runner. Same arrangement: an internal-network address in
+      # NO_PROXY, so it goes direct. The box never learns the runner's address,
+      # token or fingerprint -- runner-relay holds all three.
+      CLAUDEBOX_RUNNER_RELAY: http://runner-relay:7997
 
       # Ports to republish from dind onto this container's loopback, so
       # "localhost:<port>" means here what it means on a single-host CI runner.
@@ -291,6 +297,49 @@ services:
       start_period: 3s
     networks:
       - inner
+
+  # The bridge from the isolated box to a test runner on another machine.
+  #
+  # Same shape and the same trust model as ddev-relay: it sits on `inner` where
+  # the box can reach it AND on `edge` where there is a route off this machine,
+  # it holds the credential the box must not have -- the runner's address, its
+  # token and the certificate fingerprint to pin -- and it forwards a fixed set
+  # of routes to that one runner and nothing else.
+  #
+  # This is the piece that makes a remote runner possible at all without
+  # dismantling the sandbox. claudebox_inner is internal: true, which means no
+  # default route and no NAT, and that -- not the HTTPS_PROXY variables -- is
+  # what makes egress deny-by-default. Giving the box a route to a LAN host
+  # would end that; giving it one constrained operation over the internal
+  # network does not.
+  #
+  # Unconfigured until a runner is joined ("claudebox runner add"), in which
+  # case it answers every request with the join instructions rather than a
+  # connection error.
+  runner-relay:
+    container_name: claudebox-runner-relay
+    image: claudebox-runner-relay:latest
+    build:
+      context: ./runner-relay
+    init: true
+    environment:
+      CLAUDEBOX_RUNNER: ${BOX_RUNNER:-}
+      CLAUDEBOX_RUNNER_TOKEN: ${BOX_RUNNER_TOKEN:-}
+      CLAUDEBOX_RUNNER_FINGERPRINT: ${BOX_RUNNER_FINGERPRINT:-}
+    healthcheck:
+      # Healthy means "listening". An unconfigured relay answers 503 with the
+      # join instructions and that is a correct state to be in, not a fault --
+      # the box must still come up on a machine that has no runner.
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:7997/relay-health',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    networks:
+      # inner: where the box reaches it. edge: the route to the LAN, which is
+      # the whole reason this container exists separately from the box.
+      - inner
+      - edge
 
   # One fixed TCP forward, from the box to a running DDEV project's database.
   #

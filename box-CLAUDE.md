@@ -136,11 +136,53 @@ that domain to be allowed will not help.
 relay against an already-running project. Starting, stopping and reconfiguring
 projects is the user's job on the host; ask rather than trying to do it.
 
+## Running tests on another machine (`runner`)
+
+There may be a second machine on the LAN set up as a **runner** — the same
+image's base layers with no agent in it, for running heavy suites (Matomo's UI
+tests above all) somewhere with more CPU. `runner status` says whether one is
+joined; if it answers with the join instructions instead, there is none and this
+whole section does not apply.
+
+```
+runner status          what is joined, and which project/workdir this resolves to
+runner sync            push this project's source there
+runner run <cmd...>    sync, then run <cmd> there, in this same relative directory
+runner exec <cmd...>   run <cmd> there WITHOUT syncing first
+```
+
+`runner run` is the one to use. Output streams back as it happens and the exit
+code is the remote command's, so it behaves like running it here.
+
+What crosses the network is **source only**. A directory is left behind exactly
+when `git check-ignore` says the project ignores it — so `vendor/`,
+`node_modules/` and `target/` stay on the runner, where they are installed once
+and reused, and a committed `vendor/` (some WordPress plugins) still goes. The
+first thing to do with a new project there is therefore `runner exec "composer
+install"` / `npm ci`; those are not synced and not deleted by later syncs.
+
+Two consequences worth remembering:
+
+- Anything a test WRITES on the runner stays there. There is no return path for
+  files yet, so a suite whose result is a file (screenshot diffs, coverage) is
+  not finished by running it remotely — read what you need with `runner exec`.
+- The runner has ordinary internet access; it is not behind this box's
+  allowlist. A `composer install` that fails here may well work there.
+
+Reaching it goes through `runner-relay` on the internal network, which is the
+only thing that holds its address, its token and its certificate. This box has
+no route to that machine and no credential for it, so `curl` to the runner will
+not work and is not meant to.
+
 ## Installed tools
 
 git, ripgrep, jq, curl, wget, less, nano, rsync, zip/unzip, php-cli 8.2 (curl,
 gd, mbstring, mysql, xml, zip), composer, node 22, docker CLI + buildx + compose,
 imagemagick (`compare`/`identify`, which screenshot assertions need).
+
+Everything in that list, the fonts below and the ImageMagick limits come from a
+`base` stage the remote runner's image is also built from, so a test renders the
+same in both places. That is why they are the same list and not two lists.
 
 Fonts are matched to Matomo's `ubuntu-24.04` CI runners on purpose — the DejaVu,
 Liberation and Noto binaries come from `ubuntu:24.04` rather than Debian, whose

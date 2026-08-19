@@ -41,6 +41,15 @@ COMPOSE=(docker compose \
     -f "${BOX_DIR}/docker-compose.yaml" \
     -f "${BOX_DIR}/docker-compose.override.yaml")
 
+# The rootless dind sidecar's AppArmor prerequisite, checked before the stack
+# starts and diagnosed from the sidecar's log if it fails anyway. Shared with
+# the runner launcher so both print the same fix; see dind-apparmor.sh.
+DIND_APPARMOR_TAG=claudebox
+DIND_APPARMOR_DIR="${BOX_DIR}"
+DIND_APPARMOR_CONTAINER=claudebox-dind
+# shellcheck source=dind-apparmor.sh
+. "${BOX_DIR}/dind-apparmor.sh"
+
 # ---------------------------------------------------------------------------
 # Settings file
 #
@@ -64,6 +73,7 @@ BOX_SETTINGS=(
     BOX_WORKSPACE BOX_WORKSPACE_HOST
     BOX_USER BOX_UID BOX_GID BOX_HOST_HOME
     BOX_MKCERT_CA BOX_DDEV_PROJECT BOX_DIND_APPARMOR
+    BOX_RUNNER BOX_RUNNER_TOKEN BOX_RUNNER_FINGERPRINT
 )
 if [ -f "${BOX_CONFIG}" ]; then
     declare -A _from_env=()
@@ -130,6 +140,15 @@ export BOX_USER="${BOX_USER:-$(id -un)}"
 export BOX_UID="${BOX_UID:-$(id -u)}"
 export BOX_GID="${BOX_GID:-$(id -g)}"
 export BOX_MKCERT_CA="${BOX_MKCERT_CA:-$(mkcert -CAROOT 2>/dev/null || echo "${HOME}/.local/share/mkcert")/rootCA.pem}"
+
+# The remote test runner, if one has been joined: address, shared token and the
+# certificate fingerprint to pin. These go to runner-relay and ONLY to
+# runner-relay -- never into the box's own environment, which is the entire
+# point of having a relay. Empty is a normal state: the relay then answers the
+# box with the join instructions instead of a connection error.
+export BOX_RUNNER="${BOX_RUNNER:-}"
+export BOX_RUNNER_TOKEN="${BOX_RUNNER_TOKEN:-}"
+export BOX_RUNNER_FINGERPRINT="${BOX_RUNNER_FINGERPRINT:-}"
 
 # Which DDEV project's database the box reaches at "db:3306" (see the ddev-db
 # service). Auto-detected when exactly one project is running -- with several up
@@ -212,6 +231,23 @@ box_path() {
 # mount point that also means writing to the internal disk under it), and a host
 # path outside Docker Desktop's file-sharing list stops the container from
 # starting with an error that names the path but not the setting.
+# ---------------------------------------------------------------------------
+# Bring the stack up, and say what went wrong when it does not
+#
+# The box depends_on dind being healthy, so a sidecar that cannot start surfaces
+# here as compose's "dependency failed to start" -- which names the service and
+# nothing else. Ask the sidecar's own log first; on this host there is one
+# answer it gives often enough to be worth recognising by hand.
+# ---------------------------------------------------------------------------
+compose_up() {
+    dind_apparmor_preflight
+    if "${COMPOSE[@]}" up -d "$@"; then
+        return 0
+    fi
+    dind_apparmor_postmortem || true
+    exit 1
+}
+
 require_workspace() {
     local store shared entry ok=""
 
@@ -579,6 +615,110 @@ media_rm() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Joining a remote test runner
+#
+# "claudebox runner add <host:port> <token> <fingerprint>" is the line the other
+# machine's launcher prints. It stores those three values in ~/.claudebox/config
+# -- the same file every other per-machine setting lives in, already gitignored
+# -- and from then on the launcher hands them to runner-relay and to nothing
+# else. The box never sees any of them.
+# ---------------------------------------------------------------------------
+config_set() {
+    local key="${1}" value="${2}" tmp
+    if [ ! -f "${BOX_CONFIG}" ]; then
+        printf '# claudebox settings for this machine. See config.example.\n' > "${BOX_CONFIG}"
+    fi
+    tmp="$(mktemp "${BOX_CONFIG}.XXXXXX")"
+    # Drop any existing assignment (commented or not) and re-add it at the end,
+    # so re-joining a runner replaces rather than shadows.
+    grep -vE "^[[:space:]]*#?[[:space:]]*${key}=" "${BOX_CONFIG}" > "${tmp}" || true
+    if [ -n "${value}" ]; then
+        printf '%s=%q\n' "${key}" "${value}" >> "${tmp}"
+    fi
+    # Tightened to 0600 rather than left at whatever it was: from here on the
+    # file holds a bearer token for another machine.
+    chmod 0600 "${tmp}"
+    mv -- "${tmp}" "${BOX_CONFIG}"
+}
+
+runner_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox runner <add|show|forget|test>
+
+  add <host:port> <token> <fingerprint>
+        Join the runner on another machine. This is the line that machine's
+        "claudebox-runner" prints when it starts; copy it whole.
+  show  What is joined (the token is not printed).
+  test  Ask the runner whether it is reachable, through the relay.
+  forget
+        Un-join. The runner keeps running; this machine stops knowing about it.
+
+A runner is the box's environment minus the agent, on a second machine, for
+running tests -- see claudebox-runner in this directory.
+USAGE
+}
+
+runner_cmd() {
+    local sub="${1:-}"
+    shift || true
+    case "${sub}" in
+        add)
+            if [ "$#" -ne 3 ]; then
+                echo "claudebox: runner add takes exactly three arguments" >&2
+                runner_usage
+                return 2
+            fi
+            case "${1}" in
+                *:[0-9]*) ;;
+                *) echo "claudebox: '${1}' is not host:port" >&2; return 2 ;;
+            esac
+            # The fingerprint is compared as an uppercase colon-separated hex
+            # string, which is the form node reports and openssl prints. Reject
+            # anything else here rather than letting it fail later as a
+            # mismatch, which reads like an attack and is usually a typo.
+            case "${3}" in
+                *[!0-9A-Fa-f:]*|"") echo "claudebox: '${3}' is not a certificate fingerprint" >&2; return 2 ;;
+            esac
+            config_set BOX_RUNNER "${1}"
+            config_set BOX_RUNNER_TOKEN "${2}"
+            config_set BOX_RUNNER_FINGERPRINT "$(printf '%s' "${3}" | tr '[:lower:]' '[:upper:]')"
+            echo "claudebox: joined runner at ${1}" >&2
+            echo "claudebox: relaunch claudebox to pick it up, then 'runner status' in the box" >&2
+            ;;
+        show)
+            if [ -z "${BOX_RUNNER}" ]; then
+                echo "claudebox: no runner joined" >&2
+                return 1
+            fi
+            echo "runner:      ${BOX_RUNNER}"
+            echo "fingerprint: ${BOX_RUNNER_FINGERPRINT}"
+            echo "token:       $([ -n "${BOX_RUNNER_TOKEN}" ] && echo '(set)' || echo '(missing)')"
+            ;;
+        forget)
+            config_set BOX_RUNNER ""
+            config_set BOX_RUNNER_TOKEN ""
+            config_set BOX_RUNNER_FINGERPRINT ""
+            echo "claudebox: runner forgotten; relaunch claudebox to apply" >&2
+            ;;
+        test)
+            # Through the relay, exactly as the box would reach it -- so this
+            # tests the pinned certificate and the token, not just a route.
+            if ! docker exec claudebox-runner-relay \
+                node -e "require('http').get('http://127.0.0.1:7997/health',r=>{let t='';r.on('data',d=>t+=d);r.on('end',()=>{process.stderr.write(t);process.exit(r.statusCode===200?0:1)})}).on('error',e=>{console.error(e.message);process.exit(1)})"; then
+                echo "claudebox: the runner did not answer. Is it running, and was the join" >&2
+                echo "claudebox: line copied from its current start? A rebuilt runner has a new" >&2
+                echo "claudebox: certificate and has to be re-joined." >&2
+                return 1
+            fi
+            ;;
+        *)
+            runner_usage
+            return 2
+            ;;
+    esac
+}
+
 case "${1:-}" in
     help|-h|--help)
         cat >&2 <<'USAGE'
@@ -619,6 +759,12 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              process wrote into it as root (native engine only:
                              Docker Desktop squashed every uid to yours)
 
+  claudebox runner add <host:port> <token> <fingerprint>
+                             join a test runner on another machine -- paste the
+                             line that machine's "claudebox-runner" prints. Then
+                             "runner run <cmd>" inside the box runs it there.
+  claudebox runner show|test|forget
+
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
 
@@ -649,9 +795,17 @@ USAGE
         exit 0
         ;;
 
+    runner)
+        shift
+        runner_cmd "$@"
+        exit $?
+        ;;
+
     stop)     exec "${COMPOSE[@]}" down ;;
     rebuild)  require_workspace
-              "${COMPOSE[@]}" build --no-cache && exec "${COMPOSE[@]}" up -d --force-recreate ;;
+              "${COMPOSE[@]}" build --no-cache
+              compose_up --force-recreate
+              exit 0 ;;
 
     allowed)  exec grep -vE '^\s*(#|$)' "${ALLOWLIST}" ;;
 
@@ -960,7 +1114,7 @@ docker network inspect ddev_default >/dev/null 2>&1 \
 
 # The override (plans bind + optional gitconfig) is generated up front, near the
 # COMPOSE definition, so it is already in place here.
-"${COMPOSE[@]}" up -d >/dev/null
+compose_up >/dev/null
 
 # "up -d" returns once the container is started, not once entrypoint.sh has
 # finished seeding config -- exec'ing in too early lands in a half-built HOME.

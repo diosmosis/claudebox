@@ -1,0 +1,383 @@
+#!/usr/bin/env node
+// claudebox `runner` shim (baked into the box image as /usr/local/bin/runner).
+//
+// Runs this project's tests on the other machine.
+//
+//   runner status              is a runner joined, and what does it see
+//   runner sync                push this project's source to it
+//   runner exec <cmd...>       run <cmd> there, in this project, without syncing
+//   runner run  <cmd...>       sync, then run -- the one you usually want
+//
+// The box has no route to that machine and no credential for it. Everything
+// here goes to runner-relay on the internal network, which holds both; see
+// runner-relay/relay.mjs.
+//
+// WHAT COUNTS AS SOURCE is decided here, because this is the side git lives on,
+// and the rule is the same one claudebox-strip-artifacts uses: a directory is
+// excluded only if `git check-ignore` says the project ignores it -- never
+// because of its name. Matomo commits parts of node_modules and several plugins
+// commit vue/dist, and a name list would silently drop them and leave the runner
+// testing something subtly different from what is here.
+'use strict';
+
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
+const { spawn, spawnSync } = require('node:child_process');
+
+const RELAY = process.env.CLAUDEBOX_RUNNER_RELAY || 'http://runner-relay:7997';
+const WORKSPACE = path.resolve(process.env.CLAUDEBOX_WORKSPACE || '/home/dizzy/Projects');
+
+// Names worth ASKING git about. Not a list of things to delete -- git has the
+// final say on every one of them -- just a way to keep the walk from running
+// check-ignore on all 200k paths in a checkout.
+const CANDIDATES = new Set([
+	'node_modules',
+	'vendor',
+	'target',
+	'.venv',
+	'__pycache__',
+	'dist',
+	'build',
+	'coverage',
+]);
+
+function die(msg, code) {
+	process.stderr.write('runner: ' + msg + '\n');
+	process.exit(code == null ? 1 : code);
+}
+
+// ---------------------------------------------------------------------------
+// Which project, and where in it
+//
+// The same climb ddev-relay does, with one more marker: a plain git checkout is
+// a project here too, since not everything the runner is asked to test is a
+// DDEV site. Never leaves the workspace.
+// ---------------------------------------------------------------------------
+function resolveProject(cwd) {
+	const wd = path.resolve(cwd);
+	if (wd !== WORKSPACE && !wd.startsWith(WORKSPACE + path.sep)) {
+		die(`${wd} is outside the workspace (${WORKSPACE})`);
+	}
+	let dir = wd;
+	for (;;) {
+		if (
+			fs.existsSync(path.join(dir, '.ddev', 'config.yaml')) ||
+			fs.existsSync(path.join(dir, '.git'))
+		) {
+			return {
+				root: dir,
+				project: path.relative(WORKSPACE, dir).split(path.sep).join('/'),
+				workdir: path.relative(dir, wd).split(path.sep).join('/'),
+			};
+		}
+		if (dir === WORKSPACE) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	die(
+		`no project root at or above ${wd} -- looked for .ddev/config.yaml or .git ` +
+			`up to ${WORKSPACE}`
+	);
+}
+
+// ---------------------------------------------------------------------------
+// The manifest
+// ---------------------------------------------------------------------------
+const ignoredCache = new Map();
+function gitIgnores(dir) {
+	if (ignoredCache.has(dir)) return ignoredCache.get(dir);
+	const parent = path.dirname(dir);
+	const inRepo = spawnSync('git', ['-C', parent, 'rev-parse', '--git-dir'], { stdio: 'ignore' });
+	// Outside a repository nothing can be called ignored, so it is kept. Same
+	// conservative answer strip-artifacts gives.
+	const answer =
+		inRepo.status === 0 &&
+		spawnSync('git', ['-C', parent, 'check-ignore', '-q', dir], { stdio: 'ignore' }).status === 0;
+	ignoredCache.set(dir, answer);
+	return answer;
+}
+
+// [relative path, size, mtime in whole seconds]. Seconds, not milliseconds:
+// tar's timestamps are whole seconds, so a millisecond comparison would call
+// every file changed on the very next sync.
+function buildManifest(root, opts) {
+	const out = [];
+	// Directories deliberately NOT sent. This list goes to the runner with the
+	// manifest, and it is what stops a sync deleting the runner's own vendor/ and
+	// node_modules/: without it those look to the far side like files that were
+	// removed here, and the whole point of the runner is that build output lives
+	// and rebuilds THERE.
+	const exclude = [];
+	const skipped = [];
+	(function walk(dir, prefix) {
+		let entries;
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch (e) {
+			process.stderr.write(`runner: cannot read ${dir}: ${e.message}\n`);
+			return;
+		}
+		for (const e of entries) {
+			const rel = prefix ? prefix + '/' + e.name : e.name;
+			const full = path.join(dir, e.name);
+			if (e.isDirectory()) {
+				if (e.name === '.git' && !prefix && opts.noGit) {
+					exclude.push(rel);
+					skipped.push(rel + '/  (--no-git)');
+					continue;
+				}
+				if (CANDIDATES.has(e.name) && gitIgnores(full)) {
+					exclude.push(rel);
+					skipped.push(rel + '/  (gitignored)');
+					continue;
+				}
+				walk(full, rel);
+			} else if (e.isFile() || e.isSymbolicLink()) {
+				let st;
+				try {
+					st = fs.lstatSync(full);
+				} catch {
+					continue;
+				}
+				out.push([rel, st.size, Math.floor(st.mtimeMs / 1000)]);
+			}
+		}
+	})(root, '');
+	return { manifest: out, exclude, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// Talking to the relay
+// ---------------------------------------------------------------------------
+function relayRequest(method, urlPath, { body, gzip, stream, onResponse }) {
+	const u = new URL(RELAY + urlPath);
+	const headers = {};
+	let payload = null;
+	if (body !== undefined) {
+		payload = Buffer.from(JSON.stringify(body));
+		headers['content-type'] = 'application/json';
+		if (gzip) {
+			payload = zlib.gzipSync(payload);
+			headers['content-encoding'] = 'gzip';
+		}
+		headers['content-length'] = payload.length;
+	} else if (stream) {
+		headers['content-type'] = 'application/octet-stream';
+	}
+	const req = http.request(
+		{ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers },
+		onResponse
+	);
+	req.on('error', (e) =>
+		die(
+			`runner relay unreachable at ${RELAY} (${e.message}). ` +
+				'If the box was just updated, relaunch claudebox.'
+		)
+	);
+	if (payload) req.end(payload);
+	else if (stream) stream.pipe(req);
+	else req.end();
+	return req;
+}
+
+function relayJson(method, urlPath, body, gzip) {
+	return new Promise((resolve) => {
+		relayRequest(method, urlPath, {
+			body,
+			gzip,
+			onResponse: (res) => {
+				let text = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => (text += d));
+				res.on('end', () => {
+					if (res.statusCode !== 200) die(text.trim() || `relay error ${res.statusCode}`);
+					try {
+						resolve(JSON.parse(text));
+					} catch {
+						die(`unreadable reply from the runner: ${text.slice(0, 200)}`);
+					}
+				});
+			},
+		});
+	});
+}
+
+// ---------------------------------------------------------------------------
+// sync
+// ---------------------------------------------------------------------------
+async function doSync(ctx, opts) {
+	const t0 = Date.now();
+	const { manifest, exclude, skipped } = buildManifest(ctx.root, opts);
+	if (opts.verbose && skipped.length) {
+		process.stderr.write(`runner: not sending ${skipped.length} directories:\n`);
+		for (const s of skipped) process.stderr.write('  ' + s + '\n');
+	}
+
+	const plan = await relayJson(
+		'POST',
+		'/sync/plan',
+		{ project: ctx.project, manifest, exclude },
+		true
+	);
+
+	if (plan.delete.length) {
+		await relayJson('POST', '/sync/delete', {
+			project: ctx.project,
+			paths: plan.delete,
+			exclude,
+		});
+	}
+
+	if (plan.need.length) {
+		await uploadFiles(ctx, plan.need);
+	}
+
+	const secs = ((Date.now() - t0) / 1000).toFixed(1);
+	process.stderr.write(
+		`runner: ${ctx.project}: ${manifest.length} files, ` +
+			`sent ${plan.need.length}, removed ${plan.delete.length} (${secs}s)\n`
+	);
+}
+
+// tar rather than a file-by-file upload: it is one stream, and it carries mode,
+// symlinks and -- the part that matters -- mtimes, which is what makes the next
+// manifest comparison see an unchanged file as unchanged.
+function uploadFiles(ctx, need) {
+	return new Promise((resolve) => {
+		const tar = spawn(
+			'tar',
+			[
+				'-c',
+				'-f',
+				'-',
+				'-C',
+				ctx.root,
+				'--no-recursion',
+				// NUL-separated names read from stdin, taken verbatim -- so a
+				// path with a newline, a space or a leading dash in it is sent
+				// as itself and not interpreted.
+				'--null',
+				'-T',
+				'-',
+			],
+			{ stdio: ['pipe', 'pipe', 'pipe'] }
+		);
+		let tarErr = '';
+		tar.stderr.on('data', (b) => {
+			if (tarErr.length < 8192) tarErr += b.toString();
+		});
+		tar.on('error', (e) => die(`could not run tar: ${e.message}`));
+		tar.stdin.on('error', () => {
+			/* reported by the exit status */
+		});
+		tar.stdin.end(need.join('\0') + '\0');
+
+		relayRequest('POST', `/sync/upload?project=${encodeURIComponent(ctx.project)}`, {
+			stream: tar.stdout,
+			onResponse: (res) => {
+				let text = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => (text += d));
+				res.on('end', () => {
+					if (res.statusCode !== 200) die(text.trim() || `upload failed (${res.statusCode})`);
+					if (tarErr.trim()) process.stderr.write(`runner: tar: ${tarErr.trim()}\n`);
+					resolve();
+				});
+			},
+		});
+	});
+}
+
+// ---------------------------------------------------------------------------
+// exec
+// ---------------------------------------------------------------------------
+function doExec(ctx, command) {
+	relayRequest('POST', '/exec', {
+		body: { project: ctx.project, workdir: ctx.workdir, command },
+		onResponse: (res) => {
+			if (res.statusCode !== 200) {
+				let t = '';
+				res.setEncoding('utf8');
+				res.on('data', (d) => (t += d));
+				res.on('end', () => die(t.trim() || 'runner error ' + res.statusCode));
+				return;
+			}
+			// [1 byte channel][4 byte BE length][payload] -- the same framing
+			// ddev-relay uses, decoded the same way.
+			let buf = Buffer.alloc(0);
+			let exitCode = null;
+			res.on('data', (chunk) => {
+				buf = Buffer.concat([buf, chunk]);
+				while (buf.length >= 5) {
+					const channel = buf[0];
+					const len = buf.readUInt32BE(1);
+					if (buf.length < 5 + len) break;
+					const payload = buf.subarray(5, 5 + len);
+					buf = buf.subarray(5 + len);
+					if (channel === 1) process.stdout.write(payload);
+					else if (channel === 2) process.stderr.write(payload);
+					else if (channel === 3) {
+						try {
+							exitCode = JSON.parse(payload.toString()).exit;
+						} catch {
+							exitCode = 1;
+						}
+					}
+				}
+			});
+			res.on('end', () => process.exit(exitCode == null ? 0 : exitCode));
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------
+(async function main() {
+	const argv = process.argv.slice(2);
+	const opts = { noGit: false, verbose: false };
+	while (argv.length && (argv[0] === '--no-git' || argv[0] === '-v' || argv[0] === '--verbose')) {
+		if (argv[0] === '--no-git') opts.noGit = true;
+		else opts.verbose = true;
+		argv.shift();
+	}
+	const sub = argv.shift();
+
+	if (!sub || sub === '-h' || sub === '--help') {
+		process.stderr.write(
+			'usage: runner [--no-git] [-v] <status|sync|exec|run> [command...]\n' +
+				'\n' +
+				'  status         show what runner is joined and what it sees\n' +
+				'  sync           push this project\'s source to the runner\n' +
+				'  exec <cmd...>  run <cmd> there without syncing first\n' +
+				'  run  <cmd...>  sync, then run <cmd> there\n'
+		);
+		process.exit(sub ? 0 : 2);
+	}
+
+	if (sub === 'status') {
+		const ctx = resolveProject(process.cwd());
+		const health = await relayJson('GET', '/health');
+		process.stdout.write(
+			`runner:    reachable, workspace ${health.workspace}\n` +
+				`project:   ${ctx.project}\n` +
+				`workdir:   ${ctx.workdir || '(project root)'}\n`
+		);
+		return;
+	}
+
+	const ctx = resolveProject(process.cwd());
+
+	if (sub === 'sync') {
+		await doSync(ctx, opts);
+		return;
+	}
+	if (sub === 'exec' || sub === 'run') {
+		if (!argv.length) die(`usage: runner ${sub} <command...>`, 2);
+		if (sub === 'run') await doSync(ctx, opts);
+		doExec(ctx, argv.join(' '));
+		return;
+	}
+	die(`unknown subcommand '${sub}' -- try status, sync, exec or run`, 2);
+})();

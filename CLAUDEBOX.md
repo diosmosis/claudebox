@@ -38,6 +38,10 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
                     │  claudebox   claudebox-dind   ddev-relay   ddev-db  ddev-http  │
                     │      │             │              │           │          │     │
                     │      └─── proxy ───┘              │           │          │     │
+                    │                                                                │
+                    │            runner-relay ── claudebox_edge ──→ LAN ──→ another   │
+                    │             (token +                                  machine's │
+                    │              pinned cert)                             runner    │
                     └───────────│───────────────────────┼───────────┼──────────┼────┘
                                 │       host docker.sock ┘ → docker exec
                                 │                            ddev-<project>-<svc>
@@ -62,11 +66,12 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 | `claudebox-ddev-relay` | built from `ddev-relay/Dockerfile` | Holds the host Docker socket; runs `ddev exec` in DDEV containers on the box's behalf. On `inner` only — no egress. See below. |
 | `claudebox-ddev-db` | `alpine/socat` | One fixed TCP forward: `db:3306` on `inner` → `ddev-<project>-db:3306` on `ddev_default`. Lets PHP in the box use a DDEV project's database. See below. |
 | `claudebox-ddev-http` | built from `ddev-http/Dockerfile` | nginx on a fixed address: sets `Host` to the project's hostname, presents the client as `127.0.0.1`, and proxies to the project's web container. This is what `host.docker.internal` resolves to, in dind and in the box. See below. |
+| `claudebox-runner-relay` | built from `runner-relay/Dockerfile` | Holds a remote test runner's address, token and certificate fingerprint; forwards five routes to it and nothing else. On `inner` *and* `edge`, which is the only reason the box can reach another machine at all. Idle and harmless when no runner is joined. See below. |
 
 | Network | Kind | Members |
 |---|---|---|
-| `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay, ddev-db, ddev-http (`10.99.1.10`) |
-| `claudebox_edge` | bridge | proxy only |
+| `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay, ddev-db, ddev-http (`10.99.1.10`), runner-relay |
+| `claudebox_edge` | bridge | proxy, runner-relay |
 | `ddev_default` | external (DDEV's) | proxy, ddev-db, ddev-http |
 
 | Volume | Contents |
@@ -284,11 +289,41 @@ Each of these is doing real work. Changing one breaks something specific.
   of the mount means Claude-in-the-box cannot edit its own jail.
 
 - **dind runs with no `--privileged`.** The minimum that works is
-  `seccomp=unconfined`, `apparmor=unconfined`, `systempaths=unconfined`, plus
+  `seccomp=unconfined`, `apparmor=claudebox-dind`, `systempaths=unconfined`, plus
   `/dev/fuse` and `/dev/net/tun`. `systempaths=unconfined` is the non-obvious
   one: Docker masks parts of `/proc` by default, and the kernel then refuses
   `mount -t proc` inside the nested user namespace. Without it, nested
   containers fail with `error mounting "proc" ... operation not permitted`.
+
+- **The AppArmor profile is a prerequisite, and both launchers detect it rather
+  than documenting it.** Ubuntu 24.04 sets
+  `kernel.apparmor_restrict_unprivileged_userns=1`, which denies user-namespace
+  creation to *unconfined* processes — so `apparmor=unconfined` is precisely the
+  case that fails, and rootlesskit dies before dockerd starts with `fork/exec
+  /proc/self/exe: operation not permitted`. `apparmor/claudebox-dind` is
+  unconfined plus `userns`, granted to that one container:
+
+  ```
+  sudo cp ~/.claudebox/apparmor/claudebox-dind /etc/apparmor.d/
+  sudo apparmor_parser -r /etc/apparmor.d/claudebox-dind
+  ```
+
+  `dind-apparmor.sh` is sourced by `claudebox` and `claudebox-runner` alike and
+  runs two checks, because they fail at different times and neither covers the
+  other. The **preflight** (before `compose up`) is cheap and predictive but can
+  only see that the profile *file* exists — `/sys/kernel/security/apparmor/profiles`
+  is root-only, so a launcher running as the user cannot confirm it was ever
+  loaded. The **postmortem** greps the sidecar's log for that exact message when
+  the stack fails to come up, which is authoritative and catches "file present
+  but `apparmor_parser` never ran". Both print the same fix, with the calling
+  checkout's path in it so the commands are copy-pasteable on either machine.
+  `BOX_DIND_APPARMOR=unconfined` opts out entirely and silences both — right on a
+  host with no AppArmor confinement, which is how this ran under Docker Desktop.
+
+  This is code and not a README line because of where the symptom surfaces: the
+  container exits 1, compose reports only that a dependency is unhealthy, and the
+  cause is four layers down in a log nobody thinks to open. It cost a full
+  debugging round here and would cost the same again on every new runner machine.
 
 - **Nested containers are handed the proxy by the Docker client, not by the
   person running the command.** `entrypoint.sh` writes a `proxies.default` block
@@ -383,6 +418,13 @@ Each of these is doing real work. Changing one breaks something specific.
 | `ddev-relay/Dockerfile`, `ddev-relay/relay.mjs` | The scoped `ddev exec` relay image and server |
 | `ddev-http/Dockerfile`, `ddev-http/default.conf.template` | The `host.docker.internal` front door for nested containers |
 | `ddev-fixups`, `ddev-realip.conf` | Baked in as `claudebox-ddev-fixups`; prepares a DDEV web container for UI tests (client IP, path alias) |
+| `runner-shim` | The box's `runner` (baked to `/usr/local/bin/runner`); syncs a project to the remote runner and runs commands there |
+| `runner-relay/Dockerfile`, `runner-relay/relay.mjs` | The relay that holds the runner's credential and forwards to it |
+| `runner/Dockerfile`, `runner/runner.mjs`, `runner/entrypoint.sh` | The runner image (`FROM` the main Dockerfile's `base` stage), its API, and the first-start identity generation |
+| `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
+| `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
+| `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
+| `apparmor/claudebox-dind` | The profile that grants `userns` to the dind sidecar; installed once with `sudo`, on each machine |
 | `node-proxy-bootstrap.cjs` | Preloaded into every Node process via `NODE_OPTIONS`; DNS-preflight shim |
 | `box-CLAUDE.md` | Baked to `/etc/claude-code/CLAUDE.md` **and** `/etc/claudebox/AGENTS.md`; what the box's agent is told about its own environment, one file for both |
 | `box-opencode.json` | Baked to `/etc/claudebox/opencode.json`; the config `OPENCODE_CONFIG` points at, whose only job is adding `AGENTS.md` to opencode's instructions |
@@ -408,6 +450,13 @@ claudebox allow <domain>   append to the allowlist and hot-reload the proxy
 claudebox reload           re-apply allowlist.conf after editing it by hand
 claudebox allowed          show the allowlist
 claudebox denied           show what the proxy has blocked
+
+claudebox runner add <host:port> <token> <fingerprint>
+                           join a remote test runner -- paste the line that
+                           machine's "claudebox-runner" prints on startup
+claudebox runner show      what is joined (the token is not printed)
+claudebox runner test      ask it, through the relay, whether it answers
+claudebox runner forget    un-join
 ```
 
 Settings live in `~/.claudebox/config`, sourced as shell (see `config.example`,
@@ -421,7 +470,14 @@ typo in the file is inert rather than mysterious.
 Settings: `BOX_WORKSPACE` (where the box sees the tree), `BOX_WORKSPACE_HOST`
 (the host directory bound there; defaults to `BOX_WORKSPACE`), `BOX_USER`,
 `BOX_UID`, `BOX_GID`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`, `BOX_DDEV_PROJECT`,
-`BOX_DIND_APPARMOR`.
+`BOX_DIND_APPARMOR`, and `BOX_RUNNER` / `BOX_RUNNER_TOKEN` /
+`BOX_RUNNER_FINGERPRINT` (written by `claudebox runner add`, read by nothing but
+the relay).
+
+`claudebox-runner` reads the same file with its own allowlist —
+`BOX_USER`/`BOX_UID`/`BOX_GID`, `BOX_DIND_APPARMOR`, `BOX_RUNNER_PORT`,
+`BOX_RUNNER_WORKSPACE`, `BOX_RUNNER_BASE_IMAGE` — since a machine is normally
+one role or the other and the settings that matter differ.
 
 ### What the launcher does on each run
 
@@ -504,6 +560,173 @@ the allowlist — Anthropic's already is. `opencode.ai` and `models.opencode.ai`
 carry the auth flow and the model catalogue; blocking them does not stop opencode
 starting, it just falls back to a built-in catalogue, which is the kind of quiet
 degradation `claudebox denied` exists to explain.
+
+## Remote test runner
+
+The agent runs here; the tests can run on a second machine on the LAN. A runner
+is **the box minus the agent, plus a network API** — same image layers, so a
+screenshot rendered there and one rendered here come out of the same fonts and
+the same fontconfig rules.
+
+```
+  this machine                                    the runner machine
+  ------------                                    ------------------
+  claudebox ──POST {project, command}──▶ runner-relay ──TLS+token──▶ claudebox-runner
+   (agent)      (claudebox_inner,               (holds address,          │
+                 internal: true)                 token, fingerprint)     ├─ rootless dind
+                                                                         └─ workspace volume
+```
+
+### Why it is built this way
+
+Two obvious approaches do not work, and it is worth knowing why before
+simplifying this.
+
+**Not `DOCKER_HOST=tcp://otherbox:2375`.** `-v` sources in `docker run` are
+resolved by the *daemon*, not the client — a remote daemon looks for
+`/home/dizzy/Projects/matomo` on its own disk, and when it is absent Docker
+**silently creates an empty directory** rather than failing. Every DDEV and
+wp-env mount depends on that resolving. And `claudebox_inner` is `internal: true`;
+giving the box a route to a LAN host is what dismantles the sandbox, not the
+`HTTPS_PROXY` variables. `tcp://host:2375` is also unauthenticated root on that
+host.
+
+**Not an ad-hoc DDEV + Chromium install on the target.** Baselines would drift.
+Font *package versions* change glyph rendering — `fonts-dejavu-core 2.37-6`
+against `2.37-8`, same upstream version, different bytes — and any environment
+not built from the same layers produces UI-test diffs that look exactly like real
+regressions. This is what the `base` stage in `Dockerfile` exists for.
+
+### The base stage
+
+`Dockerfile` has two stages that produce images:
+
+| Stage | Contents |
+|---|---|
+| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, PHP + extensions, node, composer, the docker CLI, ImageMagick's raised limits, the box user |
+| `claudebox` | `base` + the agents, the shims, the language servers, `box-CLAUDE.md` |
+
+`runner/Dockerfile` is `FROM claudebox-base:latest` and installs **nothing**. If
+the runner turns out to need a package, it belongs in `base` — putting it in
+`runner/Dockerfile` is a divergence from the box's environment by definition.
+
+`claudebox-runner` builds `--target base` from this same file before building the
+runner image, which is why the base image is a build ARG rather than a fixed tag.
+
+### The trust boundary
+
+The box gets no LAN access and no credential. `runner-relay` is on `inner` (where
+the box reaches it) and on `edge` (where there is a route out), and it is the only
+thing that holds `BOX_RUNNER`, `BOX_RUNNER_TOKEN` and `BOX_RUNNER_FINGERPRINT`.
+It forwards exactly five routes — `/health`, `/sync/plan`, `/sync/delete`,
+`/sync/upload`, `/exec` — and rebuilds the headers rather than passing them
+through, so the box cannot set anything upstream sees except the body.
+
+Identity is a **pinned certificate**, in two steps and in this order: a bare TLS
+handshake that carries nothing is used to learn the runner's certificate and
+check its fingerprint, and only a certificate that matched is then installed as
+the sole trust anchor (`ca:`) for the requests that carry the token. Doing it as
+`https.request` plus a `secureConnect` check would leave a window in which the
+token could go to the wrong server; doing it by handing an already-connected
+socket to `http.request` does not work at all (the request never reaches the
+server and the client reports "socket hang up").
+
+Self-signed rather than a CA because there is one client on one LAN, and mkcert
+cannot help — its root lives on *this* machine, not the target. The consequence
+is that **a rebuilt runner has a new certificate and must be re-joined**; the
+relay says so by name when the fingerprint does not match.
+
+Be clear about what that boundary is and is not. `/exec` runs `bash -lc` on the
+runner, so a box that can reach the relay has arbitrary code execution on the
+runner machine as that user — deliberately, since that is the operation being
+granted, and exactly as `ddev exec` through `ddev-relay` already grants a shell
+in a project's web container. What the boundary buys is that the box holds no
+credential and no route: it cannot reach *anything else* on the LAN, and
+compromising it does not yield the token to use elsewhere. The runner is a
+machine you are willing to hand to the agent, not a sandbox around it.
+
+The path checks in `runner.mjs` are therefore about not corrupting the wrong
+project by accident or by a malformed request — not about containing a hostile
+client. They still all hold: a project or workdir that resolves outside its root
+is refused rather than clamped, and `tar -x -C <project>` refuses members
+containing `..` and strips leading `/`, so an upload cannot land outside the
+project either.
+
+### Sync
+
+Source only, delta-transferred, in three calls: `POST /sync/plan` with a manifest
+of `[path, size, mtime]`, then `/sync/delete` for what the runner has and this
+side does not, then `/sync/upload` with a `tar` stream of what it needs.
+
+Comparison is size + mtime — rsync's default quick check, and the reason the
+upload is a tar rather than a file-by-file POST: tar preserves mtimes, so the
+*next* sync sees unchanged files as unchanged instead of re-sending everything.
+
+**What counts as source is decided on this side, by git.** A directory is left
+out only when `git check-ignore` says the project ignores it — never because of
+its name. Matomo commits parts of `node_modules` and several plugins commit
+`vue/dist`; a name list would silently drop those and leave the runner testing
+something subtly different. Same rule as `claudebox-strip-artifacts`.
+
+The client sends that exclusion list along with the manifest, and this is
+load-bearing rather than an optimisation: without it the runner walks into its
+own `vendor/` and `node_modules/`, sees files the manifest does not mention, and
+**deletes them** — wiping the build output the runner exists to keep. The runner
+does not descend into an excluded directory at all, and refuses a delete under
+one even if asked directly.
+
+Measured here: `wp-matomo` 11510 files in 5.4s first sync, 0.9s when nothing
+changed; `matomo` 46570 files in 31s. `.git` is included by default (`--no-git`
+skips it) so the runner's tree is a real checkout.
+
+Build output never crosses the network. `composer install` / `npm ci` are run
+once **on the runner** and stay there.
+
+### In the box
+
+```
+runner status          what is joined, and which project/workdir this resolves to
+runner sync            push this project's source
+runner run <cmd...>    sync, then run <cmd> there (the usual one)
+runner exec <cmd...>   run without syncing first
+```
+
+A project is the nearest ancestor with `.ddev/config.yaml` or `.git`, climbing no
+further than the workspace root — the same shape of check `ddev-relay` does. Both
+the project and the workdir are sent *relative*, so the two machines need not
+mount the tree at the same path, and both are re-resolved and re-checked against
+the workspace root on the far side.
+
+Output streams back frame by frame using the same `[1 byte channel][4 byte BE
+length][payload]` framing `ddev-relay` uses (1 stdout, 2 stderr, 3 meta JSON), and
+the exit code is the remote command's.
+
+### Setting up a runner machine
+
+```
+git clone <this repo> ~/.claudebox && ln -s ~/.claudebox/claudebox-runner ~/.local/bin/
+claudebox-runner                      # builds base, builds the runner, starts it
+                                      # and prints the join line
+```
+
+Then on this machine, paste the line it printed:
+
+```
+claudebox runner add 192.168.1.42:7998 <token> <fingerprint>
+claudebox                             # relaunch to pick it up
+```
+
+The runner's identity lives in the `claudebox-runner-state` volume, so restarts
+and rebuilds of the *service* keep it. `claudebox-runner reset` deletes the synced
+workspace (costing a re-sync) and keeps the identity.
+
+### Not yet done
+
+`/artifacts` — pulling screenshots, diffs and logs back — is not implemented;
+anything a test writes on the runner stays there. DDEV on the runner and the
+`host.docker.internal` / port-forwarding arrangement the UI tests need are also
+still to come. Until then the runner is good for suites that need only a
+checkout and its own dependencies.
 
 ## Egress allowlist
 
@@ -1112,6 +1335,58 @@ claudebox shell -c 'head -1 /etc/claudebox/AGENTS.md'
 claudebox shell -c 'curl -s -o /dev/null -w "%{http_code}\n" https://models.opencode.ai/'
 ```
 
+After a change to the `base`/`claudebox` stage split, the acceptance test is
+"nothing changed" — the claudebox image must still be exactly what it was:
+
+```bash
+docker run --rm --entrypoint sh claudebox:latest -c '
+  id dizzy; pwd; env | grep -E "BOX_USER|^HOME|NODE_EXTRA|PHPANTOM"
+  for b in claude opencode typescript-language-server phpantom_lsp ddev runner \
+           claudebox-ddev-fixups claudebox-strip-artifacts docker composer php \
+           node fc-cache convert rsync socat; do
+    printf "%-28s %s\n" "$b" "$(command -v $b || echo MISSING)"
+  done
+  ls /etc/fonts/conf.d/ | grep -E "sub-pixel|bitmaps"'
+```
+
+With a runner joined, these exercise the whole remote path. The confinement ones
+matter most: every path in every request is attacker-controlled by construction.
+
+```bash
+claudebox runner test                     # reachable, token accepted, cert pinned
+
+# Sync is idempotent, and does NOT delete the runner's own build output.
+cd ~/Projects/<project>
+claudebox shell -c 'runner sync && runner sync'         # second must send 0
+claudebox shell -c 'runner exec "composer install -q" && runner sync \
+                    && runner exec "ls vendor/autoload.php"'
+
+# Streams output, and returns the remote exit code -- both directions.
+claudebox shell -c 'runner run "vendor/bin/phpunit"; echo "exit=$?"'
+claudebox shell -c 'runner exec "exit 42"; echo "exit=$?"'   # must print 42
+
+# Confinement. Every one must be refused, and the box must have no other way
+# to reach the runner machine at all.
+claudebox shell -c 'node -e "
+  const http=require(\"node:http\");
+  const bad=[[\"/exec\",{project:\"../../etc\",command:\"id\"}],
+             [\"/exec\",{project:\"/etc\",command:\"id\"}],
+             [\"/exec\",{project:\"matomo\",workdir:\"../../..\",command:\"id\"}],
+             [\"/exec\",{project:\".\",command:\"id\"}],
+             [\"/sync/nope\",{}]];
+  for (const [p,b] of bad) {
+    const body=JSON.stringify(b);
+    const r=http.request({host:\"runner-relay\",port:7997,path:p,method:\"POST\",
+      headers:{\"content-type\":\"application/json\",\"content-length\":Buffer.byteLength(body)}},
+      res=>console.log(res.statusCode===200?\"BAD \"+p:\"ok \"+p));
+    r.end(body);
+  }"'
+
+# The runner refuses anything without the token, and the relay refuses a
+# certificate that is not the pinned one (run on the host):
+curl -sk -o /dev/null -w '%{http_code}\n' https://<runner>:7998/health   # 401
+```
+
 With a DDEV project running, also check TLS still validates through the proxy
 (`ssl_verify_result` must be 0) and that file ownership is preserved:
 
@@ -1146,6 +1421,12 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   is how `libxshmfence1` got there — it is absent from every list upstream
   publishes. `ldd` cannot see libraries opened with `dlopen` at runtime, so
   finish by actually launching the browser.
+- **Add something the tests need (a font, a PHP extension, a library)** → the
+  `base` stage of `Dockerfile`, not the `claudebox` stage and never
+  `runner/Dockerfile`. Both images come off `base`, which is what keeps
+  screenshot baselines comparable between the box and the runner; anything added
+  below that boundary is by construction invisible to a test, and anything added
+  in `runner/Dockerfile` is a divergence by definition.
 - **Change what the box's agent knows about its environment** → `box-CLAUDE.md`,
   then `claudebox rebuild`. It lands at `/etc/claude-code/CLAUDE.md`, Claude
   Code's managed-policy memory path (loaded in every session in every directory,

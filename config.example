@@ -44,3 +44,28 @@
 # profile is required -- see apparmor/claudebox-dind. On a host with no AppArmor
 # confinement, "unconfined" is right.
 #BOX_DIND_APPARMOR=unconfined
+
+# --- the remote test runner -------------------------------------------------
+
+# Set by "claudebox runner add <host:port> <token> <fingerprint>", which is the
+# line the other machine's "claudebox-runner" prints when it starts. They are
+# handed to the runner-relay container and to nothing else -- the box itself
+# never sees the address, the token or the fingerprint, which is what keeps a
+# remote runner from being a hole in the egress sandbox.
+#
+# Edit them by re-running "claudebox runner add" rather than by hand; the
+# fingerprint has to match the runner's current certificate exactly.
+#BOX_RUNNER=192.168.1.42:7998
+#BOX_RUNNER_TOKEN=...
+#BOX_RUNNER_FINGERPRINT=AA:BB:...
+
+# --- on a RUNNER machine ----------------------------------------------------
+#
+# The same file is read by "claudebox-runner" on the machine that runs the
+# tests, where these are the settings that apply instead. A machine is normally
+# one or the other, so these sit unused on this one.
+
+# The port the runner listens on, and where it keeps its copy of the source
+# (a path inside its workspace volume, not on that machine's disk).
+#BOX_RUNNER_PORT=7998
+#BOX_RUNNER_WORKSPACE=/home/dizzy/Projects
