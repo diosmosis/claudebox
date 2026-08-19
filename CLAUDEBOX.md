@@ -426,6 +426,9 @@ Each of these is doing real work. Changing one breaks something specific.
 | `ddev-bridge` | Baked into the runner image as `claudebox-ddev-bridge`; points `db:3306`, `host.docker.internal` and a project's hostnames at a DDEV project running inside the runner's dind |
 | `docker-compose.runner.yaml` | The runner stack — runner + its own rootless dind + workspace volume — brought up on the *other* machine |
 | `claudebox-runner` | Launcher for a runner machine, symlinked into `~/.local/bin` there |
+| `agent-relay/relay.mjs`, `agent-relay/entrypoint.sh`, `agent-relay/open-enrolment.sh` | The inbound agent door on a workstation: its identity, its enrolment window, and the one route it forwards into the box |
+| `agent-relay/enrol.mjs`, `agent-relay/send.mjs` | Run as one-off containers **on a runner machine** — join a workstation, and send it a headless run |
+| `agent-serve.mjs` | Baked into the box as `/usr/local/lib/claudebox/agent-serve.mjs`; the box's side of that door, on the internal network only |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
 | `ui-parity` | Prints everything about an image that a UI test can observe, in diffable form — package versions, font file hashes, fontconfig's resolved settings, ImageMagick's limits |
 | `apparmor/claudebox-dind` | The profile that grants `userns` to the dind sidecar; installed once with `sudo`, on each machine |
@@ -469,6 +472,14 @@ claudebox runner show      what is joined (the token is not printed)
 claudebox runner test      ask it, through the relay, whether it answers
 claudebox runner forget    un-join
 
+claudebox agent enrol      serve the agent door here, for a machine that hosts a
+                           runner (needs BOX_AGENT_SERVE=1); prints the join line
+claudebox agent status     whether that door is up, and its fingerprint
+claudebox agent add <host:port> <code>
+                           ON a runner machine: join that workstation, so headless
+                           one-offs typed here are answered there
+claudebox agent show|test|forget
+
 claudebox plugins          list the commands plugins add, and where they are looked for
 claudebox <p>:<cmd> [args] run one (plugins/<p>/commands/<cmd>)
 
@@ -489,7 +500,10 @@ typo in the file is inert rather than mysterious.
 Settings: `BOX_WORKSPACE` (where the box sees the tree), `BOX_WORKSPACE_HOST`
 (the host directory bound there; defaults to `BOX_WORKSPACE`), `BOX_USER`,
 `BOX_UID`, `BOX_GID`, `BOX_HOST_HOME`, `BOX_MKCERT_CA`, `BOX_DDEV_PROJECT`,
-`BOX_DIND_APPARMOR`, `BOX_PLUGIN_PATH` (where plugins are looked for), and
+`BOX_DIND_APPARMOR`, `BOX_PLUGIN_PATH` (where plugins are looked for),
+`BOX_AGENT_SERVE` / `BOX_AGENT_PORT` (serve an agent door here) and `BOX_AGENT` /
+`BOX_AGENT_TOKEN` / `BOX_AGENT_FINGERPRINT` (written by `claudebox agent add` on
+a runner machine), and
 `BOX_RUNNER` / `BOX_RUNNER_TOKEN` / `BOX_RUNNER_FINGERPRINT` (written by
 `claudebox runner add`, read by nothing but the relay).
 
@@ -573,7 +587,10 @@ project as `AS-345.md`, and then starts a headless session
 (`claude -p ... --permission-mode auto`) — through the launcher, from the
 project directory, so it gets the full launch path and the right working
 directory — asking it to verify the report and write a failing regression test
-on a new branch. Claude's answer is printed when it finishes and kept in
+on a new branch. The issue text goes **in the prompt**, not as a path to open,
+so the run is self-contained; the file is still written, but nothing in the
+prompt depends on it. An issue over ~100KB falls back to naming the file,
+because `execve` caps one argument at 128KB and a prompt is one argument. Claude's answer is printed when it finishes and kept in
 `plugin-state/jira/runs/`.
 
 The token never crosses into a container, and that is a property of where it is
@@ -1265,6 +1282,97 @@ is one less difference.
 passing them through. `/enrol` is not forwarded: it is spoken once, at join time,
 by a one-off container and never by the box.
 
+## The agent door: keeping claude off a runner machine
+
+A runner is the box **minus the agent**, and its network is an ordinary bridge
+with no proxy and no allowlist — it has to reach package registries to build
+what it tests. That makes it the wrong machine to run an agent on, in a
+container or otherwise. Nothing used to stop someone typing `claudebox` there.
+
+Now, on a machine where the `claudebox-runner` container is running:
+
+| | |
+|---|---|
+| `claudebox -p '...'` | sent to the workstation that was joined, and answered in **its** box |
+| everything else | refuses, and says where to go instead |
+| `claudebox agent ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all |
+
+Detection is about what is **running**, not what is configured: a stopped runner
+stack is not a runner, and a machine that has merely *joined* one is a
+workstation.
+
+```
+  the runner machine                          the workstation
+  ------------------                          ---------------
+  claudebox -p '...'
+    │ hosts a runner -> does not run one
+    ▼
+  send.mjs ──TLS + token + pinned cert──▶ agent-relay        (edge + inner)
+  (one-off container)                       │  published :7996
+                                            │  plain HTTP over inner
+                                            ▼
+                                          agent-serve.mjs    (inner only)
+                                            │  in the box, as the box user
+                                            ▼
+                                          claude -p, cwd = the named project
+```
+
+**Two containers, not one**, for the same reason `runner-relay` is separate from
+the box: the relay is the only thing with a LAN-facing socket. The box gets no
+listener anything on the LAN can reach and opens no connection to one — it is
+spoken to over `inner`, which is `internal: true`. Publishing `agent-serve`'s
+port directly would be simpler and would put an inbound LAN socket in the box;
+the line that binds it says so.
+
+`runner-relay` and `agent-relay` are the same shape pointed in opposite
+directions: one is **outbound** and holds a credential for a machine elsewhere,
+the other is **inbound** and holds an identity that a machine elsewhere pins.
+Enrolment, the short code, the failure counter, the two-step pin and the
+`[1 byte channel][4 byte BE length][payload]` framing are all the runner's,
+reused rather than reinvented.
+
+**Off by default.** `BOX_AGENT_SERVE=1` is the only thing that turns it on: the
+service sits behind a compose profile the launcher enables only for that
+setting, and `entrypoint.sh` starts the in-box listener only when it sees the
+matching variable. A claudebox that does not use this creates no container and
+publishes no port.
+
+### Setting it up
+
+```sh
+# On the workstation -- the machine that runs the agent
+echo 'BOX_AGENT_SERVE=1' >> ~/.claudebox/config
+claudebox                       # brings the front door up with the stack
+claudebox agent enrol           # prints the join line and an eight-character code
+
+# On the runner machine
+claudebox agent add <workstation>:7996 <code>
+claudebox agent test
+```
+
+### Which project
+
+A forwarded prompt usually names files, and the two machines have separate
+trees — that is why `runner sync` exists. The request carries a **project
+name**, one directory under the workspace: `--project <name>`, or the directory
+the current one sits in below `BOX_WORKSPACE_HOST`. The workstation resolves it
+under its own `BOX_WORKSPACE` and **refuses if it is not there**, naming the path
+it looked in. There is no reverse sync; the tree is expected to be on both
+machines, the same way it already is for tests.
+
+### What presenting the token gets you
+
+A `claude` process in the workstation's box, in a project of its workspace, with
+whatever flags were sent — the mirror of the bargain `runner.mjs`'s `/exec`
+already makes in the other direction, and it is the operation being granted
+rather than a leak. It is bounded by the box being the box: same allowlist, same
+proxy, same workspace, same HOME. It is **not** bounded by the flags, so the
+token is a real credential: it lives in `~/.claudebox/config` on the runner
+machine at `0600`, goes to a one-off container and nowhere else, and is passed
+to that container **on stdin** — NUL-separated, along with the prompt — because
+process arguments are readable by every process on the machine and
+`docker run -e TOKEN=...` would put it in the docker client's own command line.
+
 ## Egress allowlist
 
 `allowlist.conf` is bind-mounted, so edits need a reload rather than a rebuild —
@@ -1939,6 +2047,36 @@ BOX_WORKSPACE_HOST=/nonexistent claudebox '..:passwd' 2>&1 | grep -q 'workspace 
 # uid, and the working directory a session would have started in.
 claudebox example:versions
 
+# The agent door is off unless asked for: no container, no published port, and
+# no listener in the box.
+docker ps --format '{{.Names}}' | grep -q agent-relay && echo BAD || echo ok
+claudebox shell -c 'ss -ltn 2>/dev/null | grep -q 7995' && echo BAD || echo ok
+
+# With BOX_AGENT_SERVE=1 and the stack up: the front door is on the LAN, the box
+# is NOT, and the door refuses anything without the token. The second line is
+# the one that matters -- publishing the box's own listener would be the easy
+# mistake, and it would give the LAN a socket inside the sandbox.
+curl -sk --max-time 5 -o /dev/null -w '%{http_code}\n' https://127.0.0.1:7996/health   # 401
+curl -s  --max-time 3 http://127.0.0.1:7995/health && echo BAD || echo ok
+docker exec claudebox-agent-relay node -e "require('http').get('http://claude:7995/health',r=>process.exit(r.statusCode===200?0:1))" && echo ok
+
+# The token never reaches a command line -- it goes in on stdin. Watch a
+# forwarded run: the docker run that carries it must name no secret.
+ps -ww -eo args | grep '[s]end.mjs'
+
+# On a machine hosting a runner (test with a stand-in container of that name):
+# everything refuses except the two exemptions, and a headless run goes over.
+docker run -d --rm --name claudebox-runner alpine sleep 600
+for c in "" "shell -c true" "opencode --version" "plugins" "stop"; do
+    claudebox $c >/dev/null 2>&1; echo "want non-zero, got $?"
+done
+claudebox agent show >/dev/null && echo ok      # exempt
+claudebox help >/dev/null && echo ok            # exempt
+cd ~/Projects/<a project>
+claudebox -p 'print your working directory and hostname'   # answered on the OTHER machine
+claudebox --project no-such-project -p x; echo "want non-zero, got $?"
+docker rm -f claudebox-runner
+
 # The jira plugin's credential must be unreachable from every container. These
 # are properties of where it is written, so they hold whether or not a token is
 # configured -- run them after "claudebox jira:config set".
@@ -2136,6 +2274,12 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   token typed on a command line is in the shell history too. If the plugin needs
   a host the box cannot reach, that is a feature — resist adding it to
   `allowlist.conf` to "make it work", since the fetch is happening on the host.
+- **Let something else reach the box from the LAN** → through `agent-relay`, one
+  named route at a time, never by publishing a port on the `claude` service. The
+  box having no LAN-facing socket is what makes "the box cannot talk to the LAN"
+  true in both directions; a published port would hand any host on the network a
+  socket inside the sandbox. Same rule as `ddev-relay` and `runner-relay`:
+  rebuild the headers, forward one route, and keep the destination fixed.
 - **Add something to the plugin API** → `plugin-api.sh`. It is sourced by the
   launcher as well, so it must stay functions-only: no `set -e`, no top-level
   state, and everything it needs read from the exported `BOX_*`/`CLAUDEBOX_*`

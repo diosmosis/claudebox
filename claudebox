@@ -21,6 +21,9 @@
 #   claudebox plugins         list the commands plugins add
 #   claudebox <p>:<cmd> ...   run one (plugins/<p>/commands/<cmd>)
 #
+#   claudebox agent ...       the inbound agent door: serve one here, or (on a
+#                             machine hosting a runner) join one elsewhere
+#
 # Env overrides: BOX_WORKSPACE, BOX_WORKSPACE_HOST, BOX_USER, BOX_HOST_HOME,
 #               BOX_MKCERT_CA, BOX_PLUGIN_PATH,
 #               BOX_DDEV_PROJECT (which project's database is reachable as db:3306)
@@ -95,6 +98,8 @@ BOX_SETTINGS=(
     BOX_USER BOX_UID BOX_GID BOX_HOST_HOME
     BOX_MKCERT_CA BOX_DDEV_PROJECT BOX_DIND_APPARMOR
     BOX_RUNNER BOX_RUNNER_TOKEN BOX_RUNNER_FINGERPRINT
+    BOX_AGENT BOX_AGENT_TOKEN BOX_AGENT_FINGERPRINT
+    BOX_AGENT_SERVE BOX_AGENT_PORT
     BOX_PLUGIN_PATH
 )
 if [ -f "${BOX_CONFIG}" ]; then
@@ -181,6 +186,30 @@ export BOX_PLUGIN_PATH="${BOX_PLUGIN_PATH:-${BOX_DIR}/plugins}"
 # runner-relay -- never into the box's own environment, which is the entire
 # point of having a relay. Empty is a normal state: the relay then answers the
 # box with the join instructions instead of a connection error.
+# The inbound agent door, both halves.
+#
+# On a WORKSTATION: BOX_AGENT_SERVE=1 turns on the front door (agent-relay) and
+# the box's listener behind it, so a machine that hosts a runner can send its
+# headless one-offs here. BOX_AGENT_PORT is where it is published.
+#
+# On a RUNNER MACHINE: BOX_AGENT / _TOKEN / _FINGERPRINT are the workstation
+# that was joined with "claudebox agent add", and are the mirror of the
+# BOX_RUNNER trio above -- an address, a bearer token and a pinned certificate.
+# They go to a one-off container from the agent-relay image and nowhere else;
+# the box on this machine never runs, so nothing here is in its environment.
+export BOX_AGENT="${BOX_AGENT:-}"
+export BOX_AGENT_TOKEN="${BOX_AGENT_TOKEN:-}"
+export BOX_AGENT_FINGERPRINT="${BOX_AGENT_FINGERPRINT:-}"
+export BOX_AGENT_SERVE="${BOX_AGENT_SERVE:-}"
+export BOX_AGENT_PORT="${BOX_AGENT_PORT:-7996}"
+
+# The front door is behind a compose profile, so a claudebox that was not asked
+# for one never creates the service and never publishes a port. This is the only
+# thing that turns it on.
+if [ -n "${BOX_AGENT_SERVE}" ]; then
+    COMPOSE+=(--profile agent)
+fi
+
 export BOX_RUNNER="${BOX_RUNNER:-}"
 export BOX_RUNNER_TOKEN="${BOX_RUNNER_TOKEN:-}"
 export BOX_RUNNER_FINGERPRINT="${BOX_RUNNER_FINGERPRINT:-}"
@@ -785,6 +814,197 @@ runner_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# The agent door
+#
+# Two roles, one launcher, and which one applies is decided by what is running
+# on the machine rather than by a setting:
+#
+#   A WORKSTATION serves. With BOX_AGENT_SERVE=1 it runs agent-relay, the one
+#   LAN-facing socket here, and the box runs a listener behind it.
+#     claudebox agent enrol|status
+#
+#   A RUNNER MACHINE sends. It hosts a runner, which is the box MINUS the agent
+#   on a network with no proxy and no allowlist -- the one machine deliberately
+#   built not to run an agent. So it does not run one: a headless one-off goes
+#   to the workstation that was joined, and everything else refuses.
+#     claudebox agent add|show|test|forget
+#
+# The trio it stores mirrors BOX_RUNNER's exactly, in the other direction: an
+# address, a bearer token, and a certificate fingerprint that is the identity.
+# They are handed to a one-off container from the agent-relay image and to
+# nothing else.
+# ---------------------------------------------------------------------------
+
+# Does this machine host a runner? That is what decides whether the agent may
+# run here, and it is deliberately about what is RUNNING, not about what is
+# configured: a stopped runner stack is not a runner, and a machine that has
+# merely joined one is a workstation.
+runner_hosted_here() {
+    [ "$(docker inspect -f '{{.State.Running}}' claudebox-runner 2>/dev/null || true)" = "true" ]
+}
+
+agent_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox agent <enrol|status>            on a workstation
+       claudebox agent <add|show|test|forget>    on a runner machine
+
+  On the workstation -- the machine that runs the agent:
+    enrol   Open an enrolment window and print the line to type on the runner
+            machine. Needs BOX_AGENT_SERVE=1 in the config here.
+    status  Whether the front door is up, and its certificate fingerprint.
+
+  On a runner machine -- the machine that must not run one:
+    add <host:port> <code>
+            Join that workstation, using the eight-character code its
+            "claudebox agent enrol" printed.
+    add <host:port> <token> <fingerprint>
+            The explicit form, for anyone who would rather not trust a
+            certificate on sight.
+    show    What is joined (the token is not printed).
+    test    Ask it, through the pin, whether it answers.
+    forget  Un-join. Headless runs then refuse here rather than being sent.
+
+A runner machine hosts the box minus the agent, on a network with no egress
+allowlist. This is what keeps an agent off it while still letting a one-off
+prompt typed there be answered -- on the other machine.
+USAGE
+}
+
+# Build the front door image if it is not here yet.
+#
+# Directly rather than through compose: the service sits behind the "agent"
+# profile, which is off on a runner machine (that is a workstation setting), and
+# a build is not the place to be arguing with profile selection.
+agent_image() {
+    if docker image inspect claudebox-agent-relay:latest >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "claudebox: building the agent client image, which is what talks to the workstation..." >&2
+    docker build -q -t claudebox-agent-relay:latest "${BOX_DIR}/agent-relay" >/dev/null || {
+        echo "claudebox: could not build claudebox-agent-relay" >&2
+        return 1
+    }
+}
+
+# Feed a request to send.mjs in a one-off container.
+#
+# The fields go in on STDIN, NUL-separated, and never on the command line: the
+# token is in there, and so is the prompt. "docker run -e TOKEN=..." would put
+# the token in this machine's process table for anyone to read.
+#
+# --network default rather than the box's: this container needs the LAN, which
+# is the one thing the box never gets.
+agent_send() {
+    agent_image || return 1
+    printf '%s\0' "$@" \
+        | docker run --rm -i claudebox-agent-relay:latest node /app/send.mjs
+}
+
+agent_enrol() {
+    if [ -z "${BOX_AGENT_SERVE}" ]; then
+        echo "claudebox: the agent door is off here. Put BOX_AGENT_SERVE=1 in ${BOX_CONFIG}," >&2
+        echo "claudebox: start the box, then run this again." >&2
+        return 1
+    fi
+    if ! docker exec claudebox-agent-relay true 2>/dev/null; then
+        echo "claudebox: the front door is not running; start the box first (claudebox)" >&2
+        return 1
+    fi
+    # The window is opened by the same script the front door's entrypoint uses
+    # on a machine that has never been joined, so there is one definition of
+    # what a window is.
+    docker exec claudebox-agent-relay claudebox-agent-enrol
+}
+
+agent_status() {
+    local fp
+    if [ -z "${BOX_AGENT_SERVE}" ]; then
+        echo "claudebox: the agent door is off here (set BOX_AGENT_SERVE=1 to serve one)" >&2
+        return 0
+    fi
+    if ! docker exec claudebox-agent-relay true 2>/dev/null; then
+        echo "claudebox: the front door is not running; start the box (claudebox)" >&2
+        return 1
+    fi
+    fp="$(docker exec claudebox-agent-relay cat /var/lib/claudebox-agent/fingerprint 2>/dev/null | tr -d '\r\n')"
+    printf 'front door:  up, published on :%s\n' "${BOX_AGENT_PORT}"
+    printf 'fingerprint: %s\n' "${fp:-(unknown)}"
+    if docker exec claudebox-agent-relay test -f /var/lib/claudebox-agent/enrolled 2>/dev/null; then
+        printf 'joined by:   %s\n' \
+            "$(docker exec claudebox-agent-relay cat /var/lib/claudebox-agent/enrolled 2>/dev/null | tr -d '\r\n')"
+    else
+        printf 'joined by:   nobody yet -- "claudebox agent enrol" opens a window\n'
+    fi
+}
+
+# Trade an enrolment code for the workstation's token, and pin the certificate
+# that answered. The mirror of runner_enrol, run the same way and for the same
+# reason: that image has node and a route off this machine.
+agent_join() {
+    local addr="${1}" code="${2}" out token fp
+    agent_image || return 1
+    out="$(docker run --rm claudebox-agent-relay:latest \
+              node /app/enrol.mjs "${addr}" "${code}")" || return 1
+    token="$(printf '%s\n' "${out}" | sed -n 's/^TOKEN=//p')"
+    fp="$(printf '%s\n' "${out}" | sed -n 's/^FINGERPRINT=//p')"
+    if [ -z "${token}" ] || [ -z "${fp}" ]; then
+        echo "claudebox: the workstation did not return a usable token" >&2
+        return 1
+    fi
+    config_set BOX_AGENT "${addr}"
+    config_set BOX_AGENT_TOKEN "${token}"
+    config_set BOX_AGENT_FINGERPRINT "${fp}"
+    echo "claudebox: joined the agent at ${addr}" >&2
+    echo "claudebox: pinned certificate ${fp}" >&2
+    echo "claudebox: headless one-off runs from this machine now go there" >&2
+}
+
+agent_cmd() {
+    local sub="${1:-}"
+    shift || true
+    case "${sub}" in
+        enrol|enroll) agent_enrol ;;
+        status)       agent_status ;;
+        add)
+            case "$#" in
+                2) agent_join "${1}" "${2}" ;;
+                3)
+                    config_set BOX_AGENT "${1}"
+                    config_set BOX_AGENT_TOKEN "${2}"
+                    config_set BOX_AGENT_FINGERPRINT "${3}"
+                    echo "claudebox: joined the agent at ${1}" >&2
+                    ;;
+                *) agent_usage; return 2 ;;
+            esac
+            ;;
+        show)
+            if [ -z "${BOX_AGENT}" ]; then
+                echo "claudebox: no agent joined -- run 'claudebox agent add <host:port> <code>'" >&2
+                return 0
+            fi
+            printf 'agent:       %s\n' "${BOX_AGENT}"
+            printf 'fingerprint: %s\n' "${BOX_AGENT_FINGERPRINT:-(unset)}"
+            printf 'token:       %s\n' "$([ -n "${BOX_AGENT_TOKEN}" ] && echo '(set)' || echo '(unset)')"
+            ;;
+        test)
+            if [ -z "${BOX_AGENT}" ] || [ -z "${BOX_AGENT_TOKEN}" ]; then
+                echo "claudebox: no agent joined -- run 'claudebox agent add <host:port> <code>'" >&2
+                return 1
+            fi
+            agent_send health "${BOX_AGENT}" "${BOX_AGENT_TOKEN}" "${BOX_AGENT_FINGERPRINT}"
+            ;;
+        forget)
+            config_set BOX_AGENT ""
+            config_set BOX_AGENT_TOKEN ""
+            config_set BOX_AGENT_FINGERPRINT ""
+            echo "claudebox: forgotten. Headless runs here will now refuse rather than being sent." >&2
+            ;;
+        -h|--help|help|"") agent_usage ;;
+        *) echo "claudebox: unknown agent subcommand '${sub}'" >&2; agent_usage; return 2 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Plugins
 #
 # A plugin is a directory on BOX_PLUGIN_PATH holding executables:
@@ -969,6 +1189,125 @@ plugin_dispatch() {
     exec "${exe}" "$@"
 }
 
+# ---------------------------------------------------------------------------
+# The gate: what may happen on a machine that hosts a runner
+#
+# A runner machine is the box MINUS the agent, on an ordinary bridge with no
+# proxy and no allowlist -- it has to reach package registries to build what it
+# tests. It is the wrong machine to run an agent on, container or not, and until
+# now nothing stopped someone typing "claudebox" there.
+#
+# So nothing here starts the box. A headless one-off is sent to the workstation
+# that was joined and answered there; everything else refuses and says where to
+# go. Two exceptions, both necessary rather than convenient: "agent" is how this
+# machine is pointed at a workstation in the first place, and "help" should
+# never be the thing that fails.
+#
+# Placed before the command dispatch, so it covers every subcommand, every
+# plugin and the pass-through to claude alike.
+# ---------------------------------------------------------------------------
+runner_machine_gate() {
+    local arg headless="" first="${1:-}"
+
+    case "${first}" in
+        agent|help|-h|--help) return 0 ;;
+    esac
+
+    # Headless means claude with a prompt and no terminal to answer on: -p or
+    # --print. It is only a claude run at all if the first argument is not one
+    # of this launcher's own subcommands -- "claudebox opencode ... -p" is a
+    # different agent, and "claudebox media ..." is not an agent at all.
+    case "${first}" in
+        shell|opencode|media|runner|stop|rebuild|allowed|denied|allow|reload|eject|strip|fix-perms|plugins)
+            ;;
+        *)
+            for arg in "$@"; do
+                case "${arg}" in
+                    -p|--print) headless=1; break ;;
+                esac
+            done
+            ;;
+    esac
+
+    if [ -z "${headless}" ]; then
+        {
+            echo "claudebox: this machine hosts a runner, so it is not where the agent runs."
+            echo "claudebox: a runner is the box minus the agent, on a network with no egress"
+            echo "claudebox: allowlist -- running claude here would put an agent on the one"
+            echo "claudebox: machine built not to have one."
+            echo "claudebox:"
+            echo "claudebox:   claudebox-runner <cmd>     this machine's own commands"
+            echo "claudebox:   claudebox <cmd>            on the workstation, for everything else"
+            echo "claudebox:"
+            echo "claudebox: a headless one-off (claudebox -p '...') is the exception: it is sent"
+            echo "claudebox: to the workstation joined with 'claudebox agent add'."
+        } >&2
+        exit 1
+    fi
+
+    if [ -z "${BOX_AGENT}" ] || [ -z "${BOX_AGENT_TOKEN}" ] || [ -z "${BOX_AGENT_FINGERPRINT}" ]; then
+        {
+            echo "claudebox: this machine hosts a runner, so a headless run is sent to the"
+            echo "claudebox: workstation rather than answered here -- but no workstation is joined."
+            echo "claudebox:"
+            echo "claudebox:   on the workstation:   claudebox agent enrol"
+            echo "claudebox:   then here:            claudebox agent add <host:port> <code>"
+        } >&2
+        exit 1
+    fi
+
+    # Which project, on the other machine. --project names it outright;
+    # otherwise it is the directory below the workspace root that the current
+    # directory sits in, which is the same tree layout both machines use.
+    #
+    # This is OURS, not claude's: it is consumed here and never forwarded.
+    local project="" rest=() skip=""
+    for arg in "$@"; do
+        if [ -n "${skip}" ]; then project="${arg}"; skip=""; continue; fi
+        case "${arg}" in
+            --project) skip=1 ;;
+            --project=*) project="${arg#--project=}" ;;
+            *) rest+=("${arg}") ;;
+        esac
+    done
+
+    # BOX_WORKSPACE_HOST, not BOX_WORKSPACE: this resolves a directory on THIS
+    # machine's disk. The two are the same by default and differ when the tree
+    # is bound in from somewhere else, and it is the host-side path the cwd is
+    # actually under.
+    if [ -z "${project}" ]; then
+        case "${PWD}" in
+            "${BOX_WORKSPACE_HOST}"/*)
+                project="${PWD#"${BOX_WORKSPACE_HOST}"/}"
+                project="${project%%/*}"
+                ;;
+        esac
+    fi
+    if [ -z "${project}" ]; then
+        {
+            echo "claudebox: cannot tell which project this run is about, so the workstation"
+            echo "claudebox: would not know where to run it. Either run this from inside a project"
+            echo "claudebox: under ${BOX_WORKSPACE_HOST}, or name one:"
+            echo "claudebox:   claudebox --project <name> -p '...'"
+        } >&2
+        exit 2
+    fi
+    case "${project}" in
+        */*|.|..|-*)
+            echo "claudebox: '${project}' is not a project name (one directory under the workspace)" >&2
+            exit 2 ;;
+    esac
+
+    echo "claudebox: sending this run to ${BOX_AGENT} (project ${project}); nothing runs here" >&2
+    agent_send run "${BOX_AGENT}" "${BOX_AGENT_TOKEN}" "${BOX_AGENT_FINGERPRINT}" \
+        "${project}" "${rest[@]}"
+    exit $?
+}
+
+if runner_hosted_here; then
+    runner_machine_gate "$@"
+fi
+
 case "${1:-}" in
     help|-h|--help)
         cat >&2 <<'USAGE'
@@ -1016,6 +1355,15 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              A <token> <fingerprint> pair also works, from
                              "claudebox-runner join --full".
   claudebox runner show|test|forget
+
+  claudebox agent enrol      let a machine that HOSTS a runner send its headless
+                             one-off runs here to be answered, instead of running
+                             an agent on itself. Needs BOX_AGENT_SERVE=1 here;
+                             prints the line to type over there.
+  claudebox agent status     whether that front door is up, and its fingerprint
+  claudebox agent add <host:port> <code>
+                             the other side of it, run ON a runner machine
+  claudebox agent show|test|forget
 
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
@@ -1356,6 +1704,12 @@ USAGE
     reload)
         # For edits made directly to allowlist.conf.
         reload_proxy
+        exit $?
+        ;;
+
+    agent)
+        shift
+        agent_cmd "$@"
         exit $?
         ;;
 

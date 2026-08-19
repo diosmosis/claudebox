@@ -219,5 +219,25 @@ if [ "${fixed}" -gt 0 ]; then
     echo "claudebox: reclaimed ${fixed} root-owned file(s) under ${USER_HOME}"
 fi
 
+# ---------------------------------------------------------------------------
+# The inbound agent door, box side
+#
+# Started only when the workstation asked for it (BOX_AGENT_SERVE=1, which
+# compose passes in as CLAUDEBOX_AGENT_SERVE). It listens on the internal
+# network for agent-relay, which is the thing that actually faces the LAN and
+# checks the token -- see agent-serve.mjs for why the two are separate.
+#
+# As the box user, not root: it spawns claude, and claude's HOME, credentials
+# and config are the box user's. Backgrounded, because the container's real
+# command follows this; its output goes to the container log, where
+# "docker logs claudebox" will show it.
+# ---------------------------------------------------------------------------
+if [ -n "${CLAUDEBOX_AGENT_SERVE:-}" ]; then
+    setpriv --reuid "${USER_NAME}" --regid "${USER_NAME}" --init-groups \
+        env HOME="${USER_HOME}" \
+        node /usr/local/lib/claudebox/agent-serve.mjs &
+    echo "claudebox: agent door listening for agent-relay on :${CLAUDEBOX_AGENT_PORT:-7995}"
+fi
+
 : > "${READY}"
 exec "$@"

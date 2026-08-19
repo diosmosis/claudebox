@@ -308,6 +308,13 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh
 COPY node-proxy-bootstrap.cjs /usr/local/lib/claudebox/proxy-bootstrap.cjs
 RUN chmod 0644 /usr/local/lib/claudebox/proxy-bootstrap.cjs
 
+# The box side of the inbound agent door: one route on the internal network that
+# runs a headless claude here, for a machine that hosts a runner and so must not
+# run one itself. entrypoint.sh starts it only when CLAUDEBOX_AGENT_SERVE is set,
+# and agent-relay is what faces the LAN in front of it.
+COPY agent-serve.mjs /usr/local/lib/claudebox/agent-serve.mjs
+RUN chmod 0644 /usr/local/lib/claudebox/agent-serve.mjs
+
 # `ddev` inside the box is a shim that forwards `ddev exec` to the ddev-relay
 # over the internal network -- the box has no host Docker daemon and no real
 # ddev. Baked in (not bind-mounted) so it is always on PATH ahead of anything.

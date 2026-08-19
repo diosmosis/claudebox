@@ -5,8 +5,9 @@
 #
 #   on the host   fetch the issue with the API token and write it into the
 #                 project as markdown;
-#   in the box    a headless session that reads that file, decides whether the
-#                 bug is real, and writes a failing regression test on a branch.
+#   in the box    a headless session that is handed the issue text in its prompt,
+#                 decides whether the bug is real, and writes a failing
+#                 regression test on a branch.
 #
 # The token never crosses the line. The box is handed a markdown file, which is
 # issue text and nothing else -- see lib/jira.sh.
@@ -100,8 +101,8 @@ box_path "${target_dir}" >/dev/null || plugin_die \
 
 issue_file="${target_dir}/${key}.md"
 
-# What the prompt names. Claude's working directory is the project, so the file
-# is named the way someone standing in that directory would name it.
+# How the file would be named from claude's working directory, which is the
+# project. Only used if the issue turns out to be too big to inline; see below.
 issue_rel="${issue_file#"${project}"/}"
 
 # ---------------------------------------------------------------------------
@@ -159,7 +160,40 @@ fi
 # hostname rewrite, and a session started around those is a session in a box
 # that is only almost right. Running it from the project directory is what puts
 # claude in that project's counterpart inside the box.
-prompt="In the ${issue_rel}, there is a description of a possible bug or vulnerability. please read the file, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
+# The issue goes into the prompt ITSELF rather than as a path to open.
+#
+# It saves the session a tool call, and more usefully it makes the run
+# self-contained: the agent has the whole report before it starts, rather than a
+# filename it has to decide to read. The file is still written -- it is the
+# thing you asked for, and --fetch-only produces nothing else -- but nothing in
+# the prompt depends on it any more.
+#
+# Delimited by a tag rather than a fenced block, because the issue is markdown
+# and routinely contains fences of its own; a fence here would end at the first
+# one in a stack trace and the rest of the report would read as instructions.
+issue_text="$(cat -- "${issue_file}")"
+issue_bytes="$(wc -c < "${issue_file}" | tr -d ' ')"
+
+# execve caps a SINGLE argument at 128KB (MAX_ARG_STRLEN), and a prompt is one
+# argument. Past that the failure is "docker: Argument list too long" from the
+# client, which says nothing about issues or prompts -- so measure first and
+# degrade on purpose. The margin is for the wrapper text and for the fact that
+# this is bytes, not characters.
+prompt_max=100000
+prompt_head="Below is a description of a possible bug or vulnerability. please read it, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
+
+if [ "${issue_bytes}" -gt "${prompt_max}" ]; then
+    # Rare, but real: an issue with a large log or dump pasted into it. Naming
+    # the file loses nothing, since it was written either way.
+    plugin_say "${key} is ${issue_bytes} bytes, too large to put in the prompt; pointing at the file instead"
+    prompt="In the ${issue_rel}, there is a description of a possible bug or vulnerability. please read the file, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
+else
+    prompt="${prompt_head}
+
+<issue key=\"${key}\">
+${issue_text}
+</issue>"
+fi
 
 log_dir="$(plugin_state)/runs"
 mkdir -p -- "${log_dir}"

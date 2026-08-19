@@ -51,6 +51,31 @@
 # confinement, "unconfined" is right.
 #BOX_DIND_APPARMOR=unconfined
 
+# --- the agent door ---------------------------------------------------------
+#
+# A runner machine is the box MINUS the agent, on a network with no egress
+# allowlist, so it is the wrong machine to run claude on. It does not: every
+# claudebox command there refuses, except a headless one-off, which is sent to
+# a workstation and answered in ITS box.
+#
+# On the WORKSTATION -- the machine that runs the agent. Off by default; setting
+# this creates the front door (agent-relay), publishes the port below, and
+# starts a listener in the box behind it. Then "claudebox agent enrol".
+#BOX_AGENT_SERVE=1
+#BOX_AGENT_PORT=7996
+
+# On a RUNNER MACHINE -- set by "claudebox agent add <host:port> <code>", using
+# the code the workstation's "claudebox agent enrol" prints. The mirror of the
+# BOX_RUNNER trio below, pointed the other way: an address, a bearer token and
+# the certificate fingerprint to pin. They are handed to a one-off container and
+# to nothing else.
+#
+# Edit them by re-running "claudebox agent add" rather than by hand; the
+# fingerprint has to match the workstation's current certificate exactly.
+#BOX_AGENT=192.168.1.10:7996
+#BOX_AGENT_TOKEN=...
+#BOX_AGENT_FINGERPRINT=AA:BB:...
+
 # --- the remote test runner -------------------------------------------------
 
 # Set by "claudebox runner add <host:port> <code>", using the eight-character

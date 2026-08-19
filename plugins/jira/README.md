@@ -10,16 +10,31 @@ claudebox jira:triage-issue AS-345          fetch it, then have the box triage i
 | | |
 |---|---|
 | **on the host** | fetch the issue with the API token and write it into the project as `AS-345.md` |
-| **in the box** | a headless `claude` session, in auto mode, that reads that file, decides whether the bug is real and writes a failing regression test on a new branch |
+| **in the box** | a headless `claude` session, in auto mode, handed the issue text **in its prompt**, that decides whether the bug is real and writes a failing regression test on a new branch |
 
 Claude's answer is printed when it finishes, and kept in
 `plugin-state/jira/runs/`.
 
+The issue goes into the prompt itself rather than as a path to open, so the run
+is self-contained: the agent has the whole report before it starts instead of a
+filename it has to decide to read. `<KEY>.md` is still written — it is the
+artefact, and `--fetch-only` produces nothing else — but nothing in the prompt
+depends on it. It is delimited with a tag rather than a code fence, since issues
+routinely contain fences of their own and a fence here would end at the first
+one in a stack trace.
+
+The exception is an issue too big to fit: `execve` caps a single argument at
+128KB and a prompt is one argument, so past ~100KB the command says so and
+points the prompt at the file instead. Nothing is lost — the file was written
+either way — and the alternative is `docker: Argument list too long`, which
+says nothing about issues or prompts.
+
 ## The token stays on this machine
 
-A plugin command runs on the host, so the API call does too. The box is handed a
-markdown file -- issue text and nothing else. Three things keep it that way, and
-none of them depend on the box being asked to behave:
+A plugin command runs on the host, so the API call does too. What crosses into
+the box is the issue text, in a prompt and in a file in the project -- and
+nothing else. Three things keep it that way, and none of them depend on the box
+being asked to behave:
 
 - The credential lives in `plugin-state/jira/credentials` (`0600`, in a `0700`
   directory). **No container mounts that path.** The box's binds are the
