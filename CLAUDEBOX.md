@@ -474,6 +474,7 @@ claudebox runner forget    un-join
 
 claudebox agent start      serve the agent door here, for a machine that hosts a
                            runner: turns it on, brings it up, prints the join line
+claudebox agent stop       stop serving it (the identity is kept, so no re-join)
 claudebox agent enrol      open another enrolment window, for one more machine
 claudebox agent status     whether that door is up, and its fingerprint
 claudebox agent add <host:port> <code>
@@ -1295,8 +1296,22 @@ Now, on a machine where the `claudebox-runner` container is running:
 | | |
 |---|---|
 | `claudebox -p '...'` | sent to the workstation that was joined, and answered in **its** box |
+| `claudebox <plugin>:<cmd>`, `claudebox plugins` | run here, normally |
 | everything else | refuses, and says where to go instead |
 | `claudebox agent ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all |
+
+**Plugins run on the runner machine**, and `jira:triage-issue` is why: it fetches
+an issue with a credential that lives *there* and then asks for a headless run,
+which this forwards. Refusing it would mean the plugin could only be run on the
+machine that does not have its credential.
+
+That only works because a prompt carries its content rather than a path. A
+plugin's files land on the runner machine while the session that answers runs on
+the workstation, so anything a plugin names in a prompt has to be text it sent,
+not a path it wrote. `runner_hosted_here` in `plugin-api.sh` is how a plugin asks
+which side it is on; `jira:triage-issue`'s size fallback is the one place that
+has to — over ~100KB it truncates and says so, rather than naming a file that
+exists on the wrong machine.
 
 Detection is about what is **running**, not what is configured: a stopped runner
 stack is not a runner, and a machine that has merely *joined* one is a
@@ -1355,6 +1370,13 @@ claudebox agent test
 idempotent, and on a machine that is already joined it says so rather than
 opening a window nobody asked for. `claudebox agent enrol` opens one
 deliberately, to join a second machine.
+
+`claudebox agent stop` is the pair: front door down, setting cleared, box
+restarted without its listener. It **keeps the identity** — that lives in the
+`agent-state` volume, and re-issuing it would break the pin every joined machine
+holds, so all of them would have to re-join. Turning the door off for an
+afternoon should not cost that; `docker volume rm claudebox_agent-state` is how
+you ask for a new identity on purpose.
 
 `agent-serve.mjs` is baked into the box image, so a claudebox that predates it
 needs a rebuild before `agent start` will produce a working door.
@@ -2065,7 +2087,19 @@ claudebox shell -c 'ss -ltn 2>/dev/null | grep -q 7995' && echo BAD || echo ok
 # hosts a runner -- serving a door there is what the feature exists to prevent.
 claudebox agent start
 docker run -d --rm --name claudebox-runner alpine sleep 60
-claudebox agent start; echo "want non-zero, got $?"; docker rm -f claudebox-runner
+claudebox agent start; echo "want non-zero, got $?"
+# ...but plugins do run there, which is what makes jira:triage-issue usable on
+# the machine that holds its credential.
+claudebox plugins >/dev/null && echo ok
+claudebox jira:config >/dev/null 2>&1; echo "want 0, got $?"
+claudebox shell -c true 2>/dev/null; echo "want non-zero, got $?"
+docker rm -f claudebox-runner
+
+# stop is the pair of start, and keeps the identity: the fingerprint before and
+# after must match, or every joined machine has been silently un-joined.
+claudebox agent status | grep fingerprint
+claudebox agent stop && claudebox agent start
+claudebox agent status | grep fingerprint
 
 # With the door up: the front door is on the LAN, the box
 # is NOT, and the door refuses anything without the token. The second line is

@@ -179,20 +179,33 @@ issue_bytes="$(wc -c < "${issue_file}" | tr -d ' ')"
 # client, which says nothing about issues or prompts -- so measure first and
 # degrade on purpose. The margin is for the wrapper text and for the fact that
 # this is bytes, not characters.
+#
+# There are two ways to degrade and which is right depends on where the session
+# will run, so both are below.
 prompt_max=100000
 prompt_head="Below is a description of a possible bug or vulnerability. please read it, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
 
-if [ "${issue_bytes}" -gt "${prompt_max}" ]; then
-    # Rare, but real: an issue with a large log or dump pasted into it. Naming
-    # the file loses nothing, since it was written either way.
+wrap_issue() {
+    printf '%s\n\n<issue key="%s">\n%s\n</issue>' "${prompt_head}" "${key}" "${1}"
+}
+
+if [ "${issue_bytes}" -le "${prompt_max}" ]; then
+    prompt="$(wrap_issue "${issue_text}")"
+elif runner_hosted_here; then
+    # Too big to inline, and this machine hosts a runner -- so the session will
+    # be answered on the WORKSTATION while this file sits here. Naming it would
+    # point the agent at a path that does not exist over there, so send what
+    # fits and say plainly that the tail was cut. Issues get large because of a
+    # pasted log or dump, which is at the end; the report itself is at the top.
+    plugin_say "${key} is ${issue_bytes} bytes; sending the first ${prompt_max} -- the run goes to"
+    plugin_say "another machine, so pointing at ${issue_rel} here would be pointing at nothing"
+    prompt="$(wrap_issue "$(head -c "${prompt_max}" -- "${issue_file}")
+[truncated: the issue is ${issue_bytes} bytes and only the first ${prompt_max} are above]")"
+else
+    # Too big to inline, and the session runs on this machine, so the file it
+    # was written to is right there. Naming it loses nothing.
     plugin_say "${key} is ${issue_bytes} bytes, too large to put in the prompt; pointing at the file instead"
     prompt="In the ${issue_rel}, there is a description of a possible bug or vulnerability. please read the file, verify if the issue is real, and if it is, on a new branch, create a failing regression test for it."
-else
-    prompt="${prompt_head}
-
-<issue key=\"${key}\">
-${issue_text}
-</issue>"
 fi
 
 log_dir="$(plugin_state)/runs"

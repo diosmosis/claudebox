@@ -24,10 +24,21 @@ routinely contain fences of their own and a fence here would end at the first
 one in a stack trace.
 
 The exception is an issue too big to fit: `execve` caps a single argument at
-128KB and a prompt is one argument, so past ~100KB the command says so and
-points the prompt at the file instead. Nothing is lost — the file was written
-either way — and the alternative is `docker: Argument list too long`, which
-says nothing about issues or prompts.
+128KB and a prompt is one argument, so past ~100KB the command degrades and says
+so. The alternative is `docker: Argument list too long`, which says nothing
+about issues or prompts.
+
+How it degrades depends on which machine will answer. Normally it points the
+prompt at the file, which loses nothing since the file is right there. On a
+machine that **hosts a runner** the session is answered on the workstation while
+the file stays here, so it sends the first 100KB with a note that the rest was
+cut — a path would point at nothing over there. Issues get large because of a
+pasted log, which is at the end; the report is at the top.
+
+That is also why this plugin works on a runner machine at all: it fetches with a
+credential that lives there, and the headless run it asks for is forwarded. The
+prompt carrying the issue rather than a path is what makes the two halves able
+to be on different machines.
 
 ## The token stays on this machine
 

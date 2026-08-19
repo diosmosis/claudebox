@@ -835,17 +835,13 @@ runner_cmd() {
 # nothing else.
 # ---------------------------------------------------------------------------
 
-# Does this machine host a runner? That is what decides whether the agent may
-# run here, and it is deliberately about what is RUNNING, not about what is
-# configured: a stopped runner stack is not a runner, and a machine that has
-# merely joined one is a workstation.
-runner_hosted_here() {
-    [ "$(docker inspect -f '{{.State.Running}}' claudebox-runner 2>/dev/null || true)" = "true" ]
-}
+# runner_hosted_here -- "does this machine host a runner", the question the gate
+# below turns on -- is defined in plugin-api.sh, sourced at the top, because
+# plugins have to be able to ask it too.
 
 agent_usage() {
     cat >&2 <<'USAGE'
-usage: claudebox agent <start|enrol|status>      on a workstation
+usage: claudebox agent <start|stop|enrol|status> on a workstation
        claudebox agent <add|show|test|forget>    on a runner machine
 
   On the workstation -- the machine that runs the agent:
@@ -854,6 +850,9 @@ usage: claudebox agent <start|enrol|status>      on a workstation
             one command to run on a machine that has never served one.
     enrol   Open an enrolment window and print the line to type on the runner
             machine. For a door that is already up.
+    stop    Stop serving: take the front door down, clear the setting, and
+            restart the box without its listener. The identity is kept, so
+            "start" brings the same door back and nothing has to re-join.
     status  Whether the front door is up, and its certificate fingerprint.
 
   On a runner machine -- the machine that must not run one:
@@ -962,6 +961,49 @@ agent_start() {
     agent_enrol
 }
 
+# The pair of agent_start: stop serving, and stop offering to.
+#
+# The identity is deliberately left alone. It lives in the agent-state volume,
+# and deleting it would issue a new certificate -- which every machine that ever
+# joined has pinned, so all of them would have to re-join to get the door back.
+# Turning the door off is a thing you do for an afternoon; re-issuing an
+# identity is not, and "docker volume rm claudebox_agent-state" is how you ask
+# for that on purpose.
+agent_stop() {
+    local was_up=""
+    if docker inspect claudebox-agent-relay >/dev/null 2>&1; then
+        was_up=1
+    fi
+    if [ -z "${BOX_AGENT_SERVE}" ] && [ -z "${was_up}" ]; then
+        echo "claudebox: the agent door is already off here" >&2
+        return 0
+    fi
+
+    # The container first, while this process's compose invocation still selects
+    # the agent profile. A later "up" without the profile does not remove a
+    # service it is not selecting -- it leaves it running as an orphan.
+    if [ -n "${was_up}" ]; then
+        "${COMPOSE[@]}" --profile agent rm -sf agent-relay >/dev/null 2>&1             || docker rm -f claudebox-agent-relay >/dev/null 2>&1 || true
+        echo "claudebox: front door stopped" >&2
+    fi
+
+    config_set BOX_AGENT_SERVE ""
+    export BOX_AGENT_SERVE=""
+
+    # Restart the box so its listener goes with it: the setting is passed in as
+    # CLAUDEBOX_AGENT_SERVE, so the service's environment has changed and "up"
+    # recreates it. The child re-reads the config, which no longer selects the
+    # profile, so it will not put the front door back.
+    if docker inspect claudebox >/dev/null 2>&1; then
+        echo "claudebox: restarting the box without its listener..." >&2
+        "${BOX_DIR}/claudebox" shell -c true >/dev/null || return 1
+    fi
+
+    echo "claudebox: agent door off (BOX_AGENT_SERVE cleared in ${BOX_CONFIG})" >&2
+    echo "claudebox: the certificate and token are kept, so 'claudebox agent start'" >&2
+    echo "claudebox: brings the same door back and nothing has to re-join." >&2
+}
+
 agent_enrol() {
     if [ -z "${BOX_AGENT_SERVE}" ]; then
         echo "claudebox: the agent door is off here. Put BOX_AGENT_SERVE=1 in ${BOX_CONFIG}," >&2
@@ -1026,6 +1068,7 @@ agent_cmd() {
     shift || true
     case "${sub}" in
         start)        agent_start ;;
+        stop)         agent_stop ;;
         enrol|enroll) agent_enrol ;;
         status)       agent_status ;;
         add)
@@ -1273,7 +1316,28 @@ runner_machine_gate() {
     local arg headless="" first="${1:-}"
 
     case "${first}" in
-        agent|help|-h|--help) return 0 ;;
+        agent|help|-h|--help|plugins) return 0 ;;
+        *:*)
+            # Plugin commands run here.
+            #
+            # They are host-side code that starts no box of its own, and one of
+            # them -- jira:triage-issue -- is the reason this forwarding exists:
+            # it fetches an issue with a credential that lives on THIS machine
+            # and then asks for a headless run, which the rest of this function
+            # sends to the workstation. Refusing it here would mean the plugin
+            # could only ever be run on the machine that does not have its
+            # credential.
+            #
+            # This is only safe because the prompt carries the issue text rather
+            # than a path: a plugin's files land in this machine's tree, and the
+            # session that reads them is on the other one. A plugin that writes
+            # something here and then names it in a prompt will not find it
+            # there -- see the size fallback in jira:triage-issue for the one
+            # place that still has to care.
+            if plugin_find "${first%%:*}" >/dev/null 2>&1; then
+                return 0
+            fi
+            ;;
     esac
 
     # Headless means claude with a prompt and no terminal to answer on: -p or
@@ -1300,6 +1364,7 @@ runner_machine_gate() {
             echo "claudebox: machine built not to have one."
             echo "claudebox:"
             echo "claudebox:   claudebox-runner <cmd>     this machine's own commands"
+            echo "claudebox:   claudebox <p>:<cmd>         plugins run here, as normal"
             echo "claudebox:   claudebox <cmd>            on the workstation, for everything else"
             echo "claudebox:"
             echo "claudebox: a headless one-off (claudebox -p '...') is the exception: it is sent"
@@ -1423,6 +1488,7 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              one-off runs here to be answered, instead of running
                              an agent on itself. Turns the door on, brings it up
                              and prints the line to type over there.
+  claudebox agent stop       stop serving it (the identity is kept)
   claudebox agent enrol      open another enrolment window, for one more machine
   claudebox agent status     whether that front door is up, and its fingerprint
   claudebox agent add <host:port> <code>

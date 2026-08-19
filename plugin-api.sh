@@ -106,6 +106,25 @@ host_path() {
 }
 
 # ---------------------------------------------------------------------------
+# Which machine is this
+# ---------------------------------------------------------------------------
+
+# Does this machine host a runner? If it does, the agent does not run here: the
+# launcher refuses everything but plugins and sends a headless one-off to the
+# workstation instead (see the gate in `claudebox`).
+#
+# Shared with the launcher rather than duplicated because a plugin has to be
+# able to ask the same question: a plugin's own files land on THIS machine,
+# while the session it asks for runs on the other one, and anything that names a
+# path in a prompt has to know which of those it is talking about.
+#
+# About what is RUNNING, not what is configured -- a stopped runner stack is not
+# a runner, and a machine that has merely joined one is a workstation.
+runner_hosted_here() {
+    [ "$(docker inspect -f '{{.State.Running}}' claudebox-runner 2>/dev/null || true)" = "true" ]
+}
+
+# ---------------------------------------------------------------------------
 # The box
 # ---------------------------------------------------------------------------
 
