@@ -814,6 +814,147 @@ runner_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# What the box is doing
+#
+# "claudebox ps": every claude session running in the box, where it is working,
+# how it got there, and what it is executing right now.
+#
+# It exists because a headless run is silent by construction. "claude -p" is
+# print mode -- it emits its answer when it finishes and nothing before -- so a
+# session that is thinking hard and a session that is wedged look identical from
+# outside. That is worse for a run that arrived through the agent door, where
+# the person who started it is on another machine and has no process of their
+# own to look at.
+#
+# Everything here is read out of the box's /proc through one exec. Nothing is
+# recorded anywhere while a session runs; the process table IS the state.
+# ---------------------------------------------------------------------------
+ps_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox ps [--full]
+
+  Lists the claude sessions running in the box: how long each has been going,
+  which project it is in, whether it arrived through the agent door or was
+  started here, what it is executing right now, and the prompt it was given.
+
+  --full   do not truncate the prompt
+USAGE
+}
+
+ps_cmd() {
+    local full=""
+    case "${1:-}" in
+        --full) full=1 ;;
+        "") ;;
+        -h|--help) ps_usage; return 0 ;;
+        *) ps_usage; return 2 ;;
+    esac
+
+    if ! docker exec "${CONTAINER}" true 2>/dev/null; then
+        echo "claudebox: the box is not running, so nothing is running in it" >&2
+        return 1
+    fi
+
+    # One snapshot, parsed here. -ww so a long argument is not truncated to the
+    # terminal width -- a forwarded prompt carries a whole issue, and this is
+    # the one place that wants to see into it.
+    local snapshot
+    snapshot="$(docker exec "${CONTAINER}" ps -ww -eo pid=,ppid=,etime=,args= 2>/dev/null)"
+
+    # The agent door's listener, if it is up. A session whose parent is that
+    # process arrived from another machine; anything else was started here.
+    local door_pid=""
+    door_pid="$(printf '%s\n' "${snapshot}" \
+        | awk '$4 == "node" && $5 ~ /agent-serve\.mjs$/ { print $1; exit }')"
+
+    # Filtered first, and checked, because a here-string built from an empty
+    # command substitution is still one empty line -- which the loop below would
+    # happily report as a session with no pid.
+    local sessions
+    sessions="$(printf '%s\n' "${snapshot}" | awk '$4 == "claude"')"
+    if [ -z "${sessions}" ]; then
+        echo "claudebox: no claude sessions running in the box" >&2
+        if [ -n "${door_pid}" ]; then
+            echo "claudebox: (the agent door is up, so a forwarded run would appear here)" >&2
+        fi
+        return 0
+    fi
+
+    local pid ppid etime rest cwd origin kind prompt
+    while read -r pid ppid etime rest; do
+
+        # As the box user, not root. /proc/<pid>/cwd is readable only by the
+        # process owner or with CAP_SYS_PTRACE, and the box drops that -- so
+        # root gets "permission denied" here while the user the session runs as
+        # reads it fine.
+        cwd="$(docker exec -u "${BOX_UID}:${BOX_GID}" "${CONTAINER}" \
+            readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+        # Shown as the project rather than the absolute path: that is the part
+        # that differs between sessions, and the workspace prefix is the same
+        # for all of them.
+        case "${cwd}" in
+            "${BOX_WORKSPACE}"/*) cwd="${cwd#"${BOX_WORKSPACE}"/}" ;;
+            "${BOX_WORKSPACE}")   cwd="(the workspace root)" ;;
+            "")                   cwd="(gone)" ;;
+        esac
+
+        if [ -n "${door_pid}" ] && [ "${ppid}" = "${door_pid}" ]; then
+            origin="via the agent door"
+        else
+            origin="started here"
+        fi
+
+        case " ${rest} " in
+            *" -p "*|*" --print "*) kind="headless" ;;
+            *) kind="interactive" ;;
+        esac
+
+        printf '\npid %-7s %-9s %-28s %s, %s\n' \
+            "${pid}" "${etime}" "${cwd}" "${kind}" "${origin}"
+
+        # What it is executing right now: its own children. This is the answer
+        # to "is it stuck", and it is why this command is worth having at all --
+        # a jest run or a language server starting is a session working, not a
+        # session hung.
+        local cpid cppid cetime crest
+        while read -r cpid cppid cetime crest; do
+            [ "${cppid}" = "${pid}" ] || continue
+            # claude's Bash tool runs everything through a shell that sources a
+            # snapshot, unsets a few things and then evals the real command. All
+            # of that is the same every time and none of it is what the session
+            # is doing, so show what it eval'd -- otherwise the line is a
+            # hundred characters of preamble and the command is off the end.
+            case "${crest}" in
+                *"eval '"*)
+                    crest="${crest#*eval \'}"
+                    # Cut at the closing quote of the eval'd string, which the
+                    # wrapper always follows with a stdin redirect. Matching on
+                    # "' <" rather than the exact redirect covers both spacings
+                    # and takes the trailing "&& pwd -P >| ..." with it.
+                    crest="${crest%%\' <*}"
+                    ;;
+            esac
+            if [ "${#crest}" -gt 110 ]; then
+                crest="${crest:0:110}..."
+            fi
+            printf '  doing:  %s\n' "${crest}"
+        done <<< "${snapshot}"
+
+        # The prompt, which for a forwarded run is the whole of what the other
+        # machine sent. Truncated by default because that can be a hundred
+        # kilobytes; --full prints it.
+        prompt="${rest#*-p }"
+        if [ "${prompt}" != "${rest}" ]; then
+            if [ -z "${full}" ] && [ "${#prompt}" -gt 160 ]; then
+                printf '  prompt: %s...\n' "${prompt:0:160}"
+            else
+                printf '  prompt: %s\n' "${prompt}"
+            fi
+        fi
+    done <<< "${sessions}"
+}
+
+# ---------------------------------------------------------------------------
 # The agent door
 #
 # Two roles, one launcher, and which one applies is decided by what is running
@@ -1345,7 +1486,7 @@ runner_machine_gate() {
     # of this launcher's own subcommands -- "claudebox opencode ... -p" is a
     # different agent, and "claudebox media ..." is not an agent at all.
     case "${first}" in
-        shell|opencode|media|runner|stop|rebuild|allowed|denied|allow|reload|eject|strip|fix-perms|plugins)
+        shell|opencode|media|runner|stop|rebuild|allowed|denied|allow|reload|eject|strip|fix-perms|plugins|ps)
             ;;
         *)
             for arg in "$@"; do
@@ -1494,6 +1635,12 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
   claudebox agent add <host:port> <code>
                              the other side of it, run ON a runner machine
   claudebox agent show|test|forget
+
+  claudebox ps               what claude sessions are running in the box: how long,
+                             which project, whether they arrived through the
+                             agent door, and what they are executing right now.
+                             A headless run prints nothing until it finishes, so
+                             this is how to tell working from wedged.
 
   claudebox rebuild          rebuild images (after Dockerfile/squid.conf edits)
   claudebox stop             stop the stack (volumes survive)
@@ -1840,6 +1987,12 @@ USAGE
     agent)
         shift
         agent_cmd "$@"
+        exit $?
+        ;;
+
+    ps)
+        shift
+        ps_cmd "$@"
         exit $?
         ;;
 

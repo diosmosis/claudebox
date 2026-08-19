@@ -15,6 +15,12 @@ claudebox jira:triage-issue AS-345          fetch it, then have the box triage i
 Claude's answer is printed when it finishes, and kept in
 `plugin-state/jira/runs/`.
 
+Nothing prints while it runs, because `claude -p` is print mode — it emits its
+answer at the end and nothing before. So the command prints `still running
+(2m30s)` every thirty seconds, and `claudebox ps` on the machine actually
+running it shows which project it is in and what it is executing. Interrupting
+stops the session rather than just stopping the wait.
+
 The issue goes into the prompt itself rather than as a path to open, so the run
 is self-contained: the agent has the whole report before it starts instead of a
 filename it has to decide to read. `<KEY>.md` is still written — it is the

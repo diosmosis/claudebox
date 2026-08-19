@@ -482,6 +482,9 @@ claudebox agent add <host:port> <code>
                            one-offs typed here are answered there
 claudebox agent show|test|forget
 
+claudebox ps               what claude sessions are running in the box: how long,
+                           which project, whether they came through the agent
+                           door, and what each is executing right now
 claudebox plugins          list the commands plugins add, and where they are looked for
 claudebox <p>:<cmd> [args] run one (plugins/<p>/commands/<cmd>)
 
@@ -1283,6 +1286,46 @@ is one less difference.
 `runner-relay` forwards the first five and rebuilds the headers rather than
 passing them through. `/enrol` is not forwarded: it is spoken once, at join time,
 by a one-off container and never by the box.
+
+## Seeing what a session is doing
+
+A headless run is silent by construction: `claude -p` is print mode, so it emits
+its answer when it finishes and nothing before. A session that is thinking hard
+and one that is wedged look identical from outside — and when the run was
+forwarded through the agent door, the person who started it is on another
+machine with no process of their own to look at.
+
+```
+$ claudebox ps
+
+pid 2047    04:07     looker-studio-connector      headless, via the agent door
+  doing:  npx jest --config=./jest.config.unit.ts
+  prompt: Below is a description of a possible bug or vulnerability. please read it,...
+```
+
+Everything it prints is read out of the box's `/proc` through one `exec`;
+nothing is recorded anywhere while a session runs, because the process table
+*is* the state. Three details are load-bearing:
+
+- **`/proc/<pid>/cwd` is read as the box user, not root.** It is readable only
+  by the process owner or with `CAP_SYS_PTRACE`, and the box drops that — so
+  root gets "permission denied" here while the user the session runs as reads it
+  fine.
+- **`doing:` shows what claude's Bash tool `eval`'d**, not the wrapper around
+  it. Every such command begins with a hundred characters of sourcing a shell
+  snapshot and unsetting things, which is identical every time; without
+  stripping it the line is all preamble and the command is off the end.
+- **A session whose parent is `agent-serve.mjs` came through the door.**
+  Anything else was started here. That is the whole of how origin is decided —
+  no bookkeeping, just the parent pid.
+
+`jira:triage-issue` prints a `still running (2m30s)` line every thirty seconds
+while it waits, for the same reason: the cheapest thing that distinguishes a
+long run from a dead one. Interrupting it stops the session rather than just
+stopping the wait — it kills the process group, which for a forwarded run drops
+the connection and lets `agent-serve.mjs` kill its child, and for a local run
+also finds the session in the box by the issue key in its prompt, since
+`docker exec` does not pass a signal to the process it started.
 
 ## The agent door: keeping claude off a runner machine
 

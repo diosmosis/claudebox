@@ -213,19 +213,77 @@ mkdir -p -- "${log_dir}"
 log_file="${log_dir}/${key}-$(date +%Y%m%d-%H%M%S).log"
 
 plugin_say "starting a session in the box (auto mode); this takes a while"
-plugin_say "output is also being written to ${log_file}"
+plugin_say "the answer lands in ${log_file} when it finishes"
 
 # stdout captured, stderr left alone: the launcher's own progress lines and
-# claude's stderr arrive as they happen, so a long run does not look hung, while
-# the answer is held back to be printed in one piece at the end. Capturing
-# stdout also means it is not a terminal, so the launcher attaches no tty --
-# which is what makes this safe to run non-interactively.
+# claude's stderr arrive as they happen, while the answer is held back to be
+# printed in one piece at the end. Capturing stdout also means it is not a
+# terminal, so the launcher attaches no tty -- which is what makes this safe to
+# run non-interactively.
+#
+# WHY THERE IS A HEARTBEAT
+#
+# "claude -p" is print mode: it emits its answer when it finishes and nothing
+# before that. Capturing it here holds that back further. So a triage of a
+# substantial issue is several minutes of complete silence, which is
+# indistinguishable from a hang -- and when the run has been forwarded to
+# another machine, there is not even a local process to look at. A line every
+# thirty seconds is the cheapest thing that answers "is this still going".
+#
+# It goes to stderr, so a caller capturing this command's stdout still gets the
+# answer and nothing else.
+answer_file="$(mktemp)"
+cleanup_run() { rm -f -- "${answer_file}"; }
+trap cleanup_run EXIT
+
 set +e
-answer="$(cd "${project}" && "${CLAUDEBOX_DIR}/claudebox" \
-    -p "${prompt}" --permission-mode auto </dev/null)"
+# Job control on, so the run gets a process group of its own and can be stopped
+# as a whole. Without it there is a chain here -- subshell, launcher, and either
+# a "docker exec" or the "docker run" that carries a forwarded request -- and
+# killing only the first leaves the rest of it going.
+set -m
+( cd "${project}" && "${CLAUDEBOX_DIR}/claudebox" \
+    -p "${prompt}" --permission-mode auto </dev/null > "${answer_file}" ) &
+run_pid=$!
+set +m
+
+# Ctrl-C should stop the session, not just stop waiting for it -- an auto-mode
+# agent left running is one making commits with nobody reading them.
+#
+# Two steps, because the local and forwarded cases end differently. Killing the
+# process group ends the chain here, and for a FORWARDED run that is enough: the
+# request's connection drops, and agent-serve.mjs on the other machine kills its
+# child when that happens. For a LOCAL run it is not enough -- "docker exec"
+# does not pass a signal to the process it started, so claude carries on in the
+# box. It is found by the issue key in its prompt, which is unique to this run.
+stop_run() {
+    kill -- -"${run_pid}" 2>/dev/null
+    if box_running; then
+        docker exec "${CLAUDEBOX_CONTAINER}" sh -c \
+            "ps -eo pid,args | grep '<issue key=\"${key}\">' | grep -v grep | awk '{print \$1}' | xargs -r kill" \
+            2>/dev/null || true
+    fi
+}
+trap 'echo >&2; plugin_say "stopping the session"; stop_run; cleanup_run; exit 130' INT TERM
+
+run_started="$(date +%s)"
+while kill -0 "${run_pid}" 2>/dev/null; do
+    sleep 5
+    kill -0 "${run_pid}" 2>/dev/null || break
+    elapsed=$(( $(date +%s) - run_started ))
+    # Every 30s, not every 5: the loop wakes often so that finishing is noticed
+    # promptly, but says so rarely enough not to become the noise it is meant to
+    # replace.
+    if [ $(( elapsed % 30 )) -lt 5 ] && [ "${elapsed}" -ge 30 ]; then
+        plugin_say "still running ($(printf '%dm%02ds' $(( elapsed / 60 )) $(( elapsed % 60 )))) -- 'claudebox ps' on the machine running it shows what it is doing"
+    fi
+done
+wait "${run_pid}"
 status=$?
+trap - INT TERM
 set -e
 
+answer="$(cat -- "${answer_file}")"
 printf '%s\n' "${answer}" > "${log_file}"
 
 if [ -n "${answer}" ]; then
