@@ -181,6 +181,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxtst6 \
     && rm -rf /var/lib/apt/lists/*
 
+# A C toolchain and the headers node-canvas compiles against.
+#
+# canvas 2.11.2 -- what WebdriverIO's image-comparison service and the suites
+# built on it resolve to -- publishes prebuilt binaries only through node ABI
+# 115 (node 20). This image is node 22 (ABI 127), where the prebuilt download
+# 404s and npm falls back to building from source, so an install without these
+# dies in node-gyp instead. Pinning the project to node 20 would be the other
+# way out, but that is a per-project decision the box should not be making.
+#
+# The runtime libraries are already installed above for Chromium (libcairo2,
+# libpango-1.0-0, and so on); these are the matching -dev packages, which also
+# pull in libpixman and libfreetype's headers. node-gyp's python3 comes from the
+# first apt block.
+#
+# Nothing here is loaded by a running process -- headers and a compiler cannot
+# change how a pixel comes out -- but it belongs in base rather than the runner
+# stage all the same, because a suite that cannot install cannot run.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libcairo2-dev \
+        libgif-dev \
+        libjpeg-dev \
+        libpango1.0-dev \
+        librsvg2-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
 # The fonts Matomo's UI tests run against in CI.
 #
 # The baselines under tests/UI/expected-screenshots are produced by
