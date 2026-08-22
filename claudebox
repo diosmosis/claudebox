@@ -1722,6 +1722,33 @@ sync_box_is_in_copy() {
 
 sync_serving()       { sync_container_running "${SYNC_DOOR}"; }
 
+# Which of a container's networks are internal, if any.
+#
+# This exists because of the one failure that produces a healthy-looking door
+# nobody can reach. Docker will ACCEPT a port publish for a container attached
+# only to an internal network and then never establish it: .HostConfig.
+# PortBindings holds the request, .NetworkSettings.Ports holds nothing, and
+# "docker port" prints nothing. There is no error anywhere. From the other
+# machine it is a silent timeout; from this one the door looks fine.
+#
+# Two ways in, both seen: the container ends up on `inner` (which IS internal --
+# that is what makes the box's sandbox real), or `claudebox_edge` itself exists
+# as an internal network. Compose does not change the attributes of a network
+# that already exists, so an edge created internal once stays internal through
+# every later "up".
+sync_internal_networks() {
+    local nets n out=""
+    nets="$(docker inspect --type container \
+        -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+        "${1}" 2>/dev/null || true)"
+    for n in ${nets}; do
+        if [ "$(docker network inspect -f '{{.Internal}}' "${n}" 2>/dev/null || true)" = "true" ]; then
+            out="${out}${n} "
+        fi
+    done
+    printf '%s' "${out}"
+}
+
 # What the door is ACTUALLY published on, asked of Docker.
 #
 # Not BOX_SYNC_PORT, which is only what it was asked to publish on. A container
@@ -1730,9 +1757,20 @@ sync_serving()       { sync_container_running "${SYNC_DOOR}"; }
 # this end reports itself fine. Printing the setting back as though it were an
 # observation is how that state hides, so status asks the daemon.
 sync_published_port() {
+    # .NetworkSettings.Ports, NOT .HostConfig.PortBindings, and the difference is
+    # the entire point of this function. PortBindings is what the container was
+    # ASKED to publish -- it is filled in from the compose file and stays filled
+    # in whether or not the mapping was ever established. NetworkSettings.Ports
+    # is what actually exists, and it reads {"22/tcp":null} for a container on an
+    # internal network. Reading the first one is how a door reports itself
+    # published while every machine on the LAN times out; asking it was the bug
+    # this function was written to fix, and then reintroduced one level down.
+    #
+    # "docker port" reads the same live table, which is why it prints nothing in
+    # that state and is the check to hand someone over the phone.
     docker inspect --type container \
-        -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostPort}}{{end}}{{end}}' \
-        "${SYNC_DOOR}" 2>/dev/null || true
+        -f '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' \
+        "${SYNC_DOOR}" 2>/dev/null | awk '{print $1}' || true
 }
 sync_client_running() { sync_container_running "${SYNC_CLIENT}"; }
 
@@ -2428,13 +2466,35 @@ sync_status() {
                 echo "claudebox: sshd is running and healthy inside the container, and nothing"
                 echo "claudebox: outside this machine can reach it. Every machine that tries will"
                 echo "claudebox: see a silent timeout rather than a refusal."
-                echo "claudebox: 'docker port ${SYNC_DOOR}' shows the same nothing. Recreate it:"
+                echo "claudebox: 'docker port ${SYNC_DOOR}' shows the same nothing, while"
+                echo "claudebox: 'docker inspect' still shows the binding it was ASKED for."
                 echo "claudebox:"
-                echo "claudebox:     claudebox mutagen stop && claudebox mutagen start"
-                echo "claudebox:"
-                echo "claudebox: If it comes back unpublished, the container was created from a"
-                echo "claudebox: docker-compose.yaml without the ports entry -- check that this"
-                echo "claudebox: machine has the current one."
+                local badnets
+                badnets="$(sync_internal_networks "${SYNC_DOOR}")"
+                if [ -n "${badnets}" ]; then
+                    echo "claudebox: The cause: the door is on an INTERNAL network (${badnets%% })."
+                    echo "claudebox: Docker accepts a port publish on one and then never establishes"
+                    echo "claudebox: it -- no error, no mapping, nothing to see from this end."
+                    echo "claudebox:"
+                    echo "claudebox: The door belongs on claudebox_edge, which must not be internal."
+                    echo "claudebox: Compose never changes an existing network's attributes, so one"
+                    echo "claudebox: created internal stays that way. Recreate it:"
+                    echo "claudebox:"
+                    echo "claudebox:     claudebox mutagen stop"
+                    echo "claudebox:     docker compose -f ${BOX_DIR}/docker-compose.yaml down     # frees the network"
+                    echo "claudebox:     docker network rm claudebox_edge"
+                    echo "claudebox:     claudebox mutagen start                                    # recreates it correctly"
+                    echo "claudebox:"
+                    echo "claudebox: Check with: docker network inspect claudebox_edge -f '{{.Internal}}'"
+                    echo "claudebox: It must say false."
+                else
+                    echo "claudebox: Recreate it:"
+                    echo "claudebox:"
+                    echo "claudebox:     claudebox mutagen stop && claudebox mutagen start"
+                    echo "claudebox:"
+                    echo "claudebox: If it comes back unpublished, check that this machine's"
+                    echo "claudebox: docker-compose.yaml has the ports entry for the sync service."
+                fi
             } >&2
             return 1
         fi
