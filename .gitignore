@@ -10,3 +10,12 @@
 # plugin_state. Generated, so it is kept out of plugins/ itself -- that holds
 # the plugins distributed with claudebox and is tracked.
 /plugin-state/
+
+# The client half of "claudebox ssh mount": this machine's key and the host
+# keys it has pinned. Generated per machine, and one of them is a private key.
+/ssh-client/
+
+# Where a remote claudebox's workspace is mounted by "claudebox ssh mount".
+# Empty except while mounted -- and never a place to put files, since anything
+# written here while nothing is mounted is hidden the moment one is.
+/remote-workspace/

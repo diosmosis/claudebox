@@ -56,6 +56,11 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
                                                                  Reached as
                                                                  host.docker.internal, both
                                                                  in dind and in the box)
+
+  claudebox-ssh ─── claudebox_edge ──→ LAN ──→ another machine's sshfs mount
+   (sshd, keys only. NOT on inner:                        │
+    it holds the same workspace bind                      └──→ that machine's
+    the box does, and nothing else)                            BOX_WORKSPACE_HOST
 ```
 
 | Container | Image | Role |
@@ -66,18 +71,20 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 | `claudebox-ddev-relay` | built from `ddev-relay/Dockerfile` | Holds the host Docker socket; runs `ddev exec` in DDEV containers on the box's behalf. On `inner` only — no egress. See below. |
 | `claudebox-ddev-db` | `alpine/socat` | One fixed TCP forward: `db:3306` on `inner` → `ddev-<project>-db:3306` on `ddev_default`. Lets PHP in the box use a DDEV project's database. See below. |
 | `claudebox-ddev-http` | built from `ddev-http/Dockerfile` | nginx on a fixed address: sets `Host` to the project's hostname, presents the client as `127.0.0.1`, and proxies to the project's web container. This is what `host.docker.internal` resolves to, in dind and in the box. See below. |
+| `claudebox-ssh` | built from `ssh-server/Dockerfile` | An sshd over the **same workspace bind the box gets**, published on the LAN, so another machine can mount this source tree with sshfs and run its own claudebox against it. On `edge` only — it can see the workspace and the internet, and none of the rest of the stack. Created only under the `ssh` profile. See *Sharing the workspace between machines* below. |
 | `claudebox-runner-relay` | built from `runner-relay/Dockerfile` | Holds a remote test runner's address, token and certificate fingerprint; forwards five routes to it and nothing else. On `inner` *and* `edge`, which is the only reason the box can reach another machine at all. Idle and harmless when no runner is joined. See below. |
 
 | Network | Kind | Members |
 |---|---|---|
 | `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay, ddev-db, ddev-http (`10.99.1.10`), runner-relay |
-| `claudebox_edge` | bridge | proxy, runner-relay |
+| `claudebox_edge` | bridge | proxy, runner-relay, agent-relay, ssh |
 | `ddev_default` | external (DDEV's) | proxy, ddev-db, ddev-http |
 
 | Volume | Contents |
 |---|---|
 | `claudebox-home` | Container `$HOME` (`/home/dizzy`), including its own `~/.claude` — except `~/.claude/plans`, which is a host bind (see below) |
 | `claudebox-dind-data` | dind's image store — separate from the host's |
+| `claudebox_ssh-state` | The workspace door's host key and authorized_keys. Only created under the `ssh` profile; deleting it issues a new host key, which every machine that mounted this workspace has pinned |
 
 ### Load-bearing decisions
 
@@ -411,7 +418,7 @@ Each of these is doing real work. Changing one breaks something specific.
 
 | Path | Purpose |
 |---|---|
-| `docker-compose.yaml` | The six services, three networks, two volumes |
+| `docker-compose.yaml` | The nine services (two of them behind profiles), three networks, four volumes |
 | `Dockerfile` | The claudebox image |
 | `entrypoint.sh` | Runs as root at start: installs the mkcert CA, seeds `~/.claude` and opencode's config/credentials, signals readiness |
 | `ddev-shim` | The box's `ddev` (baked to `/usr/local/bin/ddev`); forwards `ddev exec` to the relay |
@@ -429,6 +436,8 @@ Each of these is doing real work. Changing one breaks something specific.
 | `agent-relay/relay.mjs`, `agent-relay/entrypoint.sh`, `agent-relay/open-enrolment.sh` | The inbound agent door on a workstation: its identity, its enrolment window, and the one route it forwards into the box |
 | `agent-relay/enrol.mjs`, `agent-relay/send.mjs` | Run as one-off containers **on a runner machine** — join a workstation, and send it a headless run |
 | `agent-serve.mjs` | Baked into the box as `/usr/local/lib/claudebox/agent-serve.mjs`; the box's side of that door, on the internal network only |
+| `ssh-server/Dockerfile`, `ssh-server/entrypoint.sh`, `ssh-server/sshd_config.template` | The workspace door: an sshd serving the same tree the box works in. The entrypoint settles what the image deliberately does not bake in — which user may log in, and where that user's home is (the workspace, so `sshfs box@host:` needs no path) |
+| `ssh-server/authorize.sh` | Baked in as `claudebox-ssh-authorize`; adds one public key to the door's `authorized_keys`, or lists what is there. What `claudebox ssh authorize` and `claudebox ssh status` reach through `docker exec` |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
 | `ui-parity` | Prints everything about an image that a UI test can observe, in diffable form — package versions, font file hashes, fontconfig's resolved settings, ImageMagick's limits |
 | `apparmor/claudebox-dind` | The profile that grants `userns` to the dind sidecar; installed once with `sudo`, on each machine |
@@ -482,6 +491,22 @@ claudebox agent add <host:port> <code>
                            one-offs typed here are answered there
 claudebox agent show|test|forget
 
+claudebox ssh start        share this machine's workspace over ssh on the LAN:
+                           sshd over the same bind the box gets. Prints the
+                           address, the port and the host key to compare
+claudebox ssh stop         stop sharing (host key and authorised keys are kept)
+claudebox ssh status       whether it is up, and which machines may log in
+claudebox ssh authorize '<public key>'
+                           let a machine in, using the line its "ssh mount"
+                           printed. Keys only — there is no password
+claudebox ssh mount [user@]<host>[:port]
+                           ON the other machine: mount that workspace here over
+                           sshfs and point BOX_WORKSPACE_HOST at it, so the next
+                           "claudebox" runs against the remote tree
+claudebox ssh eject        unmount it and go back to the local workspace (stops
+                           the box first — a container holds the mount open)
+claudebox ssh forget       drop the pin and the joined address
+
 claudebox ps               what claude sessions are running in the box: how long,
                            which project, whether they came through the agent
                            door, and what each is executing right now
@@ -512,7 +537,11 @@ Settings: `BOX_WORKSPACE` (where the box sees the tree), `BOX_WORKSPACE_HOST`
 `BOX_AGENT_TOKEN` / `BOX_AGENT_FINGERPRINT` (written by `claudebox agent add` on
 a runner machine), and
 `BOX_RUNNER` / `BOX_RUNNER_TOKEN` / `BOX_RUNNER_FINGERPRINT` (written by
-`claudebox runner add`, read by nothing but the relay).
+`claudebox runner add`, read by nothing but the relay), and
+`BOX_SSH_SERVE` / `BOX_SSH_PORT` (share this machine's workspace over ssh) with
+`BOX_SSH_REMOTE` / `BOX_SSH_FINGERPRINT` / `BOX_SSH_LOCAL_WORKSPACE_HOST`
+(written by `claudebox ssh mount` on the machine that mounts one — the last is
+what `claudebox ssh eject` puts back).
 
 `claudebox-runner` reads the same file with its own allowlist —
 `BOX_USER`/`BOX_UID`/`BOX_GID`, `BOX_DIND_APPARMOR`, `BOX_RUNNER_PORT`,
@@ -1464,6 +1493,208 @@ to that container **on stdin** — NUL-separated, along with the prompt — beca
 process arguments are readable by every process on the machine and
 `docker run -e TOKEN=...` would put it in the docker client's own command line.
 
+## Sharing the workspace between machines
+
+Two machines, one source tree. `claudebox ssh start` on the machine that has the
+tree brings up `claudebox-ssh` — an sshd over the *same bind the box gets* —
+and publishes it on the LAN. `claudebox ssh mount <host>` on the other machine
+mounts it with sshfs and points `BOX_WORKSPACE_HOST` at the mount, so claudebox
+there runs against this tree while the box still sees a plain `~/Projects`.
+
+It exists for the case the removable-drive workspace was already solving badly:
+the tree is the source of truth and it is wanted on two machines. A drive has to
+be carried, ejected in the right order, and is on exactly one machine at a time;
+this is the same tree, live, on both.
+
+```
+  machine A (has the tree)                    machine B (wants it)
+  ┌────────────────────────────┐              ┌──────────────────────────────┐
+  │ claudebox-ssh  ── edge ────┼──── LAN ─────┤  sshfs (ON THE HOST)         │
+  │   sshd, keys only          │   :7994      │    ~/.claudebox/             │
+  │   home = the workspace     │              │      remote-workspace        │
+  │        │                   │              │            │                 │
+  │   ~/Projects (bind)        │              │   BOX_WORKSPACE_HOST ────┐   │
+  └────────┼───────────────────┘              │                          │   │
+           └── the box on A sees the same     │   claudebox (box) ───────┘   │
+               directory                      │     sees ~/Projects          │
+                                              └──────────────────────────────┘
+```
+
+### The two halves
+
+| On the machine that HAS the tree | On the machine that wants it |
+|---|---|
+| `claudebox ssh start` — bring the door up and publish it (`BOX_SSH_PORT`, default 7994) | `claudebox ssh mount [user@]<host>[:port]` — mount it and start using it |
+| `claudebox ssh authorize '<key>'` — let a machine in | `claudebox ssh eject` — unmount and go back to the local workspace |
+| `claudebox ssh status` — up? fingerprint? who may log in? | `claudebox ssh status` — mounted? in use? |
+| `claudebox ssh stop` — stop serving; identity kept | `claudebox ssh forget` — drop the pin and the address |
+
+Joining is `ssh-copy-id` by hand, in the two commands it takes:
+
+```
+B$ claudebox ssh mount 10.0.0.49:7994      # prints B's public key, refuses
+A$ claudebox ssh authorize 'ssh-ed25519 AAAA... claudebox@B'
+B$ claudebox ssh mount 10.0.0.49:7994      # mounts, pins A's host key
+```
+
+### Load-bearing decisions
+
+- **Keys only, and no enrolment code.** Every other door in this stack (the
+  runner, the agent) hands out a bearer token through a short-lived code,
+  because what is behind it is an HTTP API that had to invent an
+  authentication scheme. ssh already has one. So there is no token, no
+  window and no code: the far side's `authorized_keys` is the entire access
+  list, `PasswordAuthentication` is off in `sshd_config`, and the one line
+  that has to travel between the machines is a **public** key, which is safe
+  to paste anywhere. What is lost is the one-command join; what is gained is
+  that a mis-sent enrolment code cannot exist.
+
+- **The host key is pinned on first mount, in claudebox's own `known_hosts`.**
+  `~/.claudebox/ssh-client/` holds this machine's key and the hosts it has
+  pinned — not `~/.ssh`, because claudebox generates that key without being
+  asked and should not be writing into where a person keeps theirs, and
+  because "which machines can reach my workspace" should be answerable from
+  one file. A host that later answers with a different key is refused with
+  both fingerprints printed, not prompted about: this runs from scripts,
+  where there is nobody to answer a prompt.
+
+- **A container of its own, not sshd in the box.** Everything the box has is
+  something a login shell would inherit: a Docker client pointed at the dind
+  sidecar, the proxy variables, and a place on `inner`, where the relays
+  holding this machine's runner and agent tokens live. `claudebox-ssh` is on
+  `edge` alone. A session in it can see the workspace and the internet, and
+  cannot see the box, dind, the proxy or either relay.
+
+- **The mount is made on the host, not in a container, and that is not a
+  preference.** A bind source is resolved by the Docker **daemon**, so a
+  filesystem that exists only inside some container is not something the box
+  can be given — the same rule that makes the workspace a second mount inside
+  `dind`. So `sshfs` runs on the host at `~/.claudebox/remote-workspace`, and
+  the box is pointed at it with `BOX_WORKSPACE_HOST`, which is the mechanism
+  that already exists for putting the workspace on another drive. Nothing in
+  the box knows or needs to know.
+
+- **`/etc/fuse.conf` needs `user_allow_other`, once per machine that mounts.**
+  `allow_other` is what lets a process that is not the mounting user cross a
+  FUSE mount, and the Docker daemon — which is root, and which is what
+  resolves the bind source — is exactly such a process. FUSE only honours the
+  option for a non-root user when that file says so. Without it the box fails
+  to start with a permission error naming a path that is plainly there, so
+  `claudebox ssh mount` checks up front and prints the one-line fix rather
+  than letting it surface two commands later.
+
+- **A machine cannot mount its own workspace door, and the refusal is by
+  fingerprint.** `claudebox ssh mount` compares the host key the far side
+  presents with the local door's, so `127.0.0.1`, the LAN address and this
+  machine's hostname are all recognised as the same door — an address
+  comparison would catch one of the three. Why it is a refusal and not a
+  warning is in *Traps* below: it wedges the Docker daemon hard enough to need
+  a reboot.
+
+- **`claudebox ssh eject` stops the box first, for the reason `claudebox
+  eject` does.** A container with the mount bound into it holds the FUSE
+  filesystem in its own namespace: the unmount fails with `Device or resource
+  busy`, or — the worse case this stack has already been bitten by on a
+  removable drive — succeeds while the container reads on. Stop, unmount,
+  then put `BOX_WORKSPACE_HOST` back.
+
+- **A dropped mount is fatal at launch, not a warning.** `require_workspace`
+  refuses to start the box when `BOX_WORKSPACE_HOST` is the sshfs mountpoint
+  and nothing is mounted there. It is the quietest failure in the whole
+  arrangement: an sshfs mount that died leaves an ordinary empty directory,
+  the bind succeeds, and the session comes up seeing no projects with nothing
+  anywhere saying why.
+
+### Traps found while building it
+
+- **A keys-only account is a *locked* account, and sshd without PAM refuses
+  it.** `adduser -D` leaves `!` in the password field, which is what every
+  keys-only account on an ordinary distro carries — they work because their
+  sshd runs with `UsePAM yes`, which skips the locked-account check. Alpine's
+  sshd is built without PAM and does the check itself: `User dizzy not allowed
+  because account is locked`, before the key is ever looked at, with the
+  public key correctly installed and a mount that fails at `read: Connection
+  reset by peer`. The entrypoint gives the account 32 random bytes as a
+  password on every start instead — unusable, since password authentication is
+  off, and not the same thing as unlocking it with an *empty* password, which
+  would leave `PermitEmptyPasswords` as the only thing standing there.
+
+- **Mounting a machine's own door wedges dockerd, and it cost a reboot to find
+  out.** It is the obvious way to try the feature without a second machine, and
+  it is the one arrangement that cannot work. The door, the box and `dind` are
+  services in **one compose project** and all three carry the workspace bind, so
+  pointing `BOX_WORKSPACE_HOST` at the local sshfs mount changes the bind source
+  for all of them — and the next launch recreates *the door too*, stopping the
+  sshd that the host's own sshfs mount is talking to. The mount is made with
+  `-o reconnect`, so instead of failing it blocks; the next thing to touch that
+  mountpoint is **dockerd**, resolving the bind source for the box, and it
+  blocks in the kernel holding that container's lock. What that looks like:
+  the box sits in `Created` forever, `docker inspect claudebox` and
+  `docker logs claudebox` hang while `docker ps` and every other container
+  answer normally, and nothing short of a reboot clears it. Two machines cannot
+  reach this state — a `compose up` on the machine that *mounted* the workspace
+  does not touch the machine serving it — so `ssh mount` refuses the loopback
+  by fingerprint rather than trying to survive it.
+
+- **A mount whose server has gone does not fail, it blocks.** The same
+  `-o reconnect` that carries the mount through a closed lid means a server that
+  is gone for good never returns an error to anything reading the tree. So
+  `claudebox ssh eject` tries a lazy unmount (`fusermount -uz`, `umount -l`)
+  after the ordinary ones: it detaches the mount from the tree without asking
+  the filesystem, which is the difference between a machine that recovers and
+  one that reboots.
+
+- **`openssh-server` does not pull in `openssh-sftp-server`, and sshfs speaks
+  sftp.** Without the package, ssh logins work perfectly and every mount fails
+  with `subsystem request failed on channel 0`.
+
+- **`StrictModes` and a home directory that is the workspace cannot both
+  stand.** The login user's home is the shared tree, so that `sshfs box@host:`
+  with no path lands on it and the other machine never has to know where this
+  one keeps its projects. But `StrictModes` checks the *mode of the home
+  directory* before accepting a login, and an ordinary group-writable tree
+  (0775) makes it refuse everything — fixable only by chmod'ing someone's own
+  projects. So it is off, and what it would have protected is moved out of
+  reach instead: `authorized_keys` lives in the state volume, root-owned,
+  where nobody who logs in can append to it.
+
+- **A setting written to the config file can be silently ignored, and until now
+  nothing said so.** `~/.bashrc` on this machine exports `BOX_WORKSPACE_HOST`,
+  and the environment beating the file is the documented rule — but it makes any
+  command that *writes* a setting able to succeed and change nothing:
+  `ssh mount` saved `BOX_WORKSPACE_HOST` and the next launch read the export
+  instead. Afterwards nothing can tell, because by then the two values are one
+  variable. So the launcher now records which settings the environment took from
+  the file (`BOX_SETTINGS_FROM_ENV`, built where both values are still separate)
+  and `config_set` warns when it writes one of them to a different value. The
+  matching read is `config_get`, which asks the file directly — `ssh eject` has
+  to undo a setting it wrote earlier, and asking the resolved variable would
+  have it conclude there was nothing to undo.
+
+- **`ip -4 -o addr show scope global` is mostly Docker on this host.** The
+  address to type on the other machine came out fifth in a list of five, after
+  four bridges no other machine can reach. Interfaces named `docker*`, `br-*`,
+  `veth*`, `virbr*` are dropped.
+
+### Why this is a built-in and not a plugin
+
+The rule in *If asked to extend this* is that a new launcher command should be a
+plugin, and the exception is a command inseparable from the launch path — "the
+stack, the allowlist, the workspace". This is the workspace: `ssh mount` and
+`ssh eject` are the two things that move `BOX_WORKSPACE_HOST`, and the check
+that refuses to start the box over a mount that has dropped is in
+`require_workspace`, which runs before every session. A plugin could bring a
+container up; it could not put itself in front of the launch.
+
+### What this is not
+
+It is not a way into the box, and not a second front door. `claudebox-ssh`
+forwards nothing (`AllowTcpForwarding no`, no agent forwarding, no tunnels), has
+no route to `inner`, and serves one directory. A machine that mounts the
+workspace can read and write the source tree — which is the entire point, and
+the whole of it. Running claude over that tree still happens in each machine's
+own box, under its own allowlist.
+
 ## Egress allowlist
 
 `allowlist.conf` is bind-mounted, so edits need a reload rather than a rebuild —
@@ -2410,6 +2641,13 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   token typed on a command line is in the shell history too. If the plugin needs
   a host the box cannot reach, that is a feature — resist adding it to
   `allowlist.conf` to "make it work", since the fetch is happening on the host.
+- **Share the workspace with another machine** → `claudebox ssh start` here and
+  `claudebox ssh mount` there, not a new bind or a copy of the tree. Note what it
+  does *not* do: the door is a container of its own on `edge` with no route to
+  `inner`, so this is not an exception to the rule below — nothing was published
+  on the `claude` service, and a machine that mounts the workspace still cannot
+  reach the box, dind, the proxy or either relay. See *Sharing the workspace
+  between machines*.
 - **Let something else reach the box from the LAN** → through `agent-relay`, one
   named route at a time, never by publishing a port on the `claude` service. The
   box having no LAN-facing socket is what makes "the box cannot talk to the LAN"

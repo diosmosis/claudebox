@@ -395,6 +395,76 @@ services:
       - inner
       - edge
 
+
+  # The workspace door: sshd over the SAME source tree the box works in, so
+  # another machine on this LAN can mount it with sshfs and run its own
+  # claudebox against it. "claudebox ssh start" is what creates it.
+  #
+  # Why a container of its own rather than sshd in the box: everything the box
+  # has is something a login shell would inherit -- a Docker client pointed at
+  # dind, the proxy variables, and a place on `inner`, where the relays that
+  # hold this machine's tokens live. This service has the workspace and one
+  # network, and no way to reach any of that.
+  #
+  # `edge` alone, and that is the whole network story. A published port needs a
+  # network that is not internal: true, which is the same reason agent-relay is
+  # on edge -- but unlike agent-relay this one has no errand on `inner`, so it
+  # is not there. An ssh session in here can see the workspace and the internet;
+  # it cannot see the box, dind, the proxy or the relays.
+  #
+  # Behind a profile, so it exists only where it is wanted. The launcher passes
+  # --profile ssh when BOX_SSH_SERVE is set; without it this service is not
+  # created and nothing listens.
+  ssh:
+    container_name: claudebox-ssh
+    image: claudebox-ssh:latest
+    build:
+      context: ./ssh-server
+      args:
+        USERNAME: ${BOX_USER:-dizzy}
+        UID: ${BOX_UID:-1000}
+        GID: ${BOX_GID:-1000}
+    init: true
+    profiles: ["ssh"]
+    environment:
+      CLAUDEBOX_SSH_STATE: /var/lib/claudebox-ssh
+      # Who sshd lets in, and where that user's home is -- the workspace, so
+      # "sshfs box@host:" with no path lands on the source tree and the other
+      # machine never has to know where this one keeps it. entrypoint.sh applies
+      # both at start; see the note there on why they are not baked into the
+      # image.
+      CLAUDEBOX_SSH_USER: ${BOX_USER:-dizzy}
+      CLAUDEBOX_WORKSPACE: ${BOX_WORKSPACE:-/home/dizzy/Projects}
+    ports:
+      # On the LAN, which is the point. What protects it is that there is no
+      # password to guess: keys only, one user, and the list of keys is added to
+      # from this machine with "claudebox ssh authorize".
+      - "${BOX_SSH_PORT:-7994}:22"
+    volumes:
+      # The identity -- host key and authorized_keys. A volume, so it survives
+      # restarts and rebuilds: delete it to rotate the host key, and every
+      # machine that mounted this workspace has to re-pin before it can mount
+      # again.
+      - ssh-state:/var/lib/claudebox-ssh
+
+      # The LOCAL tree, at the same container-side path the box uses. Read-write:
+      # the other machine is running a claudebox over it, not reading it.
+      #
+      # BOX_SSH_WORKSPACE_HOST rather than BOX_WORKSPACE_HOST, and the launcher
+      # derives it: on a machine that has itself mounted someone else's
+      # workspace, BOX_WORKSPACE_HOST is that borrowed tree, and a door that
+      # followed it would hand a third machine a workspace from somewhere else
+      # over two hops -- as well as being recreated by every "ssh mount". This
+      # one moves only when the local workspace does.
+      - ${BOX_SSH_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    networks:
+      - edge
   # One fixed TCP forward, from the box to a running DDEV project's database.
   #
   # It exists because a Matomo UI-test fixture is a single PHP process that needs
@@ -485,6 +555,10 @@ volumes:
   # The agent front door's identity -- token, key, certificate. Only created
   # when the agent profile is used.
   agent-state:
+
+  # The workspace door's identity -- host key and the list of keys allowed in.
+  # Only created when the ssh profile is used.
+  ssh-state:
 
   box-home:
     name: claudebox-home

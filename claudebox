@@ -24,6 +24,9 @@
 #   claudebox agent ...       the inbound agent door: serve one here, or (on a
 #                             machine hosting a runner) join one elsewhere
 #
+#   claudebox ssh start       share this workspace over ssh on the LAN
+#   claudebox ssh mount <h>   work in another machine's workspace over sshfs
+#
 # Env overrides: BOX_WORKSPACE, BOX_WORKSPACE_HOST, BOX_USER, BOX_HOST_HOME,
 #               BOX_MKCERT_CA, BOX_PLUGIN_PATH,
 #               BOX_DDEV_PROJECT (which project's database is reachable as db:3306)
@@ -100,6 +103,8 @@ BOX_SETTINGS=(
     BOX_RUNNER BOX_RUNNER_TOKEN BOX_RUNNER_FINGERPRINT
     BOX_AGENT BOX_AGENT_TOKEN BOX_AGENT_FINGERPRINT
     BOX_AGENT_SERVE BOX_AGENT_PORT
+    BOX_SSH_SERVE BOX_SSH_PORT
+    BOX_SSH_REMOTE BOX_SSH_FINGERPRINT BOX_SSH_LOCAL_WORKSPACE_HOST
     BOX_PLUGIN_PATH
 )
 if [ -f "${BOX_CONFIG}" ]; then
@@ -116,11 +121,24 @@ if [ -f "${BOX_CONFIG}" ]; then
         echo "claudebox: ${BOX_CONFIG} failed to parse; fix it or move it aside" >&2
         exit 2
     }
+    # Which of them the environment did not merely supply but actually TOOK from
+    # the file -- the file said one thing, the environment another, and the
+    # environment won. That is the documented rule and it is the right one, but
+    # it makes any command that WRITES a setting able to succeed and change
+    # nothing: "claudebox ssh mount" saves BOX_WORKSPACE_HOST and the next launch
+    # reads a shell profile's export instead. Nothing else can tell afterwards --
+    # by then the two values are one variable -- so it is recorded here, where
+    # both are still in hand, and config_set warns from it.
+    BOX_SETTINGS_FROM_ENV=""
     for _s in "${!_from_env[@]}"; do
+        if [ "${!_s-}" != "${_from_env[${_s}]}" ]; then
+            BOX_SETTINGS_FROM_ENV="${BOX_SETTINGS_FROM_ENV}${_s} "
+        fi
         printf -v "${_s}" '%s' "${_from_env[${_s}]}"
     done
     unset _s _from_env
 fi
+export BOX_SETTINGS_FROM_ENV="${BOX_SETTINGS_FROM_ENV:-}"
 
 # The workspace has two paths, and they are only the same by default.
 #
@@ -208,6 +226,45 @@ export BOX_AGENT_PORT="${BOX_AGENT_PORT:-7996}"
 # thing that turns it on.
 if [ -n "${BOX_AGENT_SERVE}" ]; then
     COMPOSE+=(--profile agent)
+fi
+
+# The workspace over ssh, both halves.
+#
+# On the machine that HAS the tree: BOX_SSH_SERVE=1 creates the workspace door
+# (the ssh service) and publishes BOX_SSH_PORT on the LAN, so another machine
+# can mount the same source tree with sshfs.
+#
+# On the machine that MOUNTS it: BOX_SSH_REMOTE is the address joined and
+# BOX_SSH_FINGERPRINT the host key pinned there -- the mirror of the BOX_AGENT
+# trio, minus a token, because this door takes keys and nothing else.
+# BOX_SSH_LOCAL_WORKSPACE_HOST is what BOX_WORKSPACE_HOST was before the mount
+# took it over, which is the only place "claudebox ssh eject" can find the local
+# workspace to put back.
+export BOX_SSH_SERVE="${BOX_SSH_SERVE:-}"
+export BOX_SSH_PORT="${BOX_SSH_PORT:-7994}"
+export BOX_SSH_REMOTE="${BOX_SSH_REMOTE:-}"
+export BOX_SSH_FINGERPRINT="${BOX_SSH_FINGERPRINT:-}"
+export BOX_SSH_LOCAL_WORKSPACE_HOST="${BOX_SSH_LOCAL_WORKSPACE_HOST:-}"
+
+# What the workspace door serves -- derived, not a setting, and deliberately NOT
+# BOX_WORKSPACE_HOST.
+#
+# A machine can do both things at once: serve its own tree and borrow another
+# one. If the door's bind followed BOX_WORKSPACE_HOST it would follow the borrow
+# -- mounting a remote workspace would silently re-point this machine's door at
+# it, so a third machine asking for "this machine's workspace" would be handed a
+# tree from somewhere else, over two hops. It also made every "ssh mount"
+# recreate the door, which is a container nothing asked to disturb.
+#
+# BOX_SSH_LOCAL_WORKSPACE_HOST is exactly "what the workspace was before a mount
+# took it over", written by "ssh mount" and cleared by "ssh eject", so it is set
+# precisely when BOX_WORKSPACE_HOST is the wrong answer here.
+export BOX_SSH_WORKSPACE_HOST="${BOX_SSH_LOCAL_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST}}"
+
+# Same reasoning as the agent profile above: a claudebox that was not asked to
+# serve its workspace never creates the service and never publishes a port.
+if [ -n "${BOX_SSH_SERVE}" ]; then
+    COMPOSE+=(--profile ssh)
 fi
 
 export BOX_RUNNER="${BOX_RUNNER:-}"
@@ -302,6 +359,19 @@ compose_up() {
 
 require_workspace() {
     local store shared entry ok=""
+
+    # A remote workspace that is no longer mounted. Its own check, and fatal,
+    # because it is the failure that looks like nothing at all: an sshfs mount
+    # that dropped leaves an empty directory exactly where a workspace used to
+    # be, the bind then succeeds, and the session comes up seeing no projects
+    # with nothing anywhere saying why.
+    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] && ! ssh_is_mounted; then
+        echo "claudebox: the workspace is a remote one (${BOX_SSH_REMOTE:-unknown}) and it is not" >&2
+        echo "claudebox: mounted -- ${SSH_MOUNTPOINT} is just an empty directory right now." >&2
+        echo "claudebox: 'claudebox ssh mount' remounts it; 'claudebox ssh eject' gives the" >&2
+        echo "claudebox: local workspace back instead." >&2
+        exit 1
+    fi
 
     if [ ! -d "${BOX_WORKSPACE_HOST}" ]; then
         echo "claudebox: workspace ${BOX_WORKSPACE_HOST} does not exist (or is not a directory)" >&2
@@ -676,6 +746,33 @@ media_rm() {
 # -- and from then on the launcher hands them to runner-relay and to nothing
 # else. The box never sees any of them.
 # ---------------------------------------------------------------------------
+# What the settings file says for one key, ignoring the environment.
+#
+# Needed because the environment winning is the documented rule, and a command
+# that has to UNDO a setting it wrote earlier cannot ask the resolved variable
+# what is in the file -- a shell profile exporting the same name makes the two
+# disagree, and the undo then decides there is nothing to undo. "claudebox ssh
+# eject" is exactly that command.
+config_get() {
+    local key="${1}" line value
+    [ -f "${BOX_CONFIG}" ] || return 1
+    line="$(grep -E "^[[:space:]]*${key}=" "${BOX_CONFIG}" 2>/dev/null | tail -1)"
+    [ -n "${line}" ] || return 1
+    # Values are written with %q, so the shell is what unquotes them. The file is
+    # sourced whole a few lines above; evaluating one line of it is nothing new.
+    eval "value=${line#*=}" 2>/dev/null || return 1
+    printf '%s' "${value}"
+}
+
+# Is this setting one the environment is currently overriding? See
+# BOX_SETTINGS_FROM_ENV, built where both values were still separate.
+setting_shadowed() {
+    case " ${BOX_SETTINGS_FROM_ENV} " in
+        *" ${1} "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 config_set() {
     local key="${1}" value="${2}" tmp
     if [ ! -f "${BOX_CONFIG}" ]; then
@@ -692,6 +789,21 @@ config_set() {
     # file holds a bearer token for another machine.
     chmod 0600 "${tmp}"
     mv -- "${tmp}" "${BOX_CONFIG}"
+
+    # Written, and about to be ignored. A shell profile that exports the same
+    # name beats the file on every future run, so the command that just "worked"
+    # changes nothing at all -- worth a line here rather than a puzzle later.
+    # Only when it actually differs. A value written that happens to match what
+    # the environment already says is not being ignored -- it is being agreed
+    # with, and warning about it is noise.
+    if setting_shadowed "${key}" && [ "${value}" != "${!key-}" ]; then
+        {
+            echo "claudebox: warning: ${key} is exported in this environment, and the environment"
+            echo "claudebox: wins over ${BOX_CONFIG}. What was just written there will not take"
+            echo "claudebox: effect while that export stands -- it is probably in ~/.bashrc or"
+            echo "claudebox: ~/.profile. Remove it, or start a shell without it."
+        } >&2
+    fi
 }
 
 runner_usage() {
@@ -1379,6 +1491,787 @@ agent_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# The workspace over ssh, both halves
+#
+# SERVING (claudebox ssh start): a container running sshd over the same bind the
+# box gets, published on the LAN. Another machine mounts it with sshfs and runs
+# its own claudebox against this tree -- one workspace, two machines, no copy to
+# keep in step and no branch to push to hand work over.
+#
+# MOUNTING (claudebox ssh mount): the other end. The mount is made ON THE HOST,
+# not in a container, and that is not a preference -- a bind source is resolved
+# by the Docker daemon, so a filesystem that exists only inside some container
+# is not something the box can be given. It goes at ${BOX_DIR}/remote-workspace
+# and BOX_WORKSPACE_HOST is pointed at it, which is the same mechanism that
+# already puts the workspace on another drive. The box sees a perfectly ordinary
+# ${BOX_WORKSPACE}.
+#
+# Keys only. Password authentication is off in sshd_config and the account has
+# no password to begin with, so joining is "claudebox ssh mount" printing this
+# machine's public key and "claudebox ssh authorize" over there accepting it --
+# ssh-copy-id by hand, and one line to carry rather than a private key. The
+# host key is pinned on first mount, in a known_hosts file of this tool's own,
+# and a fingerprint that later changes stops the mount instead of asking.
+# ---------------------------------------------------------------------------
+
+# Where the client half keeps its half of all that: this machine's key, and the
+# host keys it has pinned. Its own directory rather than ~/.ssh -- these belong
+# to claudebox, they are generated without asking, and "claudebox ssh forget"
+# should not be able to reach anything a person put in ~/.ssh themselves.
+SSH_CLIENT_DIR="${BOX_DIR}/ssh-client"
+SSH_CLIENT_KEY="${SSH_CLIENT_DIR}/id_ed25519"
+SSH_KNOWN_HOSTS="${SSH_CLIENT_DIR}/known_hosts"
+# One mountpoint, because BOX_WORKSPACE_HOST is one setting: a second remote
+# workspace mounted at the same time would have nothing pointing at it.
+SSH_MOUNTPOINT="${BOX_DIR}/remote-workspace"
+
+ssh_usage() {
+    cat >&2 <<'USAGE'
+usage: claudebox ssh <start|stop|status|authorize>  on the machine that HAS the workspace
+       claudebox ssh <mount|eject>                  on the machine that wants to use it
+
+  Serving it -- run these where the source tree actually is:
+    start   Bring the workspace door up: sshd over the same tree the box works
+            in, published on the LAN (BOX_SSH_PORT, default 7994). Prints the
+            address, the port and the host key fingerprint to compare.
+    stop    Take it down. The host key and the authorised keys are kept, so
+            "start" brings the same door back and nothing has to re-join.
+    status  Whether it is up, its fingerprint, and which keys may log in.
+    authorize '<public key>'
+            Let a machine in, using the line "claudebox ssh mount" printed over
+            there. This is the only way in: there is no password.
+
+  Using it -- run these on the other machine:
+    mount [user@]<host>[:port]
+            Mount that machine's workspace here over sshfs and point claudebox
+            at it, so the next "claudebox" runs against the remote tree. The
+            host key is pinned on first mount. With no argument, remounts the
+            one already joined.
+    eject   Unmount it and go back to the local workspace. Stops the box first,
+            because a running container holds the mount open -- the same trap
+            "claudebox eject" exists for on a removable drive.
+
+The mount is a host mount, not a container one: Docker resolves bind sources
+itself, so a filesystem only some container can see is not one the box can be
+given. It goes at ~/.claudebox/remote-workspace and BOX_WORKSPACE_HOST is
+pointed there -- the same setting that puts a workspace on another drive.
+USAGE
+}
+
+# host, port and login name out of "[user@]host[:port]".
+#
+# Sets ssh_remote_user / ssh_remote_host / ssh_remote_port. The user defaults to
+# BOX_USER, which is right whenever both machines are set up the same way and is
+# the reason the argument is usually just an address.
+ssh_parse_remote() {
+    local spec="${1}"
+    ssh_remote_user="${BOX_USER}"
+    case "${spec}" in
+        *@*) ssh_remote_user="${spec%%@*}"; spec="${spec#*@}" ;;
+    esac
+    # Rightmost colon only, and only when what follows is digits: this leaves an
+    # IPv6 literal alone rather than reading half of it as a port.
+    ssh_remote_port="${BOX_SSH_PORT}"
+    case "${spec}" in
+        *:[0-9]*)
+            if [[ "${spec##*:}" =~ ^[0-9]+$ ]]; then
+                ssh_remote_port="${spec##*:}"
+                spec="${spec%:*}"
+            fi
+            ;;
+    esac
+    ssh_remote_host="${spec}"
+    if [ -z "${ssh_remote_host}" ]; then
+        echo "claudebox: '${1}' has no host in it" >&2
+        return 1
+    fi
+}
+
+# The addresses this machine can be reached at, for the line to type over there.
+#
+# Advisory: a machine with several interfaces has no single right answer, so
+# this prints what it finds rather than choosing. It does drop the ones that are
+# certainly wrong -- every bridge Docker has made, this stack's own networks
+# included, which a host on the LAN cannot reach and which on a machine running
+# DDEV outnumber the real answer four to one.
+ssh_lan_addresses() {
+    local addrs=""
+    if command -v ip >/dev/null 2>&1; then
+        addrs="$(ip -4 -o addr show scope global 2>/dev/null \
+            | awk '$2 !~ /^(docker|br-|veth|virbr|tun|tap)/ {print $4}' \
+            | cut -d/ -f1)"
+    fi
+    if [ -z "${addrs}" ] && command -v hostname >/dev/null 2>&1; then
+        addrs="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' || true)"
+    fi
+    printf '%s' "${addrs}"
+}
+
+ssh_serving() {
+    docker inspect claudebox-ssh >/dev/null 2>&1
+}
+
+# Bring the door up, and turn it on so it comes back with the stack.
+#
+# Only this service, not the whole stack: it needs the workspace bind and
+# nothing else -- no dind, no proxy, no box -- so a machine can hand its
+# workspace out without running an agent at all. The workspace check still runs,
+# because serving a directory Docker invented on the spot is the one failure
+# that would look like success on both machines.
+ssh_start() {
+    # This machine is currently working in a borrowed workspace. The door still
+    # serves the LOCAL tree -- see BOX_SSH_WORKSPACE_HOST -- which is almost
+    # certainly what is wanted, and is not what "the workspace" means anywhere
+    # else in this launcher right now. Say which one it is rather than leaving
+    # the two to be confused.
+    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ]; then
+        echo "claudebox: note: this machine is working in ${BOX_SSH_REMOTE:-a remote workspace}," >&2
+        echo "claudebox: so the door serves the LOCAL tree (${BOX_SSH_WORKSPACE_HOST}), not that one." >&2
+    fi
+
+    require_workspace
+
+    if [ ! -d "${BOX_SSH_WORKSPACE_HOST}" ]; then
+        echo "claudebox: the tree to serve, ${BOX_SSH_WORKSPACE_HOST}, is not there" >&2
+        return 1
+    fi
+
+    echo "claudebox: starting the workspace door..." >&2
+    if ! "${COMPOSE[@]}" --profile ssh up -d ssh; then
+        echo "claudebox: the workspace door did not start; 'docker logs claudebox-ssh' has why" >&2
+        return 1
+    fi
+
+    if [ -z "${BOX_SSH_SERVE}" ]; then
+        config_set BOX_SSH_SERVE 1
+        echo "claudebox: workspace door turned on (BOX_SSH_SERVE=1 in ${BOX_CONFIG})" >&2
+    fi
+    export BOX_SSH_SERVE=1
+
+    # The host key is generated by the entrypoint, so it exists a moment after
+    # the container does rather than at once.
+    local i
+    for i in $(seq 1 40); do
+        if docker exec claudebox-ssh test -s /var/lib/claudebox-ssh/fingerprint 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+
+    ssh_status
+}
+
+# The pair of ssh_start. The identity is deliberately left alone: it lives in
+# the ssh-state volume, and dropping it would issue a new host key that every
+# machine which ever mounted this workspace has pinned -- all of them would
+# refuse to mount until they re-pinned. Turning the door off is a thing you do
+# for an afternoon. "docker volume rm claudebox_ssh-state" is how to ask for the
+# other thing on purpose.
+ssh_stop() {
+    local was_up=""
+    if ssh_serving; then
+        was_up=1
+    fi
+    if [ -z "${BOX_SSH_SERVE}" ] && [ -z "${was_up}" ]; then
+        echo "claudebox: the workspace door is already off here" >&2
+        return 0
+    fi
+
+    # The container first, while this invocation still selects the ssh profile:
+    # a later "up" that is not selecting it does not remove the service, it
+    # leaves it running as an orphan.
+    if [ -n "${was_up}" ]; then
+        "${COMPOSE[@]}" --profile ssh rm -sf ssh >/dev/null 2>&1 \
+            || docker rm -f claudebox-ssh >/dev/null 2>&1 || true
+        echo "claudebox: workspace door stopped" >&2
+    fi
+
+    config_set BOX_SSH_SERVE ""
+    export BOX_SSH_SERVE=""
+    echo "claudebox: workspace door off (BOX_SSH_SERVE cleared in ${BOX_CONFIG})" >&2
+    echo "claudebox: the host key and the authorised keys are kept, so 'claudebox ssh start'" >&2
+    echo "claudebox: brings the same door back and nothing has to be re-authorised." >&2
+}
+
+ssh_status() {
+    local fp addrs keys
+
+    if ! ssh_serving; then
+        if [ -n "${BOX_SSH_REMOTE}" ]; then
+            ssh_mount_status
+            return 0
+        fi
+        echo "claudebox: the workspace door is not running here ('claudebox ssh start' starts it)" >&2
+        return 0
+    fi
+
+    fp="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n')"
+    printf 'workspace door: up, published on :%s\n' "${BOX_SSH_PORT}"
+    printf 'serving:        %s (as %s)\n' "${BOX_SSH_WORKSPACE_HOST}" "${BOX_USER}"
+    printf 'host key:       %s\n' "${fp:-(unknown)}"
+
+    keys="$(docker exec claudebox-ssh claudebox-ssh-authorize --list 2>/dev/null || true)"
+    if [ -n "${keys}" ]; then
+        printf 'authorised:\n%s\n' "${keys}"
+    else
+        printf 'authorised:     nobody yet\n'
+    fi
+
+    addrs="$(ssh_lan_addresses)"
+    {
+        echo
+        echo "On the other machine:"
+        echo
+        while IFS= read -r a; do
+            [ -n "${a}" ] || continue
+            echo "    claudebox ssh mount ${a}:${BOX_SSH_PORT}"
+        done <<< "${addrs:-<this-machine>}"
+        echo
+        echo "It will print that machine's public key and the 'claudebox ssh authorize'"
+        echo "line to run back here. Compare the host key fingerprint it shows with the"
+        echo "one above before accepting it."
+        echo
+    } >&2
+}
+
+ssh_authorize() {
+    local key="${*}"
+    if [ -z "${key}" ]; then
+        echo "usage: claudebox ssh authorize '<public key>'" >&2
+        return 2
+    fi
+    if ! ssh_serving; then
+        echo "claudebox: the workspace door is not running here -- 'claudebox ssh start' first" >&2
+        return 1
+    fi
+    # Through the container because that is where the file is: authorized_keys
+    # lives in the ssh-state volume, so there is nothing on the host to edit and
+    # no second copy to drift.
+    docker exec claudebox-ssh claudebox-ssh-authorize "${key}"
+}
+
+# ---------------------------------------------------------------------------
+# The mounting half
+# ---------------------------------------------------------------------------
+
+# Is the mountpoint actually carrying an sshfs mount right now?
+#
+# Worth its own function because the failure it distinguishes is the quiet one:
+# an empty directory and a dropped mount look identical, and the box coming up
+# over the first is a session that sees no projects and says nothing.
+ssh_is_mounted() {
+    local fstype
+    fstype="$(findmnt -no FSTYPE --mountpoint "${SSH_MOUNTPOINT}" 2>/dev/null || true)"
+    case "${fstype}" in
+        fuse.sshfs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_mount_status() {
+    if ssh_is_mounted; then
+        printf 'remote workspace: %s, mounted at %s\n' "${BOX_SSH_REMOTE}" "${SSH_MOUNTPOINT}"
+        printf 'host key:         %s\n' "${BOX_SSH_FINGERPRINT:-(unpinned)}"
+        if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ]; then
+            printf 'in use:           yes -- claudebox runs against it\n'
+        else
+            printf 'in use:           no -- BOX_WORKSPACE_HOST is %s\n' "${BOX_WORKSPACE_HOST}"
+        fi
+    else
+        printf 'remote workspace: %s, NOT mounted ("claudebox ssh mount" remounts it)\n' \
+            "${BOX_SSH_REMOTE:-(none joined)}"
+    fi
+}
+
+# Everything the mount needs that this machine has to supply itself. Checked up
+# front and named individually, because each one fails differently and only one
+# of them fails in a way that says what it is.
+ssh_mount_preflight() {
+    local missing=""
+    command -v sshfs      >/dev/null 2>&1 || missing="${missing} sshfs"
+    command -v ssh-keygen >/dev/null 2>&1 || missing="${missing} ssh-keygen"
+    command -v ssh-keyscan >/dev/null 2>&1 || missing="${missing} ssh-keyscan"
+    command -v sftp       >/dev/null 2>&1 || missing="${missing} sftp"
+    command -v findmnt    >/dev/null 2>&1 || missing="${missing} findmnt"
+    if [ -n "${missing}" ]; then
+        echo "claudebox: missing:${missing}" >&2
+        echo "claudebox: on Debian/Ubuntu: sudo apt install sshfs openssh-client util-linux" >&2
+        return 1
+    fi
+
+    # allow_other is what lets a process that is not this user cross the mount,
+    # and the Docker daemon -- which is root, and which is what resolves a bind
+    # source -- is exactly such a process. Without it the daemon cannot stat the
+    # mountpoint and the box fails to start with a permission error naming a
+    # path that is plainly there. FUSE only honours the option for a non-root
+    # user when /etc/fuse.conf says so, so check that rather than discovering it
+    # two commands later.
+    if [ "$(id -u)" != "0" ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+        {
+            echo "claudebox: /etc/fuse.conf does not have user_allow_other, so this mount could"
+            echo "claudebox: not be crossed by the Docker daemon -- which is root, and which is"
+            echo "claudebox: what resolves the box's bind source. Add it once:"
+            echo "claudebox:"
+            echo "claudebox:     echo user_allow_other | sudo tee -a /etc/fuse.conf"
+            echo "claudebox:"
+        } >&2
+        return 1
+    fi
+}
+
+# This machine's key, generated on first use.
+#
+# Its own, not ~/.ssh/id_*: claudebox generating a key without being asked has
+# no business putting it where a person keeps theirs, and a key that exists only
+# for this makes "which machines can reach my workspace" answerable by looking
+# at one authorized_keys file.
+ssh_client_key() {
+    mkdir -p "${SSH_CLIENT_DIR}"
+    chmod 0700 "${SSH_CLIENT_DIR}"
+    if [ ! -f "${SSH_CLIENT_KEY}" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C "claudebox@$(hostname -s 2>/dev/null || hostname)" \
+            -f "${SSH_CLIENT_KEY}" || return 1
+        echo "claudebox: generated this machine's key (${SSH_CLIENT_KEY})" >&2
+    fi
+    chmod 0600 "${SSH_CLIENT_KEY}"
+}
+
+# Pin the far side's host key, or check it against what was pinned before.
+#
+# Trust on first sight, and then never again -- the same bargain ssh makes the
+# first time it shows a host key, and the same one the agent door's certificate
+# makes. What it buys is that everything after the first mount is checked: a
+# machine that answers on that address later with a different key gets a refusal
+# here rather than a prompt, because there is nobody at a terminal to read a
+# prompt when this runs from a script.
+ssh_pin_host() {
+    local host="${1}" port="${2}" scanned fp
+
+    mkdir -p "${SSH_CLIENT_DIR}"
+    chmod 0700 "${SSH_CLIENT_DIR}"
+    touch "${SSH_KNOWN_HOSTS}"
+    chmod 0600 "${SSH_KNOWN_HOSTS}"
+
+    scanned="$(ssh-keyscan -T 8 -t ed25519 -p "${port}" "${host}" 2>/dev/null | grep -v '^#' || true)"
+    if [ -z "${scanned}" ]; then
+        {
+            echo "claudebox: nothing answered on ${host}:${port}."
+            echo "claudebox: On that machine, 'claudebox ssh start' brings the door up and"
+            echo "claudebox: 'claudebox ssh status' prints the address to use here."
+        } >&2
+        return 1
+    fi
+
+    fp="$(printf '%s\n' "${scanned}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -1)"
+    if [ -z "${fp}" ]; then
+        echo "claudebox: ${host}:${port} answered with something that is not a host key" >&2
+        return 1
+    fi
+
+    # What is already in known_hosts for this address, if anything, is the first
+    # thing the scan is checked against -- and it is the check that closes the
+    # window between a first mount that failed and the one that succeeds.
+    # BOX_SSH_FINGERPRINT is only written on a SUCCESSFUL mount, so up to then
+    # the config knows nothing, and a pin rewritten from a fresh scan on every
+    # attempt would take a new key without a word. known_hosts is per-address and
+    # was written by the first attempt, so it is what remembers.
+    local known known_fp=""
+    known="$(grep -F "[${host}]:${port} " "${SSH_KNOWN_HOSTS}" 2>/dev/null | head -1 || true)"
+    if [ -n "${known}" ]; then
+        known_fp="$(printf '%s\n' "${known}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
+    fi
+    if [ -n "${known_fp}" ] && [ "${known_fp}" != "${fp}" ]; then
+        {
+            echo "claudebox: ${host}:${port} presented a DIFFERENT host key than the one this"
+            echo "claudebox: machine pinned earlier."
+            echo "claudebox:   pinned:    ${known_fp}"
+            echo "claudebox:   presented: ${fp}"
+            echo "claudebox: 'claudebox ssh forget' drops the pin if the key really was rotated"
+            echo "claudebox: over there -- check with 'claudebox ssh status' on that machine first."
+        } >&2
+        return 1
+    fi
+
+    # Only against the remote it was taken from. BOX_SSH_FINGERPRINT is one
+    # setting because BOX_WORKSPACE_HOST is one setting, so it describes the
+    # machine in BOX_SSH_REMOTE and nothing else -- checking a second machine's
+    # key against it would refuse it as an impostor for having a different
+    # identity, which is the one thing it is guaranteed to have. Mounting a
+    # different address is a re-join, and it re-pins. known_hosts, which is
+    # per-host, is what keeps that from being a hole.
+    if [ -n "${BOX_SSH_FINGERPRINT}" ] \
+       && [ "${BOX_SSH_REMOTE##*@}" = "${host}:${port}" ] \
+       && [ "${BOX_SSH_FINGERPRINT}" != "${fp}" ]; then
+        {
+            echo "claudebox: ${host}:${port} presented a DIFFERENT host key than the one pinned."
+            echo "claudebox:   pinned:    ${BOX_SSH_FINGERPRINT}"
+            echo "claudebox:   presented: ${fp}"
+            echo "claudebox: Either the workspace door's state volume was recreated over there,"
+            echo "claudebox: or this is not that machine. Check with 'claudebox ssh status' on"
+            echo "claudebox: it; if the key really was rotated, 'claudebox ssh forget' here"
+            echo "claudebox: drops the pin so the next mount takes the new one."
+        } >&2
+        return 1
+    fi
+
+    # Rewrite this host's lines rather than appending: re-pinning after a
+    # deliberate rotation would otherwise leave the old key in the file, where
+    # ssh finds it first and refuses.
+    local tmp
+    tmp="$(mktemp "${SSH_KNOWN_HOSTS}.XXXXXX")"
+    grep -v -F "[${host}]:${port}" "${SSH_KNOWN_HOSTS}" > "${tmp}" 2>/dev/null || true
+    printf '%s\n' "${scanned}" >> "${tmp}"
+    chmod 0600 "${tmp}"
+    mv -- "${tmp}" "${SSH_KNOWN_HOSTS}"
+
+    ssh_pinned_fingerprint="${fp}"
+    if [ -z "${BOX_SSH_FINGERPRINT}" ] && [ -z "${known_fp}" ]; then
+        echo "claudebox: pinned host key ${fp}" >&2
+        echo "claudebox: compare it with what 'claudebox ssh status' prints over there" >&2
+    fi
+}
+
+# Ask the far side whether it would let us in, before asking sshfs to mount.
+#
+# Because sshfs does not pass the answer on. A refused key comes back from it as
+# "read: Connection reset by peer" and nothing else -- the "Permission denied
+# (publickey)" that ssh actually printed is consumed somewhere between the two,
+# so the one failure every new machine starts in is also the one sshfs describes
+# worst.
+#
+# "sftp -b -" fed a single "quit" is the probe rather than "ssh <host> true"
+# because it exercises exactly what sshfs will: the same authentication AND the
+# sftp subsystem behind it, which is the other thing that can be missing on the
+# far side. It exits 255 and says why.
+ssh_probe() {
+    local host="${1}" port="${2}" user="${3}"
+    printf 'quit\n' | sftp -b - -P "${port}" \
+        -o IdentityFile="${SSH_CLIENT_KEY}" \
+        -o IdentitiesOnly=yes \
+        -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" \
+        -o StrictHostKeyChecking=yes \
+        -o BatchMode=yes \
+        "${user}@${host}" 2>&1
+}
+
+# Is the door at the far end this machine's own?
+#
+# By fingerprint rather than by address, because the address it was reached at
+# proves nothing: 127.0.0.1, the LAN address, and the machine's own hostname are
+# all the same door, and a comparison of strings would miss two of the three.
+ssh_is_own_door() {
+    local fp="${1}" mine
+    ssh_serving || return 1
+    mine="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n')"
+    [ -n "${mine}" ] && [ "${mine}" = "${fp}" ]
+}
+
+# What to say when the far side refuses the key -- which is the ordinary state
+# of a first mount, not an error, and the one moment the two-machine dance needs
+# explaining.
+ssh_not_authorized_yet() {
+    local host="${1}" port="${2}" pub
+    pub="$(cat "${SSH_CLIENT_KEY}.pub")"
+    {
+        echo
+        echo "claudebox: ${host}:${port} would not let this machine in yet."
+        echo "claudebox: On THAT machine, run:"
+        echo
+        echo "    claudebox ssh authorize '${pub}'"
+        echo
+        echo "claudebox: then run this again. That key is this machine's; it is public,"
+        echo "claudebox: and pasting it anywhere is safe."
+        echo
+    } >&2
+}
+
+ssh_mount() {
+    local spec="${1:-}" out rc=""
+
+    ssh_mount_preflight || return 1
+
+    if [ -z "${spec}" ]; then
+        if [ -z "${BOX_SSH_REMOTE}" ]; then
+            echo "claudebox: no remote workspace joined yet" >&2
+            echo "claudebox: usage: claudebox ssh mount [user@]<host>[:port]" >&2
+            return 2
+        fi
+        spec="${BOX_SSH_REMOTE}"
+    fi
+    ssh_parse_remote "${spec}" || return 1
+
+    if ssh_is_mounted; then
+        echo "claudebox: ${BOX_SSH_REMOTE:-a remote workspace} is already mounted at ${SSH_MOUNTPOINT}" >&2
+        echo "claudebox: 'claudebox ssh eject' unmounts it first" >&2
+        return 0
+    fi
+
+    ssh_client_key || return 1
+    ssh_pinned_fingerprint=""
+    ssh_pin_host "${ssh_remote_host}" "${ssh_remote_port}" || return 1
+
+    # Never this machine's own door. It looks like the obvious way to try the
+    # feature out without a second machine; it wedges the Docker daemon.
+    #
+    # Measured here, and the reason this is a refusal and not a warning: the
+    # door, the box and dind are all services in ONE compose project, and all
+    # three carry the workspace bind. Pointing BOX_WORKSPACE_HOST at the local
+    # mount changes the bind source for every one of them, so the next launch
+    # recreates THE DOOR TOO -- killing the sshd that this machine's own sshfs
+    # mount is talking to. sshfs is mounted with -o reconnect, so rather than
+    # failing it blocks; and the next thing to touch that mountpoint is dockerd,
+    # resolving the bind source for the box. It blocks in the kernel holding
+    # that container's lock: the box sits in "Created", "docker inspect
+    # claudebox" and "docker logs claudebox" hang while the rest of the daemon
+    # answers normally, and nothing short of a reboot clears it.
+    #
+    # Two machines cannot reach this state. A "compose up" on the machine that
+    # MOUNTED the workspace does not touch the machine serving it, which is the
+    # whole difference.
+    if ssh_is_own_door "${ssh_pinned_fingerprint}"; then
+        {
+            echo "claudebox: ${ssh_remote_host}:${ssh_remote_port} is THIS machine's own workspace door."
+            echo "claudebox:"
+            echo "claudebox: Mounting it here would put the sshd, the box and dind in one compose"
+            echo "claudebox: project over one sshfs mount -- and the next launch, which recreates"
+            echo "claudebox: all three, would stop the sshd while the mount is still live. The"
+            echo "claudebox: mount then blocks forever (it is mounted with reconnect), dockerd"
+            echo "claudebox: blocks on it while resolving the box's bind source, and the daemon"
+            echo "claudebox: needs a reboot. Refusing rather than letting that happen."
+            echo "claudebox:"
+            echo "claudebox: This command belongs on the OTHER machine -- the one that does not"
+            echo "claudebox: have the tree. The workspace is already here."
+        } >&2
+        return 1
+    fi
+
+    # Docker creates a missing bind source as a root-owned directory, and a
+    # root-owned mountpoint is one this user cannot mount on. Make it first, and
+    # only when it is not already there -- an existing one may be someone's.
+    mkdir -p "${SSH_MOUNTPOINT}"
+
+    # A non-empty mountpoint is a real signal here rather than a nuisance: it
+    # means a previous mount dropped and left files written underneath it, and
+    # mounting over them hides them for as long as the mount lasts.
+    if [ -n "$(ls -A -- "${SSH_MOUNTPOINT}" 2>/dev/null)" ]; then
+        echo "claudebox: warning: ${SSH_MOUNTPOINT} is not empty -- something was written there" >&2
+        echo "claudebox: while nothing was mounted. Those files are hidden, not lost, while" >&2
+        echo "claudebox: the mount is up." >&2
+    fi
+
+    # Ask first, so a refusal is reported as a refusal. Everything after this
+    # point has been proved to authenticate and to speak sftp, which makes an
+    # sshfs failure below a mount problem and worth printing verbatim.
+    out="$(ssh_probe "${ssh_remote_host}" "${ssh_remote_port}" "${ssh_remote_user}")" || rc=$?
+    if [ -n "${rc:-}" ]; then
+        case "${out}" in
+            *"Permission denied"*|*"publickey"*)
+                ssh_not_authorized_yet "${ssh_remote_host}" "${ssh_remote_port}"
+                ;;
+            *"subsystem request failed"*)
+                echo "claudebox: ${ssh_remote_host}:${ssh_remote_port} let this machine in but does not" >&2
+                echo "claudebox: speak sftp, which is what sshfs mounts with. That is a workspace" >&2
+                echo "claudebox: door built without openssh-sftp-server -- 'claudebox rebuild' over" >&2
+                echo "claudebox: there, then 'claudebox ssh start' again." >&2
+                ;;
+            *)
+                echo "claudebox: could not reach ${ssh_remote_host}:${ssh_remote_port}" >&2
+                if [ -n "${out}" ]; then
+                    printf '%s\n' "${out}" >&2
+                fi
+                ;;
+        esac
+        return 1
+    fi
+
+    # -o allow_other:      the Docker daemon is root and has to cross this
+    # -o default_permissions: with the ids forced below, let the kernel do the
+    #                      permission checks rather than the remote sshd
+    # -o uid/gid:          the tree in the box is owned by the box user; force
+    #                      the same ids here so a uid that differs between the
+    #                      two machines does not turn the whole tree read-only
+    # -o reconnect + keepalives: a laptop lid, a sleeping switch. Without these
+    #                      the mount goes to "Transport endpoint is not
+    #                      connected" and stays there.
+    # -o BatchMode:        never prompt. This can run from a script, and a
+    #                      passphrase prompt nobody sees is a hang.
+    out="$(sshfs "${ssh_remote_user}@${ssh_remote_host}:" "${SSH_MOUNTPOINT}" \
+            -p "${ssh_remote_port}" \
+            -o IdentityFile="${SSH_CLIENT_KEY}" \
+            -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o allow_other \
+            -o default_permissions \
+            -o uid="${BOX_UID}" \
+            -o gid="${BOX_GID}" \
+            -o reconnect \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o Compression=no \
+            2>&1)" && rc=0 || rc=$?
+
+    if [ "${rc}" != "0" ] || ! ssh_is_mounted; then
+        # The probe above already cleared authentication and the sftp subsystem,
+        # so whatever this is, it is about the mount and nothing here can improve
+        # on sshfs's own words.
+        echo "claudebox: could not mount ${ssh_remote_host}:${ssh_remote_port}" >&2
+        if [ -n "${out}" ]; then
+            printf '%s\n' "${out}" >&2
+        fi
+        fusermount3 -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 \
+            || fusermount -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Prove it is readable before anything is pointed at it. sshfs mounts
+    # optimistically -- the mount appears whether or not the remote directory
+    # can actually be listed -- and a workspace that answers EIO on every read
+    # is worse than one that failed to mount.
+    if ! ls -A -- "${SSH_MOUNTPOINT}" >/dev/null 2>&1; then
+        echo "claudebox: mounted, but ${SSH_MOUNTPOINT} cannot be read; unmounting again" >&2
+        fusermount3 -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 \
+            || fusermount -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    config_set BOX_SSH_REMOTE "${ssh_remote_user}@${ssh_remote_host}:${ssh_remote_port}"
+    if [ -n "${ssh_pinned_fingerprint}" ]; then
+        config_set BOX_SSH_FINGERPRINT "${ssh_pinned_fingerprint}"
+    fi
+
+    # Remember what the workspace was before taking it over, so "eject" has
+    # something to put back. Guarded against a second mount overwriting it with
+    # the mountpoint itself, which would make the local workspace unrecoverable
+    # from the config file.
+    if [ "${BOX_WORKSPACE_HOST}" != "${SSH_MOUNTPOINT}" ]; then
+        config_set BOX_SSH_LOCAL_WORKSPACE_HOST "${BOX_WORKSPACE_HOST}"
+    fi
+    config_set BOX_WORKSPACE_HOST "${SSH_MOUNTPOINT}"
+
+    {
+        echo "claudebox: mounted ${ssh_remote_user}@${ssh_remote_host}:${ssh_remote_port} at ${SSH_MOUNTPOINT}"
+        echo "claudebox: BOX_WORKSPACE_HOST now points there, so the next 'claudebox' works"
+        echo "claudebox: against the remote tree -- inside the box it is still ${BOX_WORKSPACE}."
+        echo "claudebox: 'claudebox ssh eject' puts it back."
+    } >&2
+
+    # A box that is already running holds the OLD workspace in its mount
+    # namespace; compose recreates it on the next launch because the bind
+    # source changed, but until then a session in it is still on the local
+    # tree. Say so rather than leaving the two disagreeing quietly.
+    if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+        echo "claudebox: the box is running on the old workspace; the next 'claudebox'" >&2
+        echo "claudebox: recreates it against this one." >&2
+    fi
+}
+
+# Unmount, and give the local workspace back.
+#
+# Stop the stack first, and that ordering is the whole point of this command
+# rather than a bare fusermount -- a container that has the mount bound into it
+# holds the FUSE filesystem in its own namespace, so the unmount fails with
+# "Device or resource busy" (or, worse, succeeds while the container reads on).
+# It is exactly the trap "claudebox eject" documents for a removable drive,
+# arrived at from the other direction.
+ssh_eject() {
+    local prev pointed_at
+
+    # What the FILE says, not what this process resolved: a shell profile
+    # exporting BOX_WORKSPACE_HOST beats the file, and eject deciding from the
+    # resolved value would leave the file still pointing at a mountpoint that is
+    # no longer mounted -- which is the state the launcher now refuses to start
+    # over.
+    pointed_at="$(config_get BOX_WORKSPACE_HOST || true)"
+
+    if ! ssh_is_mounted; then
+        echo "claudebox: nothing is mounted at ${SSH_MOUNTPOINT}" >&2
+        # The pointer can outlive the mount -- a reboot, a killed sshfs -- and a
+        # BOX_WORKSPACE_HOST left aimed at an empty directory is precisely the
+        # "workspace with no projects in it" failure. Clean it up anyway.
+        if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] || [ "${pointed_at}" = "${SSH_MOUNTPOINT}" ]; then
+            prev="${BOX_SSH_LOCAL_WORKSPACE_HOST:-$(config_get BOX_SSH_LOCAL_WORKSPACE_HOST || true)}"
+            config_set BOX_WORKSPACE_HOST "${prev}"
+            config_set BOX_SSH_LOCAL_WORKSPACE_HOST ""
+            echo "claudebox: BOX_WORKSPACE_HOST was still pointing at it; set back to ${prev:-the default}" >&2
+        fi
+        return 0
+    fi
+
+    echo "claudebox: stopping the box, which holds the mount open" >&2
+    "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+
+    # -z last, and only last. A mount whose server has gone does not answer, so
+    # a plain unmount can block on it exactly the way everything else does; the
+    # lazy one detaches it from the tree without asking the filesystem's
+    # permission, which is the difference between a machine that recovers and
+    # one that reboots.
+    if ! fusermount3 -u "${SSH_MOUNTPOINT}" 2>/dev/null \
+       && ! fusermount -u "${SSH_MOUNTPOINT}" 2>/dev/null \
+       && ! umount "${SSH_MOUNTPOINT}" 2>/dev/null \
+       && ! fusermount3 -uz "${SSH_MOUNTPOINT}" 2>/dev/null \
+       && ! fusermount -uz "${SSH_MOUNTPOINT}" 2>/dev/null \
+       && ! umount -l "${SSH_MOUNTPOINT}" 2>/dev/null; then
+        {
+            echo "claudebox: could not unmount ${SSH_MOUNTPOINT} -- something still holds it."
+            echo "claudebox: 'lsof ${SSH_MOUNTPOINT}' (or fuser -vm) will name it. A shell whose"
+            echo "claudebox: working directory is inside the mount is the usual answer."
+        } >&2
+        return 1
+    fi
+
+    prev="${BOX_SSH_LOCAL_WORKSPACE_HOST:-$(config_get BOX_SSH_LOCAL_WORKSPACE_HOST || true)}"
+    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] || [ "${pointed_at}" = "${SSH_MOUNTPOINT}" ]; then
+        config_set BOX_WORKSPACE_HOST "${prev}"
+        config_set BOX_SSH_LOCAL_WORKSPACE_HOST ""
+    fi
+
+    echo "claudebox: unmounted ${SSH_MOUNTPOINT}" >&2
+    echo "claudebox: the workspace is ${prev:-${BOX_WORKSPACE}} again" >&2
+    echo "claudebox: the pin and this machine's key are kept -- 'claudebox ssh mount' with no" >&2
+    echo "claudebox: argument goes back." >&2
+}
+
+ssh_forget() {
+    if [ -z "${BOX_SSH_REMOTE}" ] && [ -z "${BOX_SSH_FINGERPRINT}" ]; then
+        echo "claudebox: no remote workspace joined here" >&2
+        return 0
+    fi
+    if ssh_is_mounted; then
+        echo "claudebox: ${SSH_MOUNTPOINT} is still mounted -- 'claudebox ssh eject' first" >&2
+        return 1
+    fi
+    if [ -n "${BOX_SSH_REMOTE}" ]; then
+        ssh_parse_remote "${BOX_SSH_REMOTE}" 2>/dev/null || true
+        ssh-keygen -f "${SSH_KNOWN_HOSTS}" -R "[${ssh_remote_host}]:${ssh_remote_port}" \
+            >/dev/null 2>&1 || true
+        rm -f "${SSH_KNOWN_HOSTS}.old"   # ssh-keygen -R keeps a copy; this is not one to keep
+    fi
+    config_set BOX_SSH_REMOTE ""
+    config_set BOX_SSH_FINGERPRINT ""
+    echo "claudebox: forgotten. This machine's key is kept; the far side still has it" >&2
+    echo "claudebox: authorised until 'claudebox ssh authorize' is undone over there." >&2
+}
+
+ssh_cmd() {
+    local sub="${1:-}"
+    shift || true
+    case "${sub}" in
+        start)            ssh_start ;;
+        stop)             ssh_stop ;;
+        status|show)      ssh_status ;;
+        authorize|authorise) ssh_authorize "$@" ;;
+        mount)            ssh_mount "${1:-}" ;;
+        eject|unmount|umount) ssh_eject ;;
+        forget)           ssh_forget ;;
+        -h|--help|help|"") ssh_usage ;;
+        *) echo "claudebox: unknown ssh subcommand '${sub}'" >&2; ssh_usage; return 2 ;;
+    esac
+}
+
+
+# ---------------------------------------------------------------------------
 # Plugins
 #
 # A plugin is a directory on BOX_PLUGIN_PATH holding executables:
@@ -1763,6 +2656,28 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              the other side of it, run ON a runner machine
   claudebox agent show|test|forget
 
+  claudebox ssh start        share this machine's workspace over ssh, so another
+                             machine on the LAN can mount the same source tree
+                             and run its own claudebox against it. Prints the
+                             address and the host key to compare.
+  claudebox ssh stop         stop sharing it (the host key and the authorised
+                             keys are kept)
+  claudebox ssh status       whether it is up, and which machines may log in
+  claudebox ssh authorize '<public key>'
+                             let a machine in, using the line its "ssh mount"
+                             printed. Keys only -- there is no password.
+
+  claudebox ssh mount [user@]<host>[:port]
+                             mount a remote claudebox's workspace here over
+                             sshfs and work in it: BOX_WORKSPACE_HOST is pointed
+                             at the mount, so the next "claudebox" runs against
+                             the remote tree while the box still sees a plain
+                             ~/Projects. Needs sshfs on this machine.
+  claudebox ssh eject        unmount it and go back to the local workspace.
+                             Stops the box first -- a running container holds
+                             the mount open, the same trap "claudebox eject"
+                             exists for on a removable drive.
+
   claudebox ps               what claude sessions are running in the box: how long,
                              which project, whether they arrived through the
                              agent door, and what they are executing right now.
@@ -1794,6 +2709,7 @@ Env overrides: BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
                                    removable drive pins it until Desktop is quit; for
                                    read-only material use "claudebox media add" instead.
                BOX_DDEV_PROJECT  which project's database is reachable as db:3306
+               BOX_SSH_PORT      where "claudebox ssh start" publishes (default 7994)
 For Claude Code's own help:  claudebox shell -c 'claude --help'
 For opencode's own help:     claudebox opencode --help
 USAGE
@@ -2119,6 +3035,15 @@ USAGE
     agent)
         shift
         agent_cmd "$@"
+        exit $?
+        ;;
+
+    # Both halves of the shared workspace: serving this machine's tree over
+    # ssh, and mounting another machine's. Which subcommands make sense
+    # depends on which machine you are on; ssh_usage says so.
+    ssh)
+        shift
+        ssh_cmd "$@"
         exit $?
         ;;
 

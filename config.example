@@ -110,3 +110,36 @@
 # would put a port suffix into URLs the screenshot baselines contain. https is
 # unaffected and stays on 443. Change this only if 8080 collides.
 #BOX_RUNNER_ROUTER_HTTP_PORT=8080
+
+# --- the workspace over ssh -------------------------------------------------
+#
+# Two machines, one source tree. On the machine that HAS the tree, "claudebox
+# ssh start" brings up a container running sshd over the same bind the box gets
+# and publishes it on the LAN; on the other, "claudebox ssh mount <host>" mounts
+# it with sshfs and points BOX_WORKSPACE_HOST at the mount, so claudebox there
+# runs against this tree while the box still sees a plain ~/Projects.
+#
+# Keys only -- there is no password, and no token. A machine joins by having its
+# public key added over here with "claudebox ssh authorize", which is the line
+# its own "claudebox ssh mount" prints.
+
+# On the machine that SERVES the workspace. Written by "claudebox ssh start",
+# which also brings the door up -- easier than setting it here and starting by
+# hand.
+#BOX_SSH_SERVE=1
+#BOX_SSH_PORT=7994
+
+# On the machine that MOUNTS one -- set by "claudebox ssh mount". The address
+# joined, and the host key fingerprint pinned there; a machine that later
+# answers with a different key is refused rather than prompted about.
+#
+# Edit these by re-running "claudebox ssh mount" rather than by hand; the
+# fingerprint has to match the far side's current host key exactly.
+#BOX_SSH_REMOTE=dizzy@192.168.1.10:7994
+#BOX_SSH_FINGERPRINT=SHA256:...
+
+# What BOX_WORKSPACE_HOST was before the mount took it over. Written by
+# "claudebox ssh mount" and read by "claudebox ssh eject", which is the only
+# thing that puts the local workspace back -- so this is not a setting to write
+# by hand.
+#BOX_SSH_LOCAL_WORKSPACE_HOST=/home/dizzy/Projects

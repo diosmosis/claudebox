@@ -1,0 +1,71 @@
+# claudebox workspace door -- sshd configuration.
+#
+# @USER@ is substituted by entrypoint.sh with the box user's name, which is a
+# setting (BOX_USER) rather than something this file can know.
+#
+# Keys only, one user, no forwarding. This port is on the LAN, which is the one
+# place in this stack anything is published, so everything not needed to serve a
+# filesystem is off.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+# In the state volume, so the identity survives restarts and rebuilds. The other
+# machine pins its fingerprint on first mount; deleting the volume issues a new
+# one and every mount then refuses until it is re-pinned.
+HostKey /var/lib/claudebox-ssh/ssh_host_ed25519_key
+
+# Nobody types a password here and no password exists to type: the box user's
+# account is created locked, and the only way in is a key added with
+# "claudebox ssh authorize". This makes that structural rather than incidental
+# -- with it off, an account that ever acquires a password becomes reachable.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+PubkeyAuthentication yes
+
+# Outside the home directory on purpose. The home directory here IS the shared
+# workspace -- see StrictModes below -- so keeping the list of who may log in
+# anywhere inside it would put it in the tree being served, where anyone already
+# logged in could add to it.
+AuthorizedKeysFile /var/lib/claudebox-ssh/authorized_keys
+
+# Only the box user. Root has no shell here and no key, but saying so costs
+# nothing and this is the file someone reads to find out who can get in.
+AllowUsers @USER@
+
+# StrictModes checks the ownership and mode of the user's HOME directory before
+# accepting a login -- and this user's home is the workspace, a bind of the
+# host's source tree. Its mode belongs to the host, not to us: a tree that is
+# group-writable (0775, which is ordinary) makes sshd refuse every login with
+# "bad ownership or modes for directory", and the only fix from in here would be
+# to chmod the user's own project tree. So the check is off, and what it would
+# have protected -- the authorized keys list -- is kept outside the home instead
+# and owned by root.
+StrictModes no
+
+# A filesystem is all this serves. Forwarding would make the container a way
+# onto whatever it can reach; it is on `edge` alone and never sees `inner`, but
+# `edge` does have a route out.
+AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+MaxAuthTries 3
+MaxSessions 10
+LoginGraceTime 20
+ClientAliveInterval 30
+ClientAliveCountMax 4
+PrintMotd no
+
+# UsePAM is deliberately absent, not set to no: this sshd is Alpine's, built
+# without PAM, and it warns on every start about an option it does not have.
+
+# What sshfs actually talks to. internal-sftp rather than the separate binary so
+# there is no second process to find and no path to keep in step.
+Subsystem sftp internal-sftp
