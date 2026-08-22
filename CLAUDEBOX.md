@@ -1398,6 +1398,21 @@ Now, on a machine where the `claudebox-runner` container is running:
 | `claudebox <plugin>:<cmd>`, `claudebox plugins` | run here, normally |
 | everything else | refuses, and says where to go instead |
 | `claudebox agent ...`, `claudebox mutagen ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all, and the second is a door and a file copier rather than a session |
+| `claudebox rebuild` | works, and **builds only** — see below |
+
+**`claudebox rebuild` runs there too, and stops after the build.** Rebuilding
+images is not running an agent, so the gate lets it through — but bringing the
+stack up afterwards would put the box container on the one machine built not to
+have one, which *is* what the gate is for. So on a machine hosting a runner it
+builds and stops: no `compose up`, and no workspace check either, since a runner
+machine keeps its tree in a volume and need not have a host workspace at all.
+Refusing to build an image over a directory the build never reads would be
+refusing for no reason. `claudebox mutagen start` is then how the door goes up,
+and it brings up that one service and nothing else.
+
+This mattered immediately: the documented way to stand a door up over there is
+`claudebox rebuild && claudebox mutagen start`, and the first half was being
+refused on exactly the machines most likely to want one.
 
 **`claudebox mutagen` runs on the runner machine too.** What this gate is for is
 keeping an *agent* off it; serving this machine's workspace on the LAN, or

@@ -3010,7 +3010,15 @@ runner_machine_gate() {
         # Sharing that would be handing someone a copy that is rewritten under
         # them. The door serves this machine's own BOX_SYNC_WORKSPACE_HOST, like
         # anywhere else, and says so if there is no tree there.
-        agent|mutagen|sync|help|-h|--help|plugins) return 0 ;;
+        #
+        # "rebuild" is here for the same reason, and it is the one that bites:
+        # a runner machine needs the workspace door's image built like any
+        # other, and rebuilding images starts no claude at all. It was being
+        # refused, which made "claudebox rebuild && claudebox mutagen start"
+        # -- the documented way to bring a door up over there -- impossible on
+        # exactly the machines most likely to want one. What it does there is
+        # narrowed rather than gated; see the rebuild arm below.
+        agent|mutagen|sync|rebuild|help|-h|--help|plugins) return 0 ;;
         *:*)
             # Plugin commands run here.
             #
@@ -3273,10 +3281,36 @@ USAGE
         ;;
 
     stop)     exec "${COMPOSE[@]}" down ;;
-    rebuild)  require_workspace
-              "${COMPOSE[@]}" build --no-cache
-              compose_up --force-recreate
-              exit 0 ;;
+    rebuild)
+        # On a machine that hosts a runner, this builds and stops there.
+        #
+        # Rebuilding images is not running an agent, which is why the gate lets
+        # it through -- but bringing the stack up afterwards would put the box
+        # container on the one machine built not to have one, and that IS what
+        # the gate is for. Nor is the workspace check right there: a runner
+        # machine keeps its tree in a volume and need not have a host workspace
+        # at all, and refusing to build an image over a directory the build does
+        # not read would be refusing for no reason.
+        #
+        # So the useful half runs and the rest does not. "claudebox mutagen
+        # start" is how the door then goes up, and it brings up that one service
+        # and nothing else.
+        if runner_hosted_here; then
+            "${COMPOSE[@]}" build --no-cache
+            {
+                echo
+                echo "claudebox: images rebuilt. The stack was NOT started: this machine hosts a"
+                echo "claudebox: runner, so the box does not run here."
+                echo "claudebox:   claudebox mutagen start   brings the workspace door up"
+                echo "claudebox:   claudebox-runner ...      this machine's own commands"
+            } >&2
+            exit 0
+        fi
+        require_workspace
+        "${COMPOSE[@]}" build --no-cache
+        compose_up --force-recreate
+        exit 0
+        ;;
 
     allowed)  exec grep -vE '^\s*(#|$)' "${ALLOWLIST}" ;;
 
