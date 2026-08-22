@@ -181,6 +181,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxtst6 \
     && rm -rf /var/lib/apt/lists/*
 
+# A virtual X server, for suites that drive a HEADFUL browser.
+#
+# Headless Chromium needs no display, but not every suite gets to choose:
+# WebdriverIO's Chrome sessions run headful unless the capability says
+# otherwise, and extensions -- Matomo's tests load one -- are one of the things
+# headless Chrome historically will not do at all. Those runs die on "Missing X
+# server or $DISPLAY" without something listening on one.
+#
+# Xvfb is that something: a display that renders into memory rather than onto
+# hardware, so a headful browser behaves normally with nothing to show it on.
+# `xvfb-run <cmd>` is the usual entry point -- it starts a server on a free
+# display, exports DISPLAY for the child, and tears it down afterwards.
+#
+# xauth is not optional here even though apt calls it a recommendation, and
+# --no-install-recommends would otherwise drop it: xvfb-run generates a cookie
+# for the display and hands it to the child through XAUTHORITY, so without the
+# binary it exits 3 with "xauth command not found" before starting anything.
+#
+# xfonts-base is NOT installed, deliberately. The core X font protocol is what
+# would want it, and nothing here speaks it -- Chromium finds its faces through
+# fontconfig, which the block above already covers. Xvfb starts and serves
+# clients fine without a single core font on the path; checked, not assumed.
+#
+# In base rather than the runner stage, and by the same rule as everything else
+# here: what the browser draws under Xvfb is what a screenshot assertion
+# compares, so both images have to get the same one.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xauth \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
 # A C toolchain and the headers node-canvas compiles against.
 #
 # canvas 2.11.2 -- what WebdriverIO's image-comparison service and the suites

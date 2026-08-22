@@ -404,7 +404,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
 | Host Docker | Docker Desktop on Linux, 29.6.2 | socket at `~/.docker/desktop/docker.sock` |
 | DDEV | v1.25.3 | `performance_mode: none`, so plain bind mounts |
-| Also in the box | git, ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
+| Also in the box | git, ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
 | Fonts | DejaVu / Liberation / Noto Color Emoji taken from `ubuntu:24.04`, plus CI's Arial, Verdana and Courier New | matched to the `ubuntu-24.04` runners so screenshot baselines compare; see the traps |
 
 ## Files
@@ -789,7 +789,7 @@ regressions. This is what the `base` stage in `Dockerfile` exists for.
 
 | Stage | Contents |
 |---|---|
-| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, PHP + extensions, node, composer, the docker CLI, ImageMagick's raised limits, the box user |
+| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, Xvfb, PHP + extensions, node, composer, the docker CLI, ImageMagick's raised limits, the box user |
 | `claudebox` | `base` + the agents, the shims, the language servers, `box-CLAUDE.md` |
 
 `runner/Dockerfile` is `FROM claudebox-base:latest`, and the rule for what may
@@ -1974,6 +1974,15 @@ Do not re-introduce these.
 - **`ddev-router` outlives the last project it served**, so a non-empty router
   IP does not imply there is anything to map. The hostname list must be checked
   separately.
+- **`xvfb-run` hangs forever if it is PID 1 in a container.** It waits for
+  `SIGUSR1` from Xvfb to know the display is ready, and a PID 1 with no
+  handler installed yet never gets it — the X server is up, the socket is in
+  `/tmp/.X11-unix`, and the command it was supposed to run never starts. The
+  box and the runner are safe (compose gives both `init: true`, so PID 1 is
+  docker-init), but a container a test starts itself is not: `docker run
+  ... xvfb-run npx wdio` hangs, `docker run --init ...` does not. Beware
+  `bash -c 'xvfb-run ...'` too — bash execs a lone final command, which is how
+  xvfb-run ends up as PID 1 in the first place.
 - **`ddev list -j` output is parsed defensively** (name + tld, plus any URL
   fields, deduped) because the schema is not guaranteed stable.
 
@@ -2023,6 +2032,12 @@ docker exec claudebox-proxy bash -c '
 # proxy's subnet.
 claudebox shell -c 'docker pull hello-world >/dev/null && echo ok'
 claudebox shell -c 'docker run --rm --network host alpine:3.20 ip route'
+
+# A virtual display comes up, for suites whose browser is headful. xvfb-run
+# only returns once Xvfb has signalled that it is accepting connections, so a
+# zero exit here covers the server, xauth and the base fonts together.
+claudebox shell -lc 'xvfb-run -a bash -c "echo ok on \$DISPLAY"'
+runner exec 'xvfb-run -a bash -c "echo ok on \$DISPLAY"'
 
 # A Puppeteer-downloaded Chromium starts. The image ships the shared libraries,
 # not the browser, so this also exercises the storage.googleapis.com allowance.
