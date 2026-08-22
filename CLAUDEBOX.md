@@ -1387,7 +1387,17 @@ Now, on a machine where the `claudebox-runner` container is running:
 | `claudebox -p '...'` | sent to the workstation that was joined, and answered in **its** box |
 | `claudebox <plugin>:<cmd>`, `claudebox plugins` | run here, normally |
 | everything else | refuses, and says where to go instead |
-| `claudebox agent ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all |
+| `claudebox agent ...`, `claudebox ssh ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all, and the second is a door rather than a session |
+
+**`claudebox ssh` runs on the runner machine too.** What this gate is for is
+keeping an *agent* off it; serving this machine's workspace on the LAN, or
+mounting another machine's, starts no claude and no box. It was being refused
+with "this machine hosts a runner, so it is not where the agent runs" — true,
+and nothing to do with the command. Note what the door does **not** offer to
+serve there: the runner's tree lives in a named volume and is a *sync target*
+that `runner run` overwrites from the workstation, so sharing it would hand
+someone a copy that is rewritten under them. The door serves that machine's own
+`BOX_WORKSPACE_HOST`, as everywhere else, and says so if there is no tree there.
 
 **Plugins run on the runner machine**, and `jira:triage-issue` is why: it fetches
 an issue with a credential that lives *there* and then asks for a headless run,
@@ -1670,6 +1680,21 @@ B$ claudebox ssh mount 10.0.0.49:7994      # mounts, pins A's host key
   matching read is `config_get`, which asks the file directly — `ssh eject` has
   to undo a setting it wrote earlier, and asking the resolved variable would
   have it conclude there was nothing to undo.
+
+- **`docker inspect <name>` answers about images too.** `ssh_serving` was
+  `docker inspect claudebox-ssh`, and there is an *image* of that name — so on
+  any machine that had ever built it, the door reported itself up with no
+  container anywhere, and `ssh status` then ran `docker exec` against nothing.
+  It is `docker inspect --type container -f '{{.State.Running}}'` now, which is
+  what `runner_hosted_here` already did.
+
+- **`set -euo pipefail` makes a failed pipeline inside `x="$(a | b)"` end the
+  launcher, silently.** Without `pipefail` the substitution takes `b`'s status
+  and a failing `a` is invisible; with it, `set -e` exits — no message, no exit
+  code anyone sees, just a command that produced nothing. That is exactly how
+  `ssh status` failed once `docker exec` started failing: the whole launcher
+  ended at the assignment. Every such substitution added here now ends in
+  `|| true` and lets the code below decide what an empty value means.
 
 - **`ip -4 -o addr show scope global` is mostly Docker on this host.** The
   address to type on the other machine came out fifth in a list of five, after

@@ -756,7 +756,7 @@ media_rm() {
 config_get() {
     local key="${1}" line value
     [ -f "${BOX_CONFIG}" ] || return 1
-    line="$(grep -E "^[[:space:]]*${key}=" "${BOX_CONFIG}" 2>/dev/null | tail -1)"
+    line="$(grep -E "^[[:space:]]*${key}=" "${BOX_CONFIG}" 2>/dev/null | tail -1 || true)"
     [ -n "${line}" ] || return 1
     # Values are written with %q, so the shell is what unquotes them. The file is
     # sourced whole a few lines above; evaluating one line of it is nothing new.
@@ -1599,7 +1599,7 @@ ssh_lan_addresses() {
     if command -v ip >/dev/null 2>&1; then
         addrs="$(ip -4 -o addr show scope global 2>/dev/null \
             | awk '$2 !~ /^(docker|br-|veth|virbr|tun|tap)/ {print $4}' \
-            | cut -d/ -f1)"
+            | cut -d/ -f1 || true)"
     fi
     if [ -z "${addrs}" ] && command -v hostname >/dev/null 2>&1; then
         addrs="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' || true)"
@@ -1607,8 +1607,16 @@ ssh_lan_addresses() {
     printf '%s' "${addrs}"
 }
 
+# Is the door up? --type container, and the state, not merely "does the name
+# resolve".
+#
+# "docker inspect claudebox-ssh" answers about ANY object of that name, and
+# there is an image called claudebox-ssh -- so the bare form returns success on
+# a machine that has merely built the thing, and the door reports itself up with
+# no container anywhere. --type container also keeps a stopped leftover from
+# counting as serving.
 ssh_serving() {
-    docker inspect claudebox-ssh >/dev/null 2>&1
+    [ "$(docker inspect --type container -f '{{.State.Running}}' claudebox-ssh 2>/dev/null || true)" = "true" ]
 }
 
 # Bring the door up, and turn it on so it comes back with the stack.
@@ -1705,7 +1713,10 @@ ssh_status() {
         return 0
     fi
 
-    fp="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n')"
+    # || true, because pipefail: without it a docker exec that fails takes the
+    # exit status of the whole substitution with it, and set -e ends the
+    # launcher here with nothing printed at all.
+    fp="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
     printf 'workspace door: up, published on :%s\n' "${BOX_SSH_PORT}"
     printf 'serving:        %s (as %s)\n' "${BOX_SSH_WORKSPACE_HOST}" "${BOX_USER}"
     printf 'host key:       %s\n' "${fp:-(unknown)}"
@@ -1862,7 +1873,7 @@ ssh_pin_host() {
         return 1
     fi
 
-    fp="$(printf '%s\n' "${scanned}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -1)"
+    fp="$(printf '%s\n' "${scanned}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -1 || true)"
     if [ -z "${fp}" ]; then
         echo "claudebox: ${host}:${port} answered with something that is not a host key" >&2
         return 1
@@ -1962,7 +1973,7 @@ ssh_probe() {
 ssh_is_own_door() {
     local fp="${1}" mine
     ssh_serving || return 1
-    mine="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n')"
+    mine="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
     [ -n "${mine}" ] && [ "${mine}" = "${fp}" ]
 }
 
@@ -2477,7 +2488,23 @@ runner_machine_gate() {
     local arg headless="" first="${1:-}"
 
     case "${first}" in
-        agent|help|-h|--help|plugins) return 0 ;;
+        # What this gate is for is keeping an AGENT off this machine. These are
+        # not that.
+        #
+        # "ssh" is here for the same reason "agent" is: it is a door, not a
+        # session. Serving this machine's workspace on the LAN, or mounting
+        # another machine's, starts no claude and no box -- and a runner machine
+        # is a perfectly ordinary place to want either. It was being refused
+        # with "this machine hosts a runner, so it is not where the agent runs",
+        # which is true and has nothing to do with the command.
+        #
+        # Note what it does NOT offer to serve: the runner's workspace lives in
+        # a named volume (see docker-compose.runner.yaml) and is a SYNC TARGET
+        # -- "runner run" overwrites it from the workstation. Sharing that would
+        # be handing someone a copy that is rewritten under them. The door here
+        # serves this machine's own BOX_WORKSPACE_HOST, like anywhere else, and
+        # says so if there is no tree there.
+        agent|ssh|help|-h|--help|plugins) return 0 ;;
         *:*)
             # Plugin commands run here.
             #
