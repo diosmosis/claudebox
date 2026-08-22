@@ -1721,6 +1721,19 @@ sync_box_is_in_copy() {
 }
 
 sync_serving()       { sync_container_running "${SYNC_DOOR}"; }
+
+# What the door is ACTUALLY published on, asked of Docker.
+#
+# Not BOX_SYNC_PORT, which is only what it was asked to publish on. A container
+# can be up and healthy -- sshd listening, healthcheck green -- with no port
+# binding at all, and then every machine on the LAN sees a silent timeout while
+# this end reports itself fine. Printing the setting back as though it were an
+# observation is how that state hides, so status asks the daemon.
+sync_published_port() {
+    docker inspect --type container \
+        -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostPort}}{{end}}{{end}}' \
+        "${SYNC_DOOR}" 2>/dev/null || true
+}
 sync_client_running() { sync_container_running "${SYNC_CLIENT}"; }
 
 # ---------------------------------------------------------------------------
@@ -2406,7 +2419,30 @@ sync_status() {
         shown=1
         fp="$(docker exec "${SYNC_DOOR}" cat /var/lib/claudebox-sync/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
         served_here="$(docker exec "${SYNC_DOOR}" cat /var/lib/claudebox-sync/served-workspace 2>/dev/null | tr -d '\r\n' || true)"
-        printf 'workspace door: up, published on :%s\n' "${BOX_SYNC_PORT}"
+        local realport
+        realport="$(sync_published_port)"
+        if [ -z "${realport}" ]; then
+            {
+                echo "workspace door: up, but NOT PUBLISHED -- no port is bound to it."
+                echo
+                echo "claudebox: sshd is running and healthy inside the container, and nothing"
+                echo "claudebox: outside this machine can reach it. Every machine that tries will"
+                echo "claudebox: see a silent timeout rather than a refusal."
+                echo "claudebox: 'docker port ${SYNC_DOOR}' shows the same nothing. Recreate it:"
+                echo "claudebox:"
+                echo "claudebox:     claudebox mutagen stop && claudebox mutagen start"
+                echo "claudebox:"
+                echo "claudebox: If it comes back unpublished, the container was created from a"
+                echo "claudebox: docker-compose.yaml without the ports entry -- check that this"
+                echo "claudebox: machine has the current one."
+            } >&2
+            return 1
+        fi
+        printf 'workspace door: up, published on :%s\n' "${realport}"
+        if [ "${realport}" != "${BOX_SYNC_PORT}" ]; then
+            printf '  note:         BOX_SYNC_PORT here says %s -- the container was created\n' "${BOX_SYNC_PORT}"
+            printf '                before that changed; restart it to apply.\n'
+        fi
         # The HOST path, because that is which tree an operator here is asking
         # about. The container-side path is what the other machine syncs from,
         # and it is shown too -- they differ whenever BOX_WORKSPACE_HOST does.
@@ -2430,7 +2466,7 @@ sync_status() {
             echo
             while IFS= read -r a; do
                 [ -n "${a}" ] || continue
-                echo "    claudebox mutagen attach ${a}:${BOX_SYNC_PORT}"
+                echo "    claudebox mutagen attach ${a}:${realport}"
             done <<< "${addrs:-<this-machine>}"
             echo
             echo "It will print that machine's public key and the 'claudebox mutagen authorize'"
