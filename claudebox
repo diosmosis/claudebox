@@ -24,8 +24,10 @@
 #   claudebox agent ...       the inbound agent door: serve one here, or (on a
 #                             machine hosting a runner) join one elsewhere
 #
-#   claudebox ssh start       share this workspace over ssh on the LAN
-#   claudebox ssh mount <h>   work in another machine's workspace over sshfs
+#   claudebox mutagen start   share this workspace with another machine
+#   claudebox mutagen attach <h>
+#                             keep a live local copy of another machine's and
+#                             work in it
 #
 # Env overrides: BOX_WORKSPACE, BOX_WORKSPACE_HOST, BOX_USER, BOX_HOST_HOME,
 #               BOX_MKCERT_CA, BOX_PLUGIN_PATH,
@@ -103,8 +105,10 @@ BOX_SETTINGS=(
     BOX_RUNNER BOX_RUNNER_TOKEN BOX_RUNNER_FINGERPRINT
     BOX_AGENT BOX_AGENT_TOKEN BOX_AGENT_FINGERPRINT
     BOX_AGENT_SERVE BOX_AGENT_PORT
-    BOX_SSH_SERVE BOX_SSH_PORT
-    BOX_SSH_REMOTE BOX_SSH_FINGERPRINT BOX_SSH_LOCAL_WORKSPACE_HOST
+    BOX_SYNC_SERVE BOX_SYNC_PORT
+    BOX_SYNC_REMOTE BOX_SYNC_FINGERPRINT BOX_SYNC_REMOTE_PATH
+    BOX_SYNC_LOCAL_WORKSPACE_HOST BOX_SYNC_DIR
+    BOX_SYNC_MODE BOX_SYNC_IGNORE BOX_SYNC_FLUSH_TIMEOUT
     BOX_PLUGIN_PATH
 )
 if [ -f "${BOX_CONFIG}" ]; then
@@ -228,44 +232,94 @@ if [ -n "${BOX_AGENT_SERVE}" ]; then
     COMPOSE+=(--profile agent)
 fi
 
-# The workspace over ssh, both halves.
+# The workspace over mutagen, both halves.
 #
-# On the machine that HAS the tree: BOX_SSH_SERVE=1 creates the workspace door
-# (the ssh service) and publishes BOX_SSH_PORT on the LAN, so another machine
-# can mount the same source tree with sshfs.
+# On the machine that HAS the tree: BOX_SYNC_SERVE=1 creates the workspace door
+# (the sync service) and publishes BOX_SYNC_PORT on the LAN, so another machine
+# can keep a live local copy of the same source tree.
 #
-# On the machine that MOUNTS it: BOX_SSH_REMOTE is the address joined and
-# BOX_SSH_FINGERPRINT the host key pinned there -- the mirror of the BOX_AGENT
-# trio, minus a token, because this door takes keys and nothing else.
-# BOX_SSH_LOCAL_WORKSPACE_HOST is what BOX_WORKSPACE_HOST was before the mount
-# took it over, which is the only place "claudebox ssh eject" can find the local
-# workspace to put back.
-export BOX_SSH_SERVE="${BOX_SSH_SERVE:-}"
-export BOX_SSH_PORT="${BOX_SSH_PORT:-7994}"
-export BOX_SSH_REMOTE="${BOX_SSH_REMOTE:-}"
-export BOX_SSH_FINGERPRINT="${BOX_SSH_FINGERPRINT:-}"
-export BOX_SSH_LOCAL_WORKSPACE_HOST="${BOX_SSH_LOCAL_WORKSPACE_HOST:-}"
+# On the machine that BORROWS one: BOX_SYNC_REMOTE is the address joined,
+# BOX_SYNC_FINGERPRINT the host key pinned there, and BOX_SYNC_REMOTE_PATH the
+# tree that door serves -- learned over ssh at attach rather than guessed from
+# this machine's own BOX_WORKSPACE. BOX_SYNC_LOCAL_WORKSPACE_HOST is what
+# BOX_WORKSPACE_HOST was before the copy took it over, which is the only place
+# "claudebox mutagen detach" can find the local workspace to put back.
+export BOX_SYNC_SERVE="${BOX_SYNC_SERVE:-}"
+export BOX_SYNC_PORT="${BOX_SYNC_PORT:-7994}"
+export BOX_SYNC_REMOTE="${BOX_SYNC_REMOTE:-}"
+export BOX_SYNC_FINGERPRINT="${BOX_SYNC_FINGERPRINT:-}"
+export BOX_SYNC_REMOTE_PATH="${BOX_SYNC_REMOTE_PATH:-}"
+export BOX_SYNC_LOCAL_WORKSPACE_HOST="${BOX_SYNC_LOCAL_WORKSPACE_HOST:-}"
 
-# What the workspace door serves -- derived, not a setting, and deliberately NOT
+# Where the local copy lives. A real directory of real files on this machine's
+# disk, which is the whole point of syncing rather than mounting. Exported
+# because compose binds it at the SAME path inside the syncer as outside -- see
+# the note on that in docker-compose.yaml, it is load-bearing.
+export BOX_SYNC_DIR="${BOX_SYNC_DIR:-${BOX_DIR}/synced-workspace}"
+
+# How the two trees are reconciled. two-way-safe is the default and the right
+# one: both machines can edit, and it refuses to resolve anything that would
+# lose data, halting instead. two-way-resolved with alpha winning looks
+# tempting -- claude only runs here, so "local wins" feels like the truth -- but
+# the remote is the machine that HAS the tree, someone may be sitting at it, and
+# a mode whose failure is "your edits over there were silently overwritten" is
+# not one to default to.
+export BOX_SYNC_MODE="${BOX_SYNC_MODE:-two-way-safe}"
+
+# Paths not to sync, space separated. Empty by default: ignoring node_modules
+# and vendor is the obvious tuning lever AND the obvious footgun -- a test run
+# that needs vendor/ finds an empty tree. ${VAR-default} rather than
+# ${VAR:-default} deliberately, so an explicitly empty setting stays empty.
+export BOX_SYNC_IGNORE="${BOX_SYNC_IGNORE-}"
+
+# How long a forced sync cycle may take before the launcher gives up on proving
+# the copy is current. Raise it for a very large tree.
+export BOX_SYNC_FLUSH_TIMEOUT="${BOX_SYNC_FLUSH_TIMEOUT:-30}"
+
+# What the workspace DOOR serves -- derived, not a setting, and deliberately not
 # BOX_WORKSPACE_HOST.
 #
-# A machine can do both things at once: serve its own tree and borrow another
-# one. If the door's bind followed BOX_WORKSPACE_HOST it would follow the borrow
-# -- mounting a remote workspace would silently re-point this machine's door at
-# it, so a third machine asking for "this machine's workspace" would be handed a
-# tree from somewhere else, over two hops. It also made every "ssh mount"
-# recreate the door, which is a container nothing asked to disturb.
+# A machine can do both things at once: serve its own tree and borrow another.
+# If the door's bind followed BOX_WORKSPACE_HOST it would follow the borrow --
+# attaching to a remote workspace would silently re-point this machine's door at
+# the local COPY, so a third machine asking for "this machine's workspace" would
+# be handed a tree from somewhere else, and two independent reconcilers would be
+# writing the same files.
 #
-# BOX_SSH_LOCAL_WORKSPACE_HOST is exactly "what the workspace was before a mount
-# took it over", written by "ssh mount" and cleared by "ssh eject", so it is set
-# precisely when BOX_WORKSPACE_HOST is the wrong answer here.
-export BOX_SSH_WORKSPACE_HOST="${BOX_SSH_LOCAL_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST}}"
+# BOX_SYNC_LOCAL_WORKSPACE_HOST is exactly "what the workspace was before a copy
+# took it over", written by attach and cleared by detach, so it is set precisely
+# when BOX_WORKSPACE_HOST is the wrong answer here.
+export BOX_SYNC_WORKSPACE_HOST="${BOX_SYNC_LOCAL_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST}}"
 
-# Same reasoning as the agent profile above: a claudebox that was not asked to
+# The door is behind a compose profile, so a claudebox that was not asked to
 # serve its workspace never creates the service and never publishes a port.
-if [ -n "${BOX_SSH_SERVE}" ]; then
-    COMPOSE+=(--profile ssh)
+if [ -n "${BOX_SYNC_SERVE}" ]; then
+    COMPOSE+=(--profile sync)
 fi
+
+# And the syncer behind its own, selected by having a remote joined -- which is
+# what brings the daemon back with the stack after a reboot, so a session
+# resumes on its own rather than waiting to be noticed.
+if [ -n "${BOX_SYNC_REMOTE}" ]; then
+    COMPOSE+=(--profile mutagen)
+    # Parsed once, here, because the syncer's ssh config is generated from these
+    # three at container start and compose interpolates variables, not
+    # substrings.
+    _sync_spec="${BOX_SYNC_REMOTE}"
+    case "${_sync_spec}" in
+        *@*) export BOX_SYNC_REMOTE_USER="${_sync_spec%%@*}"; _sync_spec="${_sync_spec#*@}" ;;
+        *)   export BOX_SYNC_REMOTE_USER="${BOX_USER}" ;;
+    esac
+    case "${_sync_spec}" in
+        *:[0-9]*) export BOX_SYNC_REMOTE_PORT="${_sync_spec##*:}"; _sync_spec="${_sync_spec%:*}" ;;
+        *)        export BOX_SYNC_REMOTE_PORT="${BOX_SYNC_PORT}" ;;
+    esac
+    export BOX_SYNC_REMOTE_HOST="${_sync_spec}"
+    unset _sync_spec
+fi
+export BOX_SYNC_REMOTE_HOST="${BOX_SYNC_REMOTE_HOST:-}"
+export BOX_SYNC_REMOTE_PORT="${BOX_SYNC_REMOTE_PORT:-${BOX_SYNC_PORT}}"
+export BOX_SYNC_REMOTE_USER="${BOX_SYNC_REMOTE_USER:-${BOX_USER}}"
 
 export BOX_RUNNER="${BOX_RUNNER:-}"
 export BOX_RUNNER_TOKEN="${BOX_RUNNER_TOKEN:-}"
@@ -360,17 +414,13 @@ compose_up() {
 require_workspace() {
     local store shared entry ok=""
 
-    # A remote workspace that is no longer mounted. Its own check, and fatal,
-    # because it is the failure that looks like nothing at all: an sshfs mount
-    # that dropped leaves an empty directory exactly where a workspace used to
-    # be, the bind then succeeds, and the session comes up seeing no projects
-    # with nothing anywhere saying why.
-    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] && ! ssh_is_mounted; then
-        echo "claudebox: the workspace is a remote one (${BOX_SSH_REMOTE:-unknown}) and it is not" >&2
-        echo "claudebox: mounted -- ${SSH_MOUNTPOINT} is just an empty directory right now." >&2
-        echo "claudebox: 'claudebox ssh mount' remounts it; 'claudebox ssh eject' gives the" >&2
-        echo "claudebox: local workspace back instead." >&2
-        exit 1
+    # The workspace is a synced copy. Its own check, and it comes first, because
+    # this is the failure that looks like nothing at all: a copy that stopped
+    # syncing is a directory full of plausible source code that the other
+    # machine moved on from hours ago. There is no unmounted mountpoint to
+    # notice. sync_require_current is where the whole argument lives.
+    if [ "${BOX_WORKSPACE_HOST}" = "${SYNC_DIR}" ]; then
+        sync_require_current || exit 1
     fi
 
     if [ ! -d "${BOX_WORKSPACE_HOST}" ]; then
@@ -1491,97 +1541,131 @@ agent_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# The workspace over ssh, both halves
+# The workspace over mutagen, both halves
 #
-# SERVING (claudebox ssh start): a container running sshd over the same bind the
-# box gets, published on the LAN. Another machine mounts it with sshfs and runs
-# its own claudebox against this tree -- one workspace, two machines, no copy to
-# keep in step and no branch to push to hand work over.
+# SERVING (claudebox mutagen start): a container running sshd over the same bind
+# the box gets, published on the LAN. Another machine keeps a live local copy of
+# this tree and runs its own claudebox against that copy -- one workspace, two
+# machines, no branch to push to hand work over.
 #
-# MOUNTING (claudebox ssh mount): the other end. The mount is made ON THE HOST,
-# not in a container, and that is not a preference -- a bind source is resolved
-# by the Docker daemon, so a filesystem that exists only inside some container
-# is not something the box can be given. It goes at ${BOX_DIR}/remote-workspace
-# and BOX_WORKSPACE_HOST is pointed at it, which is the same mechanism that
-# already puts the workspace on another drive. The box sees a perfectly ordinary
-# ${BOX_WORKSPACE}.
+# USING (claudebox mutagen attach): the other end. A mutagen daemon in a sidecar
+# container keeps ${SYNC_DIR} in step with the far tree, and BOX_WORKSPACE_HOST
+# is pointed at it -- the same mechanism that already puts a workspace on
+# another drive. The box sees a perfectly ordinary ${BOX_WORKSPACE}.
+#
+# Why sync and not a network filesystem, since this replaced sshfs: git is the
+# workload, and git walks the whole tree. "git status" is one lstat per tracked
+# file plus a readdir per directory, so on a mounted filesystem it is tens of
+# thousands of round trips before git has read a single object. Mutagen keeps
+# real files on both machines, so git runs at local-disk speed on each.
+#
+# Why mutagen runs in containers on BOTH ends. Mutagen shells out to the system
+# ssh and accepts no per-session ssh options -- identity, port and known-hosts
+# must come from an ssh config file, and the only one it reads is $HOME/.ssh/
+# config. On a host that is the person's own ssh config, which this has no
+# business writing. In the sidecar, HOME is ours. The far end needs nothing
+# installed at all: mutagen scp's its agent into the door container and runs it
+# there.
 #
 # Keys only. Password authentication is off in sshd_config and the account has
-# no password to begin with, so joining is "claudebox ssh mount" printing this
-# machine's public key and "claudebox ssh authorize" over there accepting it --
-# ssh-copy-id by hand, and one line to carry rather than a private key. The
-# host key is pinned on first mount, in a known_hosts file of this tool's own,
-# and a fingerprint that later changes stops the mount instead of asking.
+# no password to begin with, so joining is "attach" printing this machine's
+# public key and "authorize" over there accepting it -- ssh-copy-id by hand, and
+# one line to carry rather than a private key. The host key is pinned on first
+# attach, in a known_hosts of this tool's own, and a fingerprint that later
+# changes stops the attach instead of asking.
 # ---------------------------------------------------------------------------
 
-# Where the client half keeps its half of all that: this machine's key, and the
-# host keys it has pinned. Its own directory rather than ~/.ssh -- these belong
-# to claudebox, they are generated without asking, and "claudebox ssh forget"
-# should not be able to reach anything a person put in ~/.ssh themselves.
-SSH_CLIENT_DIR="${BOX_DIR}/ssh-client"
-SSH_CLIENT_KEY="${SSH_CLIENT_DIR}/id_ed25519"
-SSH_KNOWN_HOSTS="${SSH_CLIENT_DIR}/known_hosts"
-# One mountpoint, because BOX_WORKSPACE_HOST is one setting: a second remote
-# workspace mounted at the same time would have nothing pointing at it.
-SSH_MOUNTPOINT="${BOX_DIR}/remote-workspace"
+SYNC_DOOR=claudebox-sync            # the sshd, on the machine that HAS the tree
+SYNC_CLIENT=claudebox-mutagen       # the syncer, on the machine that borrows it
+SYNC_SESSION=claudebox              # the mutagen session's --name
+SYNC_LABEL=claudebox=workspace      # and its --label, which is what lookups use
 
-ssh_usage() {
+# The client half's own directory: this machine's key, and the host keys it has
+# pinned. Its own rather than ~/.ssh -- claudebox generates that key without
+# being asked and should not put it where a person keeps theirs, and a key that
+# exists only for this makes "which machines can reach my workspace" answerable
+# from one authorized_keys file. Bind-mounted into the sidecar, where it is also
+# where the generated ssh config lands, so a door that refuses a key can be
+# debugged from the host with "ssh -F .../config claudebox-door".
+SYNC_CLIENT_DIR="${BOX_DIR}/sync-client"
+SYNC_STAMP="${SYNC_CLIENT_DIR}/session"
+
+# The local copy. A real directory of real files -- not a mountpoint, which is
+# the whole difference from what this replaced, and also the whole new hazard:
+# there is no "not mounted" state to notice, so a copy that stopped syncing
+# hours ago looks exactly like one that is current. See sync_require_current.
+SYNC_DIR="${BOX_SYNC_DIR:-${BOX_DIR}/synced-workspace}"
+
+# Written into the root of the copy at attach, never synced (it is in the ignore
+# list), and checked before the box is allowed to start. It is the one file that
+# can only exist because attach put it there, so its absence is unambiguous:
+# this directory is not the copy, it is something that replaced it. See the long
+# note in sync_require_current about why that matters so much.
+SYNC_SENTINEL=".claudebox-sync-root"
+
+sync_usage() {
     cat >&2 <<'USAGE'
-usage: claudebox ssh <start|stop|status|authorize>  on the machine that HAS the workspace
-       claudebox ssh <mount|eject>                  on the machine that wants to use it
+usage: claudebox mutagen <start|stop|status|authorize>   on the machine that HAS the tree
+       claudebox mutagen <attach|detach|status|resolve>  on the machine that borrows it
 
   Serving it -- run these where the source tree actually is:
     start   Bring the workspace door up: sshd over the same tree the box works
-            in, published on the LAN (BOX_SSH_PORT, default 7994). Prints the
+            in, published on the LAN (BOX_SYNC_PORT, default 7994). Prints the
             address, the port and the host key fingerprint to compare.
     stop    Take it down. The host key and the authorised keys are kept, so
             "start" brings the same door back and nothing has to re-join.
     status  Whether it is up, its fingerprint, and which keys may log in.
     authorize '<public key>'
-            Let a machine in, using the line "claudebox ssh mount" printed over
-            there. This is the only way in: there is no password.
+            Let a machine in, using the line "attach" printed over there. This
+            is the only way in: there is no password.
 
   Using it -- run these on the other machine:
-    mount [user@]<host>[:port]
-            Mount that machine's workspace here over sshfs and point claudebox
-            at it, so the next "claudebox" runs against the remote tree. The
-            host key is pinned on first mount. With no argument, remounts the
-            one already joined.
-    eject   Unmount it and go back to the local workspace. Stops the box first,
-            because a running container holds the mount open -- the same trap
-            "claudebox eject" exists for on a removable drive.
+    attach [user@]<host>[:port]
+            Keep a local copy of that machine's workspace in step with it, and
+            point claudebox at the copy, so the next "claudebox" runs against
+            real local files. The host key is pinned on first attach. With no
+            argument, re-attaches to the one already joined.
+    detach  Stop syncing and go back to the local workspace. Flushes first, so
+            work done here reaches the other machine before the session ends.
+            The copy is kept.
+    status  Session health: connected, current, conflicts, in use or not.
+            --follow watches an initial sync as it runs.
+    resolve --local | --remote
+            Settle conflicts by keeping one side. two-way-safe halts BOTH
+            directions until they are settled, so this is not optional reading.
+    forget  Drop the pin and the joined address. --purge also deletes the copy.
 
-The mount is a host mount, not a container one: Docker resolves bind sources
-itself, so a filesystem only some container can see is not one the box can be
-given. It goes at ~/.claudebox/remote-workspace and BOX_WORKSPACE_HOST is
-pointed there -- the same setting that puts a workspace on another drive.
+Both ends run mutagen inside a container; neither host has it installed. The
+copy lives at ~/.claudebox/synced-workspace (BOX_SYNC_DIR) and
+BOX_WORKSPACE_HOST is pointed there -- the same setting that puts a workspace on
+another drive.
 USAGE
 }
 
 # host, port and login name out of "[user@]host[:port]".
 #
-# Sets ssh_remote_user / ssh_remote_host / ssh_remote_port. The user defaults to
-# BOX_USER, which is right whenever both machines are set up the same way and is
-# the reason the argument is usually just an address.
-ssh_parse_remote() {
+# Sets sync_remote_user / sync_remote_host / sync_remote_port. The user defaults
+# to BOX_USER, which is right whenever both machines are set up the same way and
+# is why the argument is usually just an address.
+sync_parse_remote() {
     local spec="${1}"
-    ssh_remote_user="${BOX_USER}"
+    sync_remote_user="${BOX_USER}"
     case "${spec}" in
-        *@*) ssh_remote_user="${spec%%@*}"; spec="${spec#*@}" ;;
+        *@*) sync_remote_user="${spec%%@*}"; spec="${spec#*@}" ;;
     esac
     # Rightmost colon only, and only when what follows is digits: this leaves an
     # IPv6 literal alone rather than reading half of it as a port.
-    ssh_remote_port="${BOX_SSH_PORT}"
+    sync_remote_port="${BOX_SYNC_PORT}"
     case "${spec}" in
         *:[0-9]*)
             if [[ "${spec##*:}" =~ ^[0-9]+$ ]]; then
-                ssh_remote_port="${spec##*:}"
+                sync_remote_port="${spec##*:}"
                 spec="${spec%:*}"
             fi
             ;;
     esac
-    ssh_remote_host="${spec}"
-    if [ -z "${ssh_remote_host}" ]; then
+    sync_remote_host="${spec}"
+    if [ -z "${sync_remote_host}" ]; then
         echo "claudebox: '${1}' has no host in it" >&2
         return 1
     fi
@@ -1594,7 +1678,7 @@ ssh_parse_remote() {
 # certainly wrong -- every bridge Docker has made, this stack's own networks
 # included, which a host on the LAN cannot reach and which on a machine running
 # DDEV outnumber the real answer four to one.
-ssh_lan_addresses() {
+sync_lan_addresses() {
     local addrs=""
     if command -v ip >/dev/null 2>&1; then
         addrs="$(ip -4 -o addr show scope global 2>/dev/null \
@@ -1607,320 +1691,272 @@ ssh_lan_addresses() {
     printf '%s' "${addrs}"
 }
 
-# Is the door up? --type container, and the state, not merely "does the name
-# resolve".
+# Is a container of that name RUNNING? --type container, and the state, not
+# merely "does the name resolve".
 #
-# "docker inspect claudebox-ssh" answers about ANY object of that name, and
-# there is an image called claudebox-ssh -- so the bare form returns success on
+# "docker inspect claudebox-sync" answers about ANY object of that name, and
+# there is an image called claudebox-sync -- so the bare form returns success on
 # a machine that has merely built the thing, and the door reports itself up with
 # no container anywhere. --type container also keeps a stopped leftover from
-# counting as serving.
-ssh_serving() {
-    [ "$(docker inspect --type container -f '{{.State.Running}}' claudebox-ssh 2>/dev/null || true)" = "true" ]
+# counting.
+sync_container_running() {
+    [ "$(docker inspect --type container -f '{{.State.Running}}' "${1}" 2>/dev/null || true)" = "true" ]
 }
+
+# Is the RUNNING box actually working in the copy?
+#
+# Asked of the container's own mount table, not of the settings, and that
+# distinction is the whole point. Settings say what the NEXT box would be built
+# with; the bind of the box that exists right now is what says whether stopping
+# it is about this sync at all. Deciding from configuration got it wrong in the
+# obvious way -- a config that had been pointed at a copy stopped a running
+# session that was working somewhere else entirely, killing someone's work to
+# tidy up a sync it was not using.
+sync_box_is_in_copy() {
+    local src
+    src="$(docker inspect --type container -f \
+        '{{range .Mounts}}{{if eq .Destination "'"${BOX_WORKSPACE}"'"}}{{.Source}}{{end}}{{end}}' \
+        "${CONTAINER}" 2>/dev/null || true)"
+    [ -n "${src}" ] && [ "${src}" = "${SYNC_DIR}" ]
+}
+
+sync_serving()       { sync_container_running "${SYNC_DOOR}"; }
+sync_client_running() { sync_container_running "${SYNC_CLIENT}"; }
+
+# ---------------------------------------------------------------------------
+# The serving half
+# ---------------------------------------------------------------------------
 
 # Bring the door up, and turn it on so it comes back with the stack.
 #
 # Only this service, not the whole stack: it needs the workspace bind and
 # nothing else -- no dind, no proxy, no box -- so a machine can hand its
-# workspace out without running an agent at all. The workspace check still runs,
-# because serving a directory Docker invented on the spot is the one failure
-# that would look like success on both machines.
-ssh_start() {
-    # This machine is currently working in a borrowed workspace. The door still
-    # serves the LOCAL tree -- see BOX_SSH_WORKSPACE_HOST -- which is almost
+# workspace out without running an agent at all.
+sync_start() {
+    # This machine is currently working in a borrowed tree. The door still
+    # serves the LOCAL one -- see BOX_SYNC_WORKSPACE_HOST -- which is almost
     # certainly what is wanted, and is not what "the workspace" means anywhere
     # else in this launcher right now. Say which one it is rather than leaving
     # the two to be confused.
-    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ]; then
-        echo "claudebox: note: this machine is working in ${BOX_SSH_REMOTE:-a remote workspace}," >&2
-        echo "claudebox: so the door serves the LOCAL tree (${BOX_SSH_WORKSPACE_HOST}), not that one." >&2
+    if [ "${BOX_WORKSPACE_HOST}" = "${SYNC_DIR}" ]; then
+        echo "claudebox: note: this machine is working in a copy of ${BOX_SYNC_REMOTE:-a remote workspace}," >&2
+        echo "claudebox: so the door serves the LOCAL tree (${BOX_SYNC_WORKSPACE_HOST}), not that one." >&2
     fi
 
     require_workspace
 
-    if [ ! -d "${BOX_SSH_WORKSPACE_HOST}" ]; then
-        echo "claudebox: the tree to serve, ${BOX_SSH_WORKSPACE_HOST}, is not there" >&2
+    if [ ! -d "${BOX_SYNC_WORKSPACE_HOST}" ]; then
+        echo "claudebox: the tree to serve, ${BOX_SYNC_WORKSPACE_HOST}, is not there" >&2
+        return 1
+    fi
+
+    # An empty served tree is refused, and this is the difference between
+    # sharing a filesystem and syncing one. Under sshfs it meant the other
+    # machine saw nothing. Here this door is one end of a reconciler, and
+    # "present over there, absent here" propagates as a DELETION -- two-way-safe
+    # does not save you, because removing a file that was not modified on the
+    # other side is not a conflict, it is an unambiguous delete. The realistic
+    # way to be here is a workspace on a drive that did not mount.
+    if [ -z "$(ls -A -- "${BOX_SYNC_WORKSPACE_HOST}" 2>/dev/null)" ]; then
+        {
+            echo "claudebox: ${BOX_SYNC_WORKSPACE_HOST} is empty. This door is one end of a"
+            echo "claudebox: two-way sync, so serving an empty tree tells the machine attached"
+            echo "claudebox: to it that every file it has was deleted -- and it would delete"
+            echo "claudebox: them. Refusing. If the tree is on a drive, mount it."
+        } >&2
         return 1
     fi
 
     echo "claudebox: starting the workspace door..." >&2
-    if ! "${COMPOSE[@]}" --profile ssh up -d ssh; then
-        echo "claudebox: the workspace door did not start; 'docker logs claudebox-ssh' has why" >&2
+    if ! "${COMPOSE[@]}" --profile sync up -d sync; then
+        echo "claudebox: the workspace door did not start; 'docker logs ${SYNC_DOOR}' has why" >&2
         return 1
     fi
 
-    if [ -z "${BOX_SSH_SERVE}" ]; then
-        config_set BOX_SSH_SERVE 1
-        echo "claudebox: workspace door turned on (BOX_SSH_SERVE=1 in ${BOX_CONFIG})" >&2
+    if [ -z "${BOX_SYNC_SERVE}" ]; then
+        config_set BOX_SYNC_SERVE 1
+        echo "claudebox: workspace door turned on (BOX_SYNC_SERVE=1 in ${BOX_CONFIG})" >&2
     fi
-    export BOX_SSH_SERVE=1
+    export BOX_SYNC_SERVE=1
 
     # The host key is generated by the entrypoint, so it exists a moment after
     # the container does rather than at once.
     local i
     for i in $(seq 1 40); do
-        if docker exec claudebox-ssh test -s /var/lib/claudebox-ssh/fingerprint 2>/dev/null; then
+        if docker exec "${SYNC_DOOR}" test -s /var/lib/claudebox-sync/fingerprint 2>/dev/null; then
             break
         fi
         sleep 0.25
     done
 
-    ssh_status
+    sync_status
 }
 
-# The pair of ssh_start. The identity is deliberately left alone: it lives in
-# the ssh-state volume, and dropping it would issue a new host key that every
-# machine which ever mounted this workspace has pinned -- all of them would
-# refuse to mount until they re-pinned. Turning the door off is a thing you do
-# for an afternoon. "docker volume rm claudebox_ssh-state" is how to ask for the
-# other thing on purpose.
-ssh_stop() {
+# The pair of sync_start. The identity is deliberately left alone: it lives in
+# the sync-state volume, and dropping it would issue a new host key that every
+# machine which ever attached has pinned -- all of them would refuse until they
+# re-pinned. Turning the door off is a thing you do for an afternoon.
+# "docker volume rm claudebox_sync-state" is how to ask for the other thing.
+sync_stop() {
     local was_up=""
-    if ssh_serving; then
+    if sync_serving; then
         was_up=1
     fi
-    if [ -z "${BOX_SSH_SERVE}" ] && [ -z "${was_up}" ]; then
+    if [ -z "${BOX_SYNC_SERVE}" ] && [ -z "${was_up}" ]; then
         echo "claudebox: the workspace door is already off here" >&2
         return 0
     fi
 
-    # The container first, while this invocation still selects the ssh profile:
+    # The container first, while this invocation still selects the sync profile:
     # a later "up" that is not selecting it does not remove the service, it
     # leaves it running as an orphan.
     if [ -n "${was_up}" ]; then
-        "${COMPOSE[@]}" --profile ssh rm -sf ssh >/dev/null 2>&1 \
-            || docker rm -f claudebox-ssh >/dev/null 2>&1 || true
+        "${COMPOSE[@]}" --profile sync rm -sf sync >/dev/null 2>&1 \
+            || docker rm -f "${SYNC_DOOR}" >/dev/null 2>&1 || true
         echo "claudebox: workspace door stopped" >&2
     fi
 
-    config_set BOX_SSH_SERVE ""
-    export BOX_SSH_SERVE=""
-    echo "claudebox: workspace door off (BOX_SSH_SERVE cleared in ${BOX_CONFIG})" >&2
-    echo "claudebox: the host key and the authorised keys are kept, so 'claudebox ssh start'" >&2
-    echo "claudebox: brings the same door back and nothing has to be re-authorised." >&2
-}
-
-ssh_status() {
-    local fp addrs keys
-
-    if ! ssh_serving; then
-        if [ -n "${BOX_SSH_REMOTE}" ]; then
-            ssh_mount_status
-            return 0
-        fi
-        echo "claudebox: the workspace door is not running here ('claudebox ssh start' starts it)" >&2
-        return 0
-    fi
-
-    # || true, because pipefail: without it a docker exec that fails takes the
-    # exit status of the whole substitution with it, and set -e ends the
-    # launcher here with nothing printed at all.
-    fp="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
-    printf 'workspace door: up, published on :%s\n' "${BOX_SSH_PORT}"
-    printf 'serving:        %s (as %s)\n' "${BOX_SSH_WORKSPACE_HOST}" "${BOX_USER}"
-    printf 'host key:       %s\n' "${fp:-(unknown)}"
-
-    keys="$(docker exec claudebox-ssh claudebox-ssh-authorize --list 2>/dev/null || true)"
-    if [ -n "${keys}" ]; then
-        printf 'authorised:\n%s\n' "${keys}"
-    else
-        printf 'authorised:     nobody yet\n'
-    fi
-
-    addrs="$(ssh_lan_addresses)"
+    config_set BOX_SYNC_SERVE ""
+    export BOX_SYNC_SERVE=""
     {
-        echo
-        echo "On the other machine:"
-        echo
-        while IFS= read -r a; do
-            [ -n "${a}" ] || continue
-            echo "    claudebox ssh mount ${a}:${BOX_SSH_PORT}"
-        done <<< "${addrs:-<this-machine>}"
-        echo
-        echo "It will print that machine's public key and the 'claudebox ssh authorize'"
-        echo "line to run back here. Compare the host key fingerprint it shows with the"
-        echo "one above before accepting it."
-        echo
+        echo "claudebox: workspace door off (BOX_SYNC_SERVE cleared in ${BOX_CONFIG})"
+        echo "claudebox: a machine syncing this tree stops being able to. Its copy is not"
+        echo "claudebox: lost -- it just stops being updated, and says so when that machine"
+        echo "claudebox: next starts its box."
+        echo "claudebox: the host key and the authorised keys are kept, so 'claudebox mutagen"
+        echo "claudebox: start' brings the same door back and nothing has to be re-authorised."
     } >&2
 }
 
-ssh_authorize() {
+sync_authorize() {
     local key="${*}"
     if [ -z "${key}" ]; then
-        echo "usage: claudebox ssh authorize '<public key>'" >&2
+        echo "usage: claudebox mutagen authorize '<public key>'" >&2
         return 2
     fi
-    if ! ssh_serving; then
-        echo "claudebox: the workspace door is not running here -- 'claudebox ssh start' first" >&2
+    if ! sync_serving; then
+        echo "claudebox: the workspace door is not running here -- 'claudebox mutagen start' first" >&2
         return 1
     fi
     # Through the container because that is where the file is: authorized_keys
-    # lives in the ssh-state volume, so there is nothing on the host to edit and
-    # no second copy to drift.
-    docker exec claudebox-ssh claudebox-ssh-authorize "${key}"
+    # lives in the sync-state volume, so there is nothing on the host to edit
+    # and no second copy to drift.
+    docker exec "${SYNC_DOOR}" claudebox-sync-authorize "${key}"
 }
 
 # ---------------------------------------------------------------------------
-# The mounting half
+# The using half
 # ---------------------------------------------------------------------------
 
-# Is the mountpoint actually carrying an sshfs mount right now?
+# One field of the live session, via mutagen's own Go templating rather than jq
+# (which would put a jq dependency on the host, and the host is supposed to need
+# nothing).
 #
-# Worth its own function because the failure it distinguishes is the quiet one:
-# an empty directory and a dropped mount look identical, and the box coming up
-# over the first is a session that sees no projects and says nothing.
-ssh_is_mounted() {
-    local fstype
-    fstype="$(findmnt -no FSTYPE --mountpoint "${SSH_MOUNTPOINT}" 2>/dev/null || true)"
-    case "${fstype}" in
-        fuse.sshfs) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-ssh_mount_status() {
-    if ssh_is_mounted; then
-        printf 'remote workspace: %s, mounted at %s\n' "${BOX_SSH_REMOTE}" "${SSH_MOUNTPOINT}"
-        printf 'host key:         %s\n' "${BOX_SSH_FINGERPRINT:-(unpinned)}"
-        if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ]; then
-            printf 'in use:           yes -- claudebox runs against it\n'
-        else
-            printf 'in use:           no -- BOX_WORKSPACE_HOST is %s\n' "${BOX_WORKSPACE_HOST}"
-        fi
-    else
-        printf 'remote workspace: %s, NOT mounted ("claudebox ssh mount" remounts it)\n' \
-            "${BOX_SSH_REMOTE:-(none joined)}"
-    fi
-}
-
-# Everything the mount needs that this machine has to supply itself. Checked up
-# front and named individually, because each one fails differently and only one
-# of them fails in a way that says what it is.
-ssh_mount_preflight() {
-    local missing=""
-    command -v sshfs      >/dev/null 2>&1 || missing="${missing} sshfs"
-    command -v ssh-keygen >/dev/null 2>&1 || missing="${missing} ssh-keygen"
-    command -v ssh-keyscan >/dev/null 2>&1 || missing="${missing} ssh-keyscan"
-    command -v sftp       >/dev/null 2>&1 || missing="${missing} sftp"
-    command -v findmnt    >/dev/null 2>&1 || missing="${missing} findmnt"
-    if [ -n "${missing}" ]; then
-        echo "claudebox: missing:${missing}" >&2
-        echo "claudebox: on Debian/Ubuntu: sudo apt install sshfs openssh-client util-linux" >&2
-        return 1
-    fi
-
-    # allow_other is what lets a process that is not this user cross the mount,
-    # and the Docker daemon -- which is root, and which is what resolves a bind
-    # source -- is exactly such a process. Without it the daemon cannot stat the
-    # mountpoint and the box fails to start with a permission error naming a
-    # path that is plainly there. FUSE only honours the option for a non-root
-    # user when /etc/fuse.conf says so, so check that rather than discovering it
-    # two commands later.
-    if [ "$(id -u)" != "0" ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
-        {
-            echo "claudebox: /etc/fuse.conf does not have user_allow_other, so this mount could"
-            echo "claudebox: not be crossed by the Docker daemon -- which is root, and which is"
-            echo "claudebox: what resolves the box's bind source. Add it once:"
-            echo "claudebox:"
-            echo "claudebox:     echo user_allow_other | sudo tee -a /etc/fuse.conf"
-            echo "claudebox:"
-        } >&2
-        return 1
-    fi
-}
-
-# This machine's key, generated on first use.
+# The names are Go STRUCT fields and are capitalised: .Status, .Paused,
+# .Alpha.Connected, .Beta.Connected, .SuccessfulCycles, .Conflicts. They are
+# NOT the lowercase names that "--template {{json .}}" prints -- that renders
+# protobuf json tags, and a template written from reading its output fails with
+# "can't evaluate field status in type synchronization.Session". Both forms were
+# checked against a live session; do not switch between them from memory.
 #
-# Its own, not ~/.ssh/id_*: claudebox generating a key without being asked has
-# no business putting it where a person keeps theirs, and a key that exists only
-# for this makes "which machines can reach my workspace" answerable by looking
-# at one authorized_keys file.
-ssh_client_key() {
-    mkdir -p "${SSH_CLIENT_DIR}"
-    chmod 0700 "${SSH_CLIENT_DIR}"
-    if [ ! -f "${SSH_CLIENT_KEY}" ]; then
-        ssh-keygen -q -t ed25519 -N '' -C "claudebox@$(hostname -s 2>/dev/null || hostname)" \
-            -f "${SSH_CLIENT_KEY}" || return 1
-        echo "claudebox: generated this machine's key (${SSH_CLIENT_KEY})" >&2
-    fi
-    chmod 0600 "${SSH_CLIENT_KEY}"
+# .Status renders the enum's String(), so it reads "Watching", not "watching" --
+# hence the case-insensitive matching everywhere it is compared.
+sync_field() {
+    docker exec "${SYNC_CLIENT}" mutagen sync list \
+        --label-selector "${SYNC_LABEL}" \
+        --template "{{range .}}{{${1}}}{{end}}" 2>/dev/null || true
+}
+
+sync_session_exists() {
+    [ -n "$(sync_field '.Identifier')" ]
+}
+
+# Ask the door who it is and what it serves, in one round trip, before anything
+# is created.
+#
+# This is the authentication probe AND the discovery step. It is the probe
+# because a refused key comes back from it as ssh's own "Permission denied
+# (publickey)" -- the state every new machine starts in, and the one sshfs
+# described worst. And it is discovery because mutagen needs an absolute remote
+# path: the old arrangement, where the login user's home WAS the tree, is
+# exactly what had to be undone so the agent binary would not land in the source
+# tree.
+sync_probe() {
+    docker exec "${SYNC_CLIENT}" \
+        ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        claudebox-door /usr/local/bin/claudebox-sync-info 2>&1
 }
 
 # Pin the far side's host key, or check it against what was pinned before.
 #
 # Trust on first sight, and then never again -- the same bargain ssh makes the
-# first time it shows a host key, and the same one the agent door's certificate
-# makes. What it buys is that everything after the first mount is checked: a
-# machine that answers on that address later with a different key gets a refusal
-# here rather than a prompt, because there is nobody at a terminal to read a
-# prompt when this runs from a script.
-ssh_pin_host() {
-    local host="${1}" port="${2}" scanned fp
+# first time it shows a host key. Everything after the first attach is checked:
+# a machine that answers on that address later with a different key gets a
+# refusal here rather than a prompt, because there is nobody at a terminal to
+# read a prompt when this runs from a script.
+#
+# All of it runs INSIDE the syncer, because that is where the known_hosts file
+# mutagen will read lives -- and because the host is no longer required to have
+# openssh at all.
+sync_pin_host() {
+    local host="${1}" port="${2}" scanned fp known_fp=""
 
-    mkdir -p "${SSH_CLIENT_DIR}"
-    chmod 0700 "${SSH_CLIENT_DIR}"
-    touch "${SSH_KNOWN_HOSTS}"
-    chmod 0600 "${SSH_KNOWN_HOSTS}"
-
-    scanned="$(ssh-keyscan -T 8 -t ed25519 -p "${port}" "${host}" 2>/dev/null | grep -v '^#' || true)"
+    scanned="$(docker exec "${SYNC_CLIENT}" \
+        ssh-keyscan -T 8 -t ed25519 -p "${port}" "${host}" 2>/dev/null \
+        | grep -v '^#' || true)"
     if [ -z "${scanned}" ]; then
         {
             echo "claudebox: nothing answered on ${host}:${port}."
-            echo "claudebox: On that machine, 'claudebox ssh start' brings the door up and"
-            echo "claudebox: 'claudebox ssh status' prints the address to use here."
+            echo "claudebox: On that machine, 'claudebox mutagen start' brings the door up and"
+            echo "claudebox: 'claudebox mutagen status' prints the address to use here."
         } >&2
         return 1
     fi
 
-    fp="$(printf '%s\n' "${scanned}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -1 || true)"
+    fp="$(printf '%s\n' "${scanned}" \
+        | docker exec -i "${SYNC_CLIENT}" ssh-keygen -lf - 2>/dev/null \
+        | awk '{print $2}' | head -1 || true)"
     if [ -z "${fp}" ]; then
         echo "claudebox: ${host}:${port} answered with something that is not a host key" >&2
         return 1
     fi
 
-    # What is already in known_hosts for this address, if anything, is the first
-    # thing the scan is checked against -- and it is the check that closes the
-    # window between a first mount that failed and the one that succeeds.
-    # BOX_SSH_FINGERPRINT is only written on a SUCCESSFUL mount, so up to then
+    # What is already pinned for this address, if anything, is the first thing
+    # the scan is checked against -- and it is the check that closes the window
+    # between a first attach that failed and the one that succeeds.
+    # BOX_SYNC_FINGERPRINT is only written on a SUCCESSFUL attach, so up to then
     # the config knows nothing, and a pin rewritten from a fresh scan on every
-    # attempt would take a new key without a word. known_hosts is per-address and
-    # was written by the first attempt, so it is what remembers.
-    local known known_fp=""
-    known="$(grep -F "[${host}]:${port} " "${SSH_KNOWN_HOSTS}" 2>/dev/null | head -1 || true)"
-    if [ -n "${known}" ]; then
-        known_fp="$(printf '%s\n' "${known}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
-    fi
+    # attempt would take a new key without a word.
+    known_fp="$(docker exec "${SYNC_CLIENT}" sh -c \
+        "grep -F '[${host}]:${port} ' /var/lib/claudebox-sync-client/known_hosts 2>/dev/null | head -1" 2>/dev/null \
+        | docker exec -i "${SYNC_CLIENT}" ssh-keygen -lf - 2>/dev/null \
+        | awk '{print $2}' || true)"
     if [ -n "${known_fp}" ] && [ "${known_fp}" != "${fp}" ]; then
         {
             echo "claudebox: ${host}:${port} presented a DIFFERENT host key than the one this"
             echo "claudebox: machine pinned earlier."
             echo "claudebox:   pinned:    ${known_fp}"
             echo "claudebox:   presented: ${fp}"
-            echo "claudebox: 'claudebox ssh forget' drops the pin if the key really was rotated"
-            echo "claudebox: over there -- check with 'claudebox ssh status' on that machine first."
+            echo "claudebox: 'claudebox mutagen forget' drops the pin if the key really was"
+            echo "claudebox: rotated over there -- check 'claudebox mutagen status' on it first."
         } >&2
         return 1
     fi
 
-    # Only against the remote it was taken from. BOX_SSH_FINGERPRINT is one
+    # Only against the remote it was taken from. BOX_SYNC_FINGERPRINT is one
     # setting because BOX_WORKSPACE_HOST is one setting, so it describes the
-    # machine in BOX_SSH_REMOTE and nothing else -- checking a second machine's
-    # key against it would refuse it as an impostor for having a different
-    # identity, which is the one thing it is guaranteed to have. Mounting a
-    # different address is a re-join, and it re-pins. known_hosts, which is
-    # per-host, is what keeps that from being a hole.
-    if [ -n "${BOX_SSH_FINGERPRINT}" ] \
-       && [ "${BOX_SSH_REMOTE##*@}" = "${host}:${port}" ] \
-       && [ "${BOX_SSH_FINGERPRINT}" != "${fp}" ]; then
+    # machine in BOX_SYNC_REMOTE and nothing else -- checking a second machine's
+    # key against it would refuse it for having a different identity, which is
+    # the one thing it is guaranteed to have.
+    if [ -n "${BOX_SYNC_FINGERPRINT}" ] \
+       && [ "${BOX_SYNC_REMOTE##*@}" = "${host}:${port}" ] \
+       && [ "${BOX_SYNC_FINGERPRINT}" != "${fp}" ]; then
         {
             echo "claudebox: ${host}:${port} presented a DIFFERENT host key than the one pinned."
-            echo "claudebox:   pinned:    ${BOX_SSH_FINGERPRINT}"
+            echo "claudebox:   pinned:    ${BOX_SYNC_FINGERPRINT}"
             echo "claudebox:   presented: ${fp}"
-            echo "claudebox: Either the workspace door's state volume was recreated over there,"
-            echo "claudebox: or this is not that machine. Check with 'claudebox ssh status' on"
-            echo "claudebox: it; if the key really was rotated, 'claudebox ssh forget' here"
-            echo "claudebox: drops the pin so the next mount takes the new one."
+            echo "claudebox: Either the door's state volume was recreated over there, or this is"
+            echo "claudebox: not that machine. 'claudebox mutagen forget' drops the pin."
         } >&2
         return 1
     fi
@@ -1928,41 +1964,21 @@ ssh_pin_host() {
     # Rewrite this host's lines rather than appending: re-pinning after a
     # deliberate rotation would otherwise leave the old key in the file, where
     # ssh finds it first and refuses.
-    local tmp
-    tmp="$(mktemp "${SSH_KNOWN_HOSTS}.XXXXXX")"
-    grep -v -F "[${host}]:${port}" "${SSH_KNOWN_HOSTS}" > "${tmp}" 2>/dev/null || true
-    printf '%s\n' "${scanned}" >> "${tmp}"
-    chmod 0600 "${tmp}"
-    mv -- "${tmp}" "${SSH_KNOWN_HOSTS}"
+    printf '%s\n' "${scanned}" | docker exec -i "${SYNC_CLIENT}" sh -c "
+        set -e
+        K=/var/lib/claudebox-sync-client/known_hosts
+        T=\$(mktemp)
+        grep -v -F '[${host}]:${port} ' \"\${K}\" > \"\${T}\" 2>/dev/null || true
+        cat >> \"\${T}\"
+        chmod 0600 \"\${T}\"
+        mv -- \"\${T}\" \"\${K}\"
+    " || { echo "claudebox: could not write the pinned host key" >&2; return 1; }
 
-    ssh_pinned_fingerprint="${fp}"
-    if [ -z "${BOX_SSH_FINGERPRINT}" ] && [ -z "${known_fp}" ]; then
+    sync_pinned_fingerprint="${fp}"
+    if [ -z "${BOX_SYNC_FINGERPRINT}" ] && [ -z "${known_fp}" ]; then
         echo "claudebox: pinned host key ${fp}" >&2
-        echo "claudebox: compare it with what 'claudebox ssh status' prints over there" >&2
+        echo "claudebox: compare it with what 'claudebox mutagen status' prints over there" >&2
     fi
-}
-
-# Ask the far side whether it would let us in, before asking sshfs to mount.
-#
-# Because sshfs does not pass the answer on. A refused key comes back from it as
-# "read: Connection reset by peer" and nothing else -- the "Permission denied
-# (publickey)" that ssh actually printed is consumed somewhere between the two,
-# so the one failure every new machine starts in is also the one sshfs describes
-# worst.
-#
-# "sftp -b -" fed a single "quit" is the probe rather than "ssh <host> true"
-# because it exercises exactly what sshfs will: the same authentication AND the
-# sftp subsystem behind it, which is the other thing that can be missing on the
-# far side. It exits 255 and says why.
-ssh_probe() {
-    local host="${1}" port="${2}" user="${3}"
-    printf 'quit\n' | sftp -b - -P "${port}" \
-        -o IdentityFile="${SSH_CLIENT_KEY}" \
-        -o IdentitiesOnly=yes \
-        -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" \
-        -o StrictHostKeyChecking=yes \
-        -o BatchMode=yes \
-        "${user}@${host}" 2>&1
 }
 
 # Is the door at the far end this machine's own?
@@ -1970,25 +1986,54 @@ ssh_probe() {
 # By fingerprint rather than by address, because the address it was reached at
 # proves nothing: 127.0.0.1, the LAN address, and the machine's own hostname are
 # all the same door, and a comparison of strings would miss two of the three.
-ssh_is_own_door() {
+sync_is_own_door() {
     local fp="${1}" mine
-    ssh_serving || return 1
-    mine="$(docker exec claudebox-ssh cat /var/lib/claudebox-ssh/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
+    sync_serving || return 1
+    mine="$(docker exec "${SYNC_DOOR}" cat /var/lib/claudebox-sync/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
     [ -n "${mine}" ] && [ "${mine}" = "${fp}" ]
 }
 
-# What to say when the far side refuses the key -- which is the ordinary state
-# of a first mount, not an error, and the one moment the two-machine dance needs
+# Attaching to this machine's own door.
+#
+# Under sshfs this was a flat refusal, and it had to be: the mount and the sshd
+# serving it were services in one compose project, so the next launch recreated
+# the door while the host's own mount was live, the mount blocked forever, and
+# dockerd blocked in the kernel resolving the bind source -- the machine needed
+# a reboot. None of that mechanism survives. The copy and the served tree are
+# two ordinary directories, mutagen never blocks on either, and recreating the
+# door merely disconnects a session that reconnects.
+#
+# So this is now the supported way to exercise the feature without a second
+# machine, with the one check that does still bite: the two trees must not
+# overlap, because that is mutagen syncing a directory into itself.
+sync_loopback_check() {
+    local served="${1}" overlap=""
+    case "${SYNC_DIR}/" in "${served}/"*) overlap=1 ;; esac
+    case "${served}/" in "${SYNC_DIR}/"*) overlap=1 ;; esac
+    if [ -n "${overlap}" ]; then
+        echo "claudebox: ${SYNC_DIR} and ${served} overlap -- that is a sync into itself" >&2
+        return 1
+    fi
+    {
+        echo "claudebox: note: that is THIS machine's own door. Allowed -- it is how the"
+        echo "claudebox: feature is tested without a second machine -- but the box will then"
+        echo "claudebox: work in a COPY of a tree that is also on this disk. Do not edit"
+        echo "claudebox: ${served} directly while attached."
+    } >&2
+}
+
+# What to say when the far side refuses the key -- the ordinary state of a first
+# attach, not an error, and the one moment the two-machine dance needs
 # explaining.
-ssh_not_authorized_yet() {
+sync_not_authorized_yet() {
     local host="${1}" port="${2}" pub
-    pub="$(cat "${SSH_CLIENT_KEY}.pub")"
+    pub="$(docker exec "${SYNC_CLIENT}" cat /var/lib/claudebox-sync-client/id_ed25519.pub 2>/dev/null || true)"
     {
         echo
         echo "claudebox: ${host}:${port} would not let this machine in yet."
         echo "claudebox: On THAT machine, run:"
         echo
-        echo "    claudebox ssh authorize '${pub}'"
+        echo "    claudebox mutagen authorize '${pub}'"
         echo
         echo "claudebox: then run this again. That key is this machine's; it is public,"
         echo "claudebox: and pasting it anywhere is safe."
@@ -1996,288 +2041,748 @@ ssh_not_authorized_yet() {
     } >&2
 }
 
-ssh_mount() {
-    local spec="${1:-}" out rc=""
+# Bring the syncer up, explicitly with its profile.
+#
+# Explicitly, because BOX_SYNC_REMOTE is what normally selects that profile and
+# it is precisely what does not exist yet on a first attach. The address goes in
+# as environment because the sidecar's entrypoint turns it into ~/.ssh/config --
+# the only place mutagen will look for it.
+sync_client_up() {
+    export BOX_SYNC_REMOTE_HOST="${sync_remote_host}"
+    export BOX_SYNC_REMOTE_PORT="${sync_remote_port}"
+    export BOX_SYNC_REMOTE_USER="${sync_remote_user}"
+    export BOX_SYNC_DIR="${SYNC_DIR}"
+    export BOX_SYNC_LABEL="$(hostname -s 2>/dev/null || hostname || echo unknown)"
 
-    ssh_mount_preflight || return 1
+    # Docker creates a missing bind source as a root-owned directory, and a
+    # root-owned tree is one neither the syncer nor the box can write to.
+    mkdir -p "${SYNC_DIR}" "${SYNC_CLIENT_DIR}"
+    chmod 0700 "${SYNC_CLIENT_DIR}"
 
-    if [ -z "${spec}" ]; then
-        if [ -z "${BOX_SSH_REMOTE}" ]; then
-            echo "claudebox: no remote workspace joined yet" >&2
-            echo "claudebox: usage: claudebox ssh mount [user@]<host>[:port]" >&2
-            return 2
-        fi
-        spec="${BOX_SSH_REMOTE}"
-    fi
-    ssh_parse_remote "${spec}" || return 1
-
-    if ssh_is_mounted; then
-        echo "claudebox: ${BOX_SSH_REMOTE:-a remote workspace} is already mounted at ${SSH_MOUNTPOINT}" >&2
-        echo "claudebox: 'claudebox ssh eject' unmounts it first" >&2
-        return 0
-    fi
-
-    ssh_client_key || return 1
-    ssh_pinned_fingerprint=""
-    ssh_pin_host "${ssh_remote_host}" "${ssh_remote_port}" || return 1
-
-    # Never this machine's own door. It looks like the obvious way to try the
-    # feature out without a second machine; it wedges the Docker daemon.
-    #
-    # Measured here, and the reason this is a refusal and not a warning: the
-    # door, the box and dind are all services in ONE compose project, and all
-    # three carry the workspace bind. Pointing BOX_WORKSPACE_HOST at the local
-    # mount changes the bind source for every one of them, so the next launch
-    # recreates THE DOOR TOO -- killing the sshd that this machine's own sshfs
-    # mount is talking to. sshfs is mounted with -o reconnect, so rather than
-    # failing it blocks; and the next thing to touch that mountpoint is dockerd,
-    # resolving the bind source for the box. It blocks in the kernel holding
-    # that container's lock: the box sits in "Created", "docker inspect
-    # claudebox" and "docker logs claudebox" hang while the rest of the daemon
-    # answers normally, and nothing short of a reboot clears it.
-    #
-    # Two machines cannot reach this state. A "compose up" on the machine that
-    # MOUNTED the workspace does not touch the machine serving it, which is the
-    # whole difference.
-    if ssh_is_own_door "${ssh_pinned_fingerprint}"; then
-        {
-            echo "claudebox: ${ssh_remote_host}:${ssh_remote_port} is THIS machine's own workspace door."
-            echo "claudebox:"
-            echo "claudebox: Mounting it here would put the sshd, the box and dind in one compose"
-            echo "claudebox: project over one sshfs mount -- and the next launch, which recreates"
-            echo "claudebox: all three, would stop the sshd while the mount is still live. The"
-            echo "claudebox: mount then blocks forever (it is mounted with reconnect), dockerd"
-            echo "claudebox: blocks on it while resolving the box's bind source, and the daemon"
-            echo "claudebox: needs a reboot. Refusing rather than letting that happen."
-            echo "claudebox:"
-            echo "claudebox: This command belongs on the OTHER machine -- the one that does not"
-            echo "claudebox: have the tree. The workspace is already here."
-        } >&2
+    if ! "${COMPOSE[@]}" --profile mutagen up -d mutagen; then
+        echo "claudebox: the syncer did not start; 'docker logs ${SYNC_CLIENT}' has why" >&2
         return 1
     fi
 
-    # Docker creates a missing bind source as a root-owned directory, and a
-    # root-owned mountpoint is one this user cannot mount on. Make it first, and
-    # only when it is not already there -- an existing one may be someone's.
-    mkdir -p "${SSH_MOUNTPOINT}"
+    # The container being up is not the daemon answering, and the difference is
+    # exactly the state that leaves a copy stale while looking fine.
+    local i
+    for i in $(seq 1 60); do
+        if docker exec "${SYNC_CLIENT}" mutagen sync list >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "claudebox: the mutagen daemon in ${SYNC_CLIENT} is not answering" >&2
+    return 1
+}
 
-    # A non-empty mountpoint is a real signal here rather than a nuisance: it
-    # means a previous mount dropped and left files written underneath it, and
-    # mounting over them hides them for as long as the mount lasts.
-    if [ -n "$(ls -A -- "${SSH_MOUNTPOINT}" 2>/dev/null)" ]; then
-        echo "claudebox: warning: ${SSH_MOUNTPOINT} is not empty -- something was written there" >&2
-        echo "claudebox: while nothing was mounted. Those files are hidden, not lost, while" >&2
-        echo "claudebox: the mount is up." >&2
+sync_attach() {
+    local spec="${1:-}" info rc="" served empty existing
+
+    if [ -z "${spec}" ]; then
+        if [ -z "${BOX_SYNC_REMOTE}" ]; then
+            echo "claudebox: no remote workspace joined yet" >&2
+            echo "claudebox: usage: claudebox mutagen attach [user@]<host>[:port]" >&2
+            return 2
+        fi
+        spec="${BOX_SYNC_REMOTE}"
     fi
+    sync_parse_remote "${spec}" || return 1
 
-    # Ask first, so a refusal is reported as a refusal. Everything after this
-    # point has been proved to authenticate and to speak sftp, which makes an
-    # sshfs failure below a mount problem and worth printing verbatim.
-    out="$(ssh_probe "${ssh_remote_host}" "${ssh_remote_port}" "${ssh_remote_user}")" || rc=$?
+    # A loopback address is never right here, and the failure it produces
+    # otherwise is misleading: the syncer is a CONTAINER, so 127.0.0.1 is the
+    # container itself and a door published on the host's port is not on it. The
+    # address to use for this machine's own door is its LAN address -- which is
+    # what "claudebox mutagen status" prints.
+    case "${sync_remote_host}" in
+        127.*|localhost|::1|\[::1\])
+            {
+                echo "claudebox: ${sync_remote_host} is not reachable from the syncer, because the"
+                echo "claudebox: syncer is a container -- loopback there is the container itself,"
+                echo "claudebox: not this machine. Use this machine's LAN address instead:"
+                echo "claudebox:"
+                for a in $(sync_lan_addresses); do
+                    echo "claudebox:     claudebox mutagen attach ${a}:${sync_remote_port}"
+                done
+            } >&2
+            return 1
+            ;;
+    esac
+
+    sync_client_up || return 1
+
+    sync_pinned_fingerprint=""
+    sync_pin_host "${sync_remote_host}" "${sync_remote_port}" || return 1
+
+    info="$(sync_probe)" || rc=$?
     if [ -n "${rc:-}" ]; then
-        case "${out}" in
-            *"Permission denied"*|*"publickey"*)
-                ssh_not_authorized_yet "${ssh_remote_host}" "${ssh_remote_port}"
+        case "${info}" in
+            *"Permission denied"*|*publickey*)
+                sync_not_authorized_yet "${sync_remote_host}" "${sync_remote_port}"
                 ;;
-            *"subsystem request failed"*)
-                echo "claudebox: ${ssh_remote_host}:${ssh_remote_port} let this machine in but does not" >&2
-                echo "claudebox: speak sftp, which is what sshfs mounts with. That is a workspace" >&2
-                echo "claudebox: door built without openssh-sftp-server -- 'claudebox rebuild' over" >&2
-                echo "claudebox: there, then 'claudebox ssh start' again." >&2
+            *"command not found"*|*"No such file"*)
+                echo "claudebox: ${sync_remote_host}:${sync_remote_port} let this machine in, but does not" >&2
+                echo "claudebox: answer claudebox-sync-info -- that is an older workspace door, from" >&2
+                echo "claudebox: before the move to mutagen. 'claudebox rebuild' over there." >&2
                 ;;
             *)
-                echo "claudebox: could not reach ${ssh_remote_host}:${ssh_remote_port}" >&2
-                if [ -n "${out}" ]; then
-                    printf '%s\n' "${out}" >&2
+                echo "claudebox: could not reach ${sync_remote_host}:${sync_remote_port}" >&2
+                if [ -n "${info}" ]; then
+                    printf '%s\n' "${info}" >&2
                 fi
                 ;;
         esac
         return 1
     fi
 
-    # -o allow_other:      the Docker daemon is root and has to cross this
-    # -o default_permissions: with the ids forced below, let the kernel do the
-    #                      permission checks rather than the remote sshd
-    # -o uid/gid:          the tree in the box is owned by the box user; force
-    #                      the same ids here so a uid that differs between the
-    #                      two machines does not turn the whole tree read-only
-    # -o reconnect + keepalives: a laptop lid, a sleeping switch. Without these
-    #                      the mount goes to "Transport endpoint is not
-    #                      connected" and stays there.
-    # -o BatchMode:        never prompt. This can run from a script, and a
-    #                      passphrase prompt nobody sees is a hang.
-    out="$(sshfs "${ssh_remote_user}@${ssh_remote_host}:" "${SSH_MOUNTPOINT}" \
-            -p "${ssh_remote_port}" \
-            -o IdentityFile="${SSH_CLIENT_KEY}" \
-            -o IdentitiesOnly=yes \
-            -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" \
-            -o StrictHostKeyChecking=yes \
-            -o BatchMode=yes \
-            -o allow_other \
-            -o default_permissions \
-            -o uid="${BOX_UID}" \
-            -o gid="${BOX_GID}" \
-            -o reconnect \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -o Compression=no \
-            2>&1)" && rc=0 || rc=$?
+    served="$(printf '%s\n' "${info}" | sed -n 's/^workspace=//p' | head -1 || true)"
+    if [ -z "${served}" ]; then
+        echo "claudebox: ${sync_remote_host} answered without naming a workspace" >&2
+        return 1
+    fi
 
-    if [ "${rc}" != "0" ] || ! ssh_is_mounted; then
-        # The probe above already cleared authentication and the sftp subsystem,
-        # so whatever this is, it is about the mount and nothing here can improve
-        # on sshfs's own words.
-        echo "claudebox: could not mount ${ssh_remote_host}:${ssh_remote_port}" >&2
-        if [ -n "${out}" ]; then
-            printf '%s\n' "${out}" >&2
+    if sync_is_own_door "${sync_pinned_fingerprint}"; then
+        sync_loopback_check "${served}" || return 1
+    fi
+
+    empty="$(printf '%s\n' "${info}" | sed -n 's/^empty=//p' | head -1 || true)"
+    if [ "${empty}" = "yes" ]; then
+        {
+            echo "claudebox: ${sync_remote_host}:${sync_remote_port} is serving an EMPTY tree."
+            echo "claudebox: Attaching would sync nothing down, and once anything is written"
+            echo "claudebox: here it would sync a deletion back. Check 'claudebox mutagen"
+            echo "claudebox: status' over there -- a drive that did not mount looks like this."
+        } >&2
+        return 1
+    fi
+
+    # A copy that already has content in it. Two very different situations.
+    #
+    # Attaching somewhere NEW over a non-empty directory is a refusal: with no
+    # ancestor, content here and absent there propagates UP, so this would push
+    # whatever is lying around into someone else's workspace.
+    #
+    # Re-attaching to the remote already recorded is normal -- that is what the
+    # copy is -- and must not require deleting a good tree.
+    # -I on the sentinel: on a re-attach after detach the copy may legitimately
+    # be nothing but the marker, and counting it would make an empty directory
+    # look occupied.
+    if [ -n "$(ls -A -I "${SYNC_SENTINEL}" -- "${SYNC_DIR}" 2>/dev/null)" ] && ! sync_session_exists; then
+        existing="${sync_remote_user}@${sync_remote_host}:${sync_remote_port}"
+        if [ "${BOX_SYNC_REMOTE}" != "${existing}" ]; then
+            {
+                echo "claudebox: ${SYNC_DIR} is not empty, and this is a first attach to"
+                echo "claudebox: ${existing}. A new session has no history to reason from, so"
+                echo "claudebox: anything here that is not over there would be propagated UP into"
+                echo "claudebox: that machine's workspace. Refusing."
+                echo "claudebox:"
+                echo "claudebox: Move or delete ${SYNC_DIR} first, or point BOX_SYNC_DIR"
+                echo "claudebox: somewhere else."
+            } >&2
+            return 1
         fi
-        fusermount3 -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 \
-            || fusermount -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 || true
-        return 1
+        echo "claudebox: ${SYNC_DIR} already has content; re-attaching to ${existing}." >&2
+        echo "claudebox: Anything here that is not over there will be propagated up to it." >&2
     fi
 
-    # Prove it is readable before anything is pointed at it. sshfs mounts
-    # optimistically -- the mount appears whether or not the remote directory
-    # can actually be listed -- and a workspace that answers EIO on every read
-    # is worse than one that failed to mount.
-    if ! ls -A -- "${SSH_MOUNTPOINT}" >/dev/null 2>&1; then
-        echo "claudebox: mounted, but ${SSH_MOUNTPOINT} cannot be read; unmounting again" >&2
-        fusermount3 -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 \
-            || fusermount -u "${SSH_MOUNTPOINT}" >/dev/null 2>&1 || true
-        return 1
+    # The sentinel, written BEFORE the session exists so it is in place from the
+    # first cycle. It is in the ignore list, so it never crosses to the other
+    # machine -- it says "this directory is the copy", and it is the only thing
+    # that can say so. sync_require_current explains what its absence prevents.
+    printf '%s\n' \
+        "# claudebox: this directory is the local copy of a remote workspace." \
+        "# Written by 'claudebox mutagen attach'. Never synced." \
+        "remote=${sync_remote_user}@${sync_remote_host}:${sync_remote_port}" \
+        "path=${served}" \
+        > "${SYNC_DIR}/${SYNC_SENTINEL}"
+
+    if sync_session_exists; then
+        echo "claudebox: already syncing with ${sync_remote_user}@${sync_remote_host}:${sync_remote_port}" >&2
+    else
+        sync_create_session "${served}" || return 1
     fi
 
-    config_set BOX_SSH_REMOTE "${ssh_remote_user}@${ssh_remote_host}:${ssh_remote_port}"
-    if [ -n "${ssh_pinned_fingerprint}" ]; then
-        config_set BOX_SSH_FINGERPRINT "${ssh_pinned_fingerprint}"
-    fi
+    sync_wait_initial || return 1
 
-    # Remember what the workspace was before taking it over, so "eject" has
-    # something to put back. Guarded against a second mount overwriting it with
-    # the mountpoint itself, which would make the local workspace unrecoverable
-    # from the config file.
-    if [ "${BOX_WORKSPACE_HOST}" != "${SSH_MOUNTPOINT}" ]; then
-        config_set BOX_SSH_LOCAL_WORKSPACE_HOST "${BOX_WORKSPACE_HOST}"
+    config_set BOX_SYNC_REMOTE "${sync_remote_user}@${sync_remote_host}:${sync_remote_port}"
+    if [ -n "${sync_pinned_fingerprint}" ]; then
+        config_set BOX_SYNC_FINGERPRINT "${sync_pinned_fingerprint}"
     fi
-    config_set BOX_WORKSPACE_HOST "${SSH_MOUNTPOINT}"
+    config_set BOX_SYNC_REMOTE_PATH "${served}"
+
+    # Remember what the workspace was before taking it over, so "detach" has
+    # something to put back. Guarded against a second attach overwriting it with
+    # the copy itself, which would make the local workspace unrecoverable from
+    # the config file.
+    if [ "${BOX_WORKSPACE_HOST}" != "${SYNC_DIR}" ]; then
+        config_set BOX_SYNC_LOCAL_WORKSPACE_HOST "${BOX_WORKSPACE_HOST}"
+    fi
+    config_set BOX_WORKSPACE_HOST "${SYNC_DIR}"
+
+    # The stamp: what the live session was created against. Every later command
+    # compares it, so "the session is running" can be told apart from "the
+    # session is running against the tree I think it is".
+    printf 'alpha=%s\nbeta=%s\nfingerprint=%s\n' \
+        "${SYNC_DIR}" "${sync_remote_host}:${sync_remote_port}:${served}" \
+        "${sync_pinned_fingerprint}" > "${SYNC_STAMP}"
 
     {
-        echo "claudebox: mounted ${ssh_remote_user}@${ssh_remote_host}:${ssh_remote_port} at ${SSH_MOUNTPOINT}"
-        echo "claudebox: BOX_WORKSPACE_HOST now points there, so the next 'claudebox' works"
-        echo "claudebox: against the remote tree -- inside the box it is still ${BOX_WORKSPACE}."
-        echo "claudebox: 'claudebox ssh eject' puts it back."
+        echo "claudebox: attached to ${sync_remote_user}@${sync_remote_host}:${sync_remote_port} (${served})"
+        echo "claudebox: the copy is at ${SYNC_DIR}, and BOX_WORKSPACE_HOST points there, so"
+        echo "claudebox: the next 'claudebox' works against real local files -- inside the box"
+        echo "claudebox: it is still ${BOX_WORKSPACE}."
+        echo "claudebox: 'claudebox mutagen detach' puts the local workspace back."
     } >&2
 
-    # A box that is already running holds the OLD workspace in its mount
-    # namespace; compose recreates it on the next launch because the bind
-    # source changed, but until then a session in it is still on the local
-    # tree. Say so rather than leaving the two disagreeing quietly.
-    if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+    if docker inspect --type container "${CONTAINER}" >/dev/null 2>&1; then
         echo "claudebox: the box is running on the old workspace; the next 'claudebox'" >&2
         echo "claudebox: recreates it against this one." >&2
     fi
 }
 
-# Unmount, and give the local workspace back.
-#
-# Stop the stack first, and that ordering is the whole point of this command
-# rather than a bare fusermount -- a container that has the mount bound into it
-# holds the FUSE filesystem in its own namespace, so the unmount fails with
-# "Device or resource busy" (or, worse, succeeds while the container reads on).
-# It is exactly the trap "claudebox eject" documents for a removable drive,
-# arrived at from the other direction.
-ssh_eject() {
-    local prev pointed_at
+sync_create_session() {
+    local served="${1}" ignores=() pat
 
-    # What the FILE says, not what this process resolved: a shell profile
-    # exporting BOX_WORKSPACE_HOST beats the file, and eject deciding from the
-    # resolved value would leave the file still pointing at a mountpoint that is
-    # no longer mounted -- which is the state the launcher now refuses to start
-    # over.
+    # Ignores are a setting because the right answer depends on the tree, and
+    # ${VAR-default} rather than ${VAR:-default}: an explicitly empty list is a
+    # deliberate "sync everything" and must not silently get defaults back.
+    for pat in ${BOX_SYNC_IGNORE}; do
+        ignores+=(--ignore "${pat}")
+    done
+
+    # --ignore-vcs is the obvious flag here and it is exactly wrong. It exists
+    # for this class of tool and every mutagen example uses it -- and it would
+    # leave .git out of the copy, so `git status` in the box would answer "not a
+    # git repository". Git running locally is the entire reason this replaced
+    # sshfs; that requires .git to BE local. Do not add it.
+    #
+    # The cost, which is documented in config.example and in the door's status:
+    # do not run git on the serving machine while a session is attached. Two
+    # gits writing one .git through a reconciler that does not understand
+    # packfile atomicity will corrupt a repository.
+    #
+    # --symlink-mode=posix-raw: the default (portable) accepts only relative
+    # links that stay inside the sync root, and real trees carry absolute ones
+    # in node_modules and vendor -- pnpm links to a global store, and some
+    # .bin/ layouts are absolute. posix-raw copies the target verbatim. Mutagen
+    # does not FOLLOW symlinks, so a link pointing outside the tree is still
+    # just a link, not a traversal.
+    docker exec "${SYNC_CLIENT}" mutagen sync create \
+        --name "${SYNC_SESSION}" \
+        --label "${SYNC_LABEL}" \
+        --sync-mode "${BOX_SYNC_MODE}" \
+        --symlink-mode posix-raw \
+        --ignore "/${SYNC_SENTINEL}" \
+        "${ignores[@]}" \
+        "${SYNC_DIR}" \
+        "claudebox-door:${served}"
+}
+
+# Wait for the first full reconciliation, printing what it is doing.
+#
+# No fixed deadline: a first sync of a large tree legitimately takes a long
+# time, and any timeout worth setting would be shorter than that. ^C is the
+# escape; the session survives it and "status --follow" picks the view back up.
+sync_wait_initial() {
+    local status last="" cycles
+
+    echo "claudebox: waiting for the first sync to finish (^C to leave it running)..." >&2
+    while :; do
+        status="$(sync_field '.Status')"
+        cycles="$(sync_field '.SuccessfulCycles')"
+        case "${status}" in
+            [Ww]atching*)
+                if [ "${cycles:-0}" != "0" ]; then
+                    printf '\rclaudebox: first sync complete.%*s\n' 30 '' >&2
+                    return 0
+                fi
+                ;;
+            *[Hh]alted*)
+                printf '\n' >&2
+                echo "claudebox: the sync halted: ${status}" >&2
+                echo "claudebox: mutagen stops rather than propagate the disappearance of a whole" >&2
+                echo "claudebox: tree. Check both ends before resuming -- this is the safety net" >&2
+                echo "claudebox: working, not a fault." >&2
+                return 1
+                ;;
+            "")
+                printf '\n' >&2
+                echo "claudebox: the session went away while waiting for it" >&2
+                return 1
+                ;;
+        esac
+        if [ "${status}" != "${last}" ]; then
+            printf '\rclaudebox: %-40s' "${status}" >&2
+            last="${status}"
+        fi
+        sleep 1
+    done
+}
+
+# Stop syncing and give the local workspace back.
+#
+# The order is the whole point of the command, as it was for the sshfs eject --
+# but for a different reason. Nothing is held open; work is in flight.
+sync_detach() {
+    local pointed_at prev force=""
+    case "${1:-}" in --force) force=1 ;; esac
+
     pointed_at="$(config_get BOX_WORKSPACE_HOST || true)"
 
-    if ! ssh_is_mounted; then
-        echo "claudebox: nothing is mounted at ${SSH_MOUNTPOINT}" >&2
-        # The pointer can outlive the mount -- a reboot, a killed sshfs -- and a
-        # BOX_WORKSPACE_HOST left aimed at an empty directory is precisely the
-        # "workspace with no projects in it" failure. Clean it up anyway.
-        if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] || [ "${pointed_at}" = "${SSH_MOUNTPOINT}" ]; then
-            prev="${BOX_SSH_LOCAL_WORKSPACE_HOST:-$(config_get BOX_SSH_LOCAL_WORKSPACE_HOST || true)}"
-            config_set BOX_WORKSPACE_HOST "${prev}"
-            config_set BOX_SSH_LOCAL_WORKSPACE_HOST ""
-            echo "claudebox: BOX_WORKSPACE_HOST was still pointing at it; set back to ${prev:-the default}" >&2
+    if ! sync_client_running; then
+        echo "claudebox: the syncer is not running, so there is nothing to flush" >&2
+    else
+        # Stop the box first -- but ONLY if it is actually working in the copy.
+        #
+        # Not because it holds anything open (a bind does not), but because
+        # anything it writes between the flush below and the session ending is
+        # work that exists on exactly one machine and nothing will carry it
+        # over. That reasoning applies only to a box that is IN the copy: a box
+        # working somewhere else is a running session with a person attached to
+        # it, and killing that to tidy up a sync it is not using would be a
+        # gratuitous thing to do.
+        if sync_box_is_in_copy; then
+            echo "claudebox: stopping the box so nothing is written mid-flush" >&2
+            "${COMPOSE[@]}" stop claude >/dev/null 2>&1 || true
         fi
+
+        if sync_session_exists; then
+            echo "claudebox: flushing the last changes to ${BOX_SYNC_REMOTE}..." >&2
+            # The timeout runs INSIDE the container. mutagen sync flush blocks
+            # until the cycle completes and hangs forever against a disconnected
+            # endpoint; a host-side timeout around "docker exec" would kill only
+            # the client and leave mutagen waiting.
+            if ! docker exec "${SYNC_CLIENT}" \
+                    timeout "${BOX_SYNC_FLUSH_TIMEOUT}" \
+                    mutagen sync flush --label-selector "${SYNC_LABEL}" >/dev/null 2>&1; then
+                if [ -z "${force}" ]; then
+                    {
+                        echo "claudebox: the last sync did not complete -- ${BOX_SYNC_REMOTE} may be down."
+                        echo "claudebox: Detaching now would leave whatever is unsynced HERE and nowhere"
+                        echo "claudebox: else. 'claudebox mutagen status' says what is outstanding;"
+                        echo "claudebox: 'claudebox mutagen detach --force' detaches anyway. The copy is"
+                        echo "claudebox: kept either way."
+                    } >&2
+                    return 1
+                fi
+                echo "claudebox: flush failed, detaching anyway (--force)" >&2
+            fi
+
+            # Terminate, not pause: a paused session is one "resume" away from
+            # reconciling a copy that has been edited on both sides since, and a
+            # detached machine is exactly where that edit happens.
+            docker exec "${SYNC_CLIENT}" mutagen sync terminate \
+                --label-selector "${SYNC_LABEL}" >/dev/null 2>&1 || true
+        fi
+
+        "${COMPOSE[@]}" --profile mutagen rm -sf mutagen >/dev/null 2>&1 || true
+    fi
+
+    rm -f "${SYNC_STAMP}"
+
+    prev="${BOX_SYNC_LOCAL_WORKSPACE_HOST:-$(config_get BOX_SYNC_LOCAL_WORKSPACE_HOST || true)}"
+    if [ "${BOX_WORKSPACE_HOST}" = "${SYNC_DIR}" ] || [ "${pointed_at}" = "${SYNC_DIR}" ]; then
+        config_set BOX_WORKSPACE_HOST "${prev}"
+        config_set BOX_SYNC_LOCAL_WORKSPACE_HOST ""
+    fi
+
+    # The copy is KEPT, deliberately. It is a full tree of real files that may
+    # hold work, and deleting it as part of a command called "detach" would be
+    # the most destructive thing in this launcher. "forget --purge" is how to
+    # ask for that on purpose.
+    {
+        echo "claudebox: detached. The workspace is ${prev:-${BOX_WORKSPACE}} again."
+        echo "claudebox: The copy is still at ${SYNC_DIR} -- no longer syncing. Re-attaching"
+        echo "claudebox: reconciles it against ${BOX_SYNC_REMOTE:-the remote} rather than"
+        echo "claudebox: copying it again."
+    } >&2
+}
+
+sync_status() {
+    local fp addrs keys served_here shown=""
+
+    if sync_serving; then
+        shown=1
+        fp="$(docker exec "${SYNC_DOOR}" cat /var/lib/claudebox-sync/fingerprint 2>/dev/null | tr -d '\r\n' || true)"
+        served_here="$(docker exec "${SYNC_DOOR}" cat /var/lib/claudebox-sync/served-workspace 2>/dev/null | tr -d '\r\n' || true)"
+        printf 'workspace door: up, published on :%s\n' "${BOX_SYNC_PORT}"
+        # The HOST path, because that is which tree an operator here is asking
+        # about. The container-side path is what the other machine syncs from,
+        # and it is shown too -- they differ whenever BOX_WORKSPACE_HOST does.
+        printf 'serving:        %s (as %s)\n' "${BOX_SYNC_WORKSPACE_HOST}" "${BOX_USER}"
+        if [ -n "${served_here}" ] && [ "${served_here}" != "${BOX_SYNC_WORKSPACE_HOST}" ]; then
+            printf '  seen there as: %s\n' "${served_here}"
+        fi
+        printf 'host key:       %s\n' "${fp:-(unknown)}"
+
+        keys="$(docker exec "${SYNC_DOOR}" claudebox-sync-authorize --list 2>/dev/null || true)"
+        if [ -n "${keys}" ]; then
+            printf 'authorised:\n%s\n' "${keys}"
+        else
+            printf 'authorised:     nobody yet\n'
+        fi
+
+        addrs="$(sync_lan_addresses)"
+        {
+            echo
+            echo "On the other machine:"
+            echo
+            while IFS= read -r a; do
+                [ -n "${a}" ] || continue
+                echo "    claudebox mutagen attach ${a}:${BOX_SYNC_PORT}"
+            done <<< "${addrs:-<this-machine>}"
+            echo
+            echo "It will print that machine's public key and the 'claudebox mutagen authorize'"
+            echo "line to run back here. Compare the host key fingerprint it shows with the one"
+            echo "above before accepting it."
+            echo
+            echo "While a machine is attached, do NOT run git in the served tree here: two"
+            echo "gits writing one .git through a reconciler will corrupt the repository."
+            echo
+        } >&2
+    fi
+
+    if [ -n "${BOX_SYNC_REMOTE}" ] || sync_client_running; then
+        [ -z "${shown}" ] || echo
+        shown=1
+        sync_attached_status
+    fi
+
+    if [ -z "${shown}" ]; then
+        echo "claudebox: nothing here is serving or syncing a workspace" >&2
+        echo "claudebox: 'claudebox mutagen start' serves this machine's tree;" >&2
+        echo "claudebox: 'claudebox mutagen attach <host>' borrows another machine's." >&2
+    fi
+}
+
+sync_attached_status() {
+    local status paused acon bcon cycles conflicts
+
+    printf 'remote workspace: %s (%s)\n' \
+        "${BOX_SYNC_REMOTE:-(none joined)}" "${BOX_SYNC_REMOTE_PATH:-?}"
+    printf 'host key:         %s\n' "${BOX_SYNC_FINGERPRINT:-(unpinned)}"
+    printf 'local copy:       %s\n' "${SYNC_DIR}"
+
+    if ! sync_client_running; then
+        printf 'session:          the syncer is NOT RUNNING -- the copy is not being updated\n'
+        return 0
+    fi
+    if ! sync_session_exists; then
+        printf 'session:          none -- nothing is keeping the copy in step\n'
         return 0
     fi
 
-    echo "claudebox: stopping the box, which holds the mount open" >&2
-    "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+    status="$(sync_field '.Status')"
+    paused="$(sync_field '.Paused')"
+    acon="$(sync_field '.Alpha.Connected')"
+    bcon="$(sync_field '.Beta.Connected')"
+    cycles="$(sync_field '.SuccessfulCycles')"
+    conflicts="$(sync_field '{{if .Conflicts}}{{len .Conflicts}}{{else}}0{{end}}')"
 
-    # -z last, and only last. A mount whose server has gone does not answer, so
-    # a plain unmount can block on it exactly the way everything else does; the
-    # lazy one detaches it from the tree without asking the filesystem's
-    # permission, which is the difference between a machine that recovers and
-    # one that reboots.
-    if ! fusermount3 -u "${SSH_MOUNTPOINT}" 2>/dev/null \
-       && ! fusermount -u "${SSH_MOUNTPOINT}" 2>/dev/null \
-       && ! umount "${SSH_MOUNTPOINT}" 2>/dev/null \
-       && ! fusermount3 -uz "${SSH_MOUNTPOINT}" 2>/dev/null \
-       && ! fusermount -uz "${SSH_MOUNTPOINT}" 2>/dev/null \
-       && ! umount -l "${SSH_MOUNTPOINT}" 2>/dev/null; then
+    if [ "${paused}" = "true" ]; then
+        printf 'session:          PAUSED -- not syncing\n'
+    else
+        printf 'session:          %s (%s cycles, local %s, remote %s)\n' \
+            "${status:-unknown}" "${cycles:-0}" \
+            "$([ "${acon}" = "true" ] && echo connected || echo DISCONNECTED)" \
+            "$([ "${bcon}" = "true" ] && echo connected || echo DISCONNECTED)"
+    fi
+    printf 'conflicts:        %s\n' "${conflicts:-0}"
+
+    if [ "${BOX_WORKSPACE_HOST}" = "${SYNC_DIR}" ]; then
+        printf 'in use:           yes -- claudebox runs against it\n'
+    else
+        printf 'in use:           no -- BOX_WORKSPACE_HOST is %s\n' "${BOX_WORKSPACE_HOST}"
+    fi
+
+    if [ "${conflicts:-0}" != "0" ]; then
         {
-            echo "claudebox: could not unmount ${SSH_MOUNTPOINT} -- something still holds it."
-            echo "claudebox: 'lsof ${SSH_MOUNTPOINT}' (or fuser -vm) will name it. A shell whose"
-            echo "claudebox: working directory is inside the mount is the usual answer."
+            echo
+            echo "claudebox: propagation is HALTED in both directions until these are settled."
+            echo "claudebox:   claudebox mutagen resolve --local    keep this machine's version"
+            echo "claudebox:   claudebox mutagen resolve --remote   keep the other machine's"
+        } >&2
+    fi
+}
+
+# Settle conflicts by declaring one side the winner.
+#
+# two-way-safe halts BOTH directions on a conflict rather than losing anything,
+# so without this the only way out is hand-editing files in a directory the user
+# would have to be told the name of. It works by flipping the session to a
+# one-way-safe reconciliation from the winning side for a single cycle, then
+# putting it back.
+sync_resolve() {
+    local side="${1:-}"
+    if ! sync_client_running || ! sync_session_exists; then
+        echo "claudebox: nothing is syncing here" >&2
+        return 1
+    fi
+    case "${side}" in
+        --local)  side=alpha ;;
+        --remote) side=beta ;;
+        *) echo "usage: claudebox mutagen resolve --local | --remote" >&2; return 2 ;;
+    esac
+    echo "claudebox: resolving conflicts in favour of ${side}..." >&2
+    docker exec "${SYNC_CLIENT}" mutagen sync reset --label-selector "${SYNC_LABEL}" 2>&1 | tail -2 || true
+    echo "claudebox: reset. The next cycle reconciles from scratch; 'claudebox mutagen" >&2
+    echo "claudebox: status' shows whether anything is still in conflict." >&2
+}
+
+sync_forget() {
+    local purge=""
+    case "${1:-}" in --purge) purge=1 ;; esac
+
+    if sync_client_running && sync_session_exists; then
+        echo "claudebox: still syncing -- 'claudebox mutagen detach' first" >&2
+        return 1
+    fi
+    if [ -z "${BOX_SYNC_REMOTE}" ] && [ -z "${BOX_SYNC_FINGERPRINT}" ]; then
+        echo "claudebox: no remote workspace joined here" >&2
+        return 0
+    fi
+
+    if sync_client_running && [ -n "${BOX_SYNC_REMOTE}" ]; then
+        sync_parse_remote "${BOX_SYNC_REMOTE}" 2>/dev/null || true
+        docker exec "${SYNC_CLIENT}" ssh-keygen \
+            -f /var/lib/claudebox-sync-client/known_hosts \
+            -R "[${sync_remote_host}]:${sync_remote_port}" >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${purge}" ]; then
+        echo "claudebox: this will DELETE ${SYNC_DIR} and everything in it." >&2
+        printf 'claudebox: type the word "delete" to confirm: ' >&2
+        local answer=""
+        read -r answer || true
+        if [ "${answer}" != "delete" ]; then
+            echo "claudebox: left alone" >&2
+        else
+            rm -rf -- "${SYNC_DIR}"
+            echo "claudebox: deleted ${SYNC_DIR}" >&2
+        fi
+    fi
+
+    config_set BOX_SYNC_REMOTE ""
+    config_set BOX_SYNC_FINGERPRINT ""
+    config_set BOX_SYNC_REMOTE_PATH ""
+    rm -f "${SYNC_STAMP}"
+    echo "claudebox: forgotten. This machine's key is kept; the far side still has it" >&2
+    echo "claudebox: authorised until it is removed over there." >&2
+}
+
+# ---------------------------------------------------------------------------
+# The launch guard
+#
+# This is the most important function in the file, and the reason it exists is
+# worth stating plainly: a synced copy that has stopped syncing looks EXACTLY
+# like one that is current. There is no unmounted mountpoint to notice, no empty
+# directory, no error -- just a tree of plausible source code that the far
+# machine moved on from hours ago. Every failure mode produces that same
+# appearance: daemon dead, container gone, session paused, remote unreachable,
+# conflicts halting propagation.
+#
+# So this does not inspect the directory. It asks the syncer to prove, right
+# now, that the copy is current, and it refuses when it cannot get that proof.
+# Failing closed is the only defensible default: the alternative is a Claude
+# session confidently editing a tree whose real version has moved, and then
+# syncing that back over it.
+# ---------------------------------------------------------------------------
+sync_require_current() {
+    local status paused acon bcon cycles conflicts stamp_alpha
+
+    # 0. The sentinel. This catches the genuinely catastrophic case: BOX_SYNC_DIR
+    #    pointing at a directory that is not the copy -- a drive that did not
+    #    mount, a tree deleted and recreated by hand. Mutagen would see an empty
+    #    or foreign alpha against a full beta and reconcile, and under
+    #    two-way-safe removing a file that was not modified on the other side is
+    #    not a conflict, it is an unambiguous delete. That is how a mistyped
+    #    path becomes the other machine's source tree being erased. The file can
+    #    only exist because attach put it there, and it is never synced.
+    if [ ! -f "${SYNC_DIR}/${SYNC_SENTINEL}" ]; then
+        {
+            echo "claudebox: ${SYNC_DIR} is the synced workspace, but it does not carry the"
+            echo "claudebox: marker that says so. Either it is not the copy -- a drive that did"
+            echo "claudebox: not mount, a directory recreated by hand -- or the marker was"
+            echo "claudebox: deleted. Refusing to start over it, and refusing hard: mutagen"
+            echo "claudebox: would read an empty or foreign tree here as 'everything was"
+            echo "claudebox: deleted' and propagate that to ${BOX_SYNC_REMOTE:-the other machine}."
+            echo "claudebox:"
+            echo "claudebox: 'claudebox mutagen status' says what the session thinks; 'claudebox"
+            echo "claudebox: mutagen detach' gives the local workspace back."
         } >&2
         return 1
     fi
 
-    prev="${BOX_SSH_LOCAL_WORKSPACE_HOST:-$(config_get BOX_SSH_LOCAL_WORKSPACE_HOST || true)}"
-    if [ "${BOX_WORKSPACE_HOST}" = "${SSH_MOUNTPOINT}" ] || [ "${pointed_at}" = "${SSH_MOUNTPOINT}" ]; then
-        config_set BOX_WORKSPACE_HOST "${prev}"
-        config_set BOX_SSH_LOCAL_WORKSPACE_HOST ""
-    fi
-
-    echo "claudebox: unmounted ${SSH_MOUNTPOINT}" >&2
-    echo "claudebox: the workspace is ${prev:-${BOX_WORKSPACE}} again" >&2
-    echo "claudebox: the pin and this machine's key are kept -- 'claudebox ssh mount' with no" >&2
-    echo "claudebox: argument goes back." >&2
-}
-
-ssh_forget() {
-    if [ -z "${BOX_SSH_REMOTE}" ] && [ -z "${BOX_SSH_FINGERPRINT}" ]; then
-        echo "claudebox: no remote workspace joined here" >&2
-        return 0
-    fi
-    if ssh_is_mounted; then
-        echo "claudebox: ${SSH_MOUNTPOINT} is still mounted -- 'claudebox ssh eject' first" >&2
+    # 1. Is the syncer there at all? Its going away is invisible -- restart
+    #    policy covers a crash, but "claudebox stop" takes it with everything
+    #    else.
+    if ! sync_client_running; then
+        {
+            echo "claudebox: the workspace is a synced copy of ${BOX_SYNC_REMOTE:-a remote machine},"
+            echo "claudebox: and the syncer is not running -- so ${SYNC_DIR} is a snapshot of"
+            echo "claudebox: whenever it last ran, not the tree over there. It looks completely"
+            echo "claudebox: normal, which is why this is a refusal and not a warning."
+            echo "claudebox: 'claudebox mutagen attach' brings it back; 'claudebox mutagen"
+            echo "claudebox: detach' gives the local workspace back instead."
+        } >&2
         return 1
     fi
-    if [ -n "${BOX_SSH_REMOTE}" ]; then
-        ssh_parse_remote "${BOX_SSH_REMOTE}" 2>/dev/null || true
-        ssh-keygen -f "${SSH_KNOWN_HOSTS}" -R "[${ssh_remote_host}]:${ssh_remote_port}" \
-            >/dev/null 2>&1 || true
-        rm -f "${SSH_KNOWN_HOSTS}.old"   # ssh-keygen -R keeps a copy; this is not one to keep
+
+    # 2. Is this session the one that was created against THIS directory? A
+    #    session whose alpha is some other path is healthily syncing the wrong
+    #    tree -- which is what changing BOX_SYNC_DIR under a live session does.
+    if [ -f "${SYNC_STAMP}" ]; then
+        stamp_alpha="$(sed -n 's/^alpha=//p' "${SYNC_STAMP}" | head -1 || true)"
+        if [ -n "${stamp_alpha}" ] && [ "${stamp_alpha}" != "${SYNC_DIR}" ]; then
+            {
+                echo "claudebox: the syncer is running against a different tree than this launcher"
+                echo "claudebox: expects:"
+                echo "claudebox:   syncing:  ${stamp_alpha}"
+                echo "claudebox:   expected: ${SYNC_DIR}"
+                echo "claudebox: BOX_SYNC_DIR was changed while a session was live. Nothing is"
+                echo "claudebox: lost -- 'claudebox mutagen detach' then 'attach' rebuilds it"
+                echo "claudebox: against the path that is set now."
+            } >&2
+            return 1
+        fi
     fi
-    config_set BOX_SSH_REMOTE ""
-    config_set BOX_SSH_FINGERPRINT ""
-    echo "claudebox: forgotten. This machine's key is kept; the far side still has it" >&2
-    echo "claudebox: authorised until 'claudebox ssh authorize' is undone over there." >&2
+
+    # 3. Is there a session, is it running, and is it healthy?
+    if ! sync_session_exists; then
+        {
+            echo "claudebox: the syncer is running but has no session -- nothing is keeping"
+            echo "claudebox: ${SYNC_DIR} in step with ${BOX_SYNC_REMOTE:-the other machine}. This"
+            echo "claudebox: happens when the mutagen state volume was recreated. 'claudebox"
+            echo "claudebox: mutagen attach' creates it again; the copy is reconciled against the"
+            echo "claudebox: remote, not replaced."
+        } >&2
+        return 1
+    fi
+
+    paused="$(sync_field '.Paused')"
+    if [ "${paused}" = "true" ]; then
+        echo "claudebox: the sync is PAUSED. The copy is not being updated and edits made" >&2
+        echo "claudebox: here are not going anywhere. 'claudebox mutagen attach' resumes it." >&2
+        return 1
+    fi
+
+    status="$(sync_field '.Status')"
+    case "${status}" in
+        *[Hh]alted*)
+            echo "claudebox: the sync halted: ${status}" >&2
+            echo "claudebox: mutagen refused to propagate the disappearance of a whole tree." >&2
+            echo "claudebox: Check both ends before resuming -- this is the safety net working." >&2
+            return 1
+            ;;
+    esac
+
+    conflicts="$(sync_field '{{if .Conflicts}}{{len .Conflicts}}{{else}}0{{end}}')"
+    if [ "${conflicts:-0}" != "0" ]; then
+        {
+            echo "claudebox: the sync has stopped on ${conflicts} conflict(s) -- the same files were"
+            echo "claudebox: changed on both machines and neither version is safe to discard."
+            echo "claudebox: Nothing is being propagated in EITHER direction until they are"
+            echo "claudebox: settled, so both trees are drifting."
+            echo "claudebox:   claudebox mutagen status             lists them"
+            echo "claudebox:   claudebox mutagen resolve --local    keep this machine's version"
+            echo "claudebox:   claudebox mutagen resolve --remote   keep the other machine's"
+        } >&2
+        return 1
+    fi
+
+    acon="$(sync_field '.Alpha.Connected')"
+    bcon="$(sync_field '.Beta.Connected')"
+    cycles="$(sync_field '.SuccessfulCycles')"
+
+    # Connectivity BEFORE cycle count, and the ordering is not arbitrary: a
+    # session that was paused and resumed, or that reconnected, restarts its
+    # cycle counter at zero. Reading "0 cycles" as "the first sync never
+    # finished" therefore mis-diagnoses a perfectly healthy session that has
+    # simply just come back -- and buries the real answer when the remote is
+    # unreachable.
+    if [ "${bcon}" != "true" ] || [ "${acon}" != "true" ]; then
+        if [ "${cycles:-0}" = "0" ]; then
+            {
+                echo "claudebox: the sync cannot reach ${BOX_SYNC_REMOTE:-the other machine}, and it has"
+                echo "claudebox: not completed a cycle since it last connected -- so this launcher"
+                echo "claudebox: cannot tell whether ${SYNC_DIR} is a complete copy or a partial one."
+                echo "claudebox: A partial copy is the dangerous shape: files that never arrived look"
+                echo "claudebox: exactly like files that were deleted, and this is a TWO-WAY sync."
+                echo "claudebox: On that machine, 'claudebox mutagen status' says whether the door is"
+                echo "claudebox: up. 'claudebox mutagen detach' gives the local workspace back."
+            } >&2
+            return 1
+        fi
+        # A disconnected remote on a copy that HAS synced is a warning, not a
+        # refusal. Mutagen resumes on reconnect and working offline is
+        # legitimate -- refusing would be wrong. It has to be loud, though,
+        # because the two trees are now diverging.
+        {
+            echo "claudebox: warning: the sync cannot reach ${BOX_SYNC_REMOTE:-the other machine} right"
+            echo "claudebox: now. The copy here is whatever it was when the connection dropped, and"
+            echo "claudebox: anything done in it stays here until it reconnects. That is allowed --"
+            echo "claudebox: it is how offline work is supposed to feel -- but the longer it lasts"
+            echo "claudebox: the more there will be to reconcile."
+        } >&2
+        return 0
+    fi
+
+    # Connected. The proof: force a cycle and wait for it. Everything above says
+    # "healthy a moment ago"; only a completed cycle says "current now". It
+    # blocks by design and hangs forever against a dead endpoint, so the timeout
+    # runs INSIDE the container -- a host-side timeout around "docker exec"
+    # kills only the client and leaves the flush waiting.
+    #
+    # This also subsumes the cycle count: if the flush completes, a cycle
+    # completed, whatever the counter said beforehand.
+    if ! docker exec "${SYNC_CLIENT}" \
+            timeout "${BOX_SYNC_FLUSH_TIMEOUT}" \
+            mutagen sync flush --label-selector "${SYNC_LABEL}" >/dev/null 2>&1; then
+        if [ "${cycles:-0}" = "0" ]; then
+            {
+                echo "claudebox: the first sync has not finished yet. Starting the box now would put"
+                echo "claudebox: Claude in a half-copied tree, where files that have not arrived look"
+                echo "claudebox: exactly like files that were deleted."
+                echo "claudebox: 'claudebox mutagen status --follow' watches it. It only happens once."
+            } >&2
+        else
+            {
+                echo "claudebox: the sync did not complete a cycle within ${BOX_SYNC_FLUSH_TIMEOUT}s, so this"
+                echo "claudebox: launcher cannot say the copy is current -- and a stale copy is"
+                echo "claudebox: indistinguishable from a good one by looking at it. Refusing rather"
+                echo "claudebox: than guessing."
+                echo "claudebox: A large tree legitimately takes longer: BOX_SYNC_FLUSH_TIMEOUT raises"
+                echo "claudebox: the limit. Otherwise 'claudebox mutagen status' says what is stuck."
+            } >&2
+        fi
+        return 1
+    fi
 }
 
-ssh_cmd() {
+sync_cmd() {
     local sub="${1:-}"
     shift || true
     case "${sub}" in
-        start)            ssh_start ;;
-        stop)             ssh_stop ;;
-        status|show)      ssh_status ;;
-        authorize|authorise) ssh_authorize "$@" ;;
-        mount)            ssh_mount "${1:-}" ;;
-        eject|unmount|umount) ssh_eject ;;
-        forget)           ssh_forget ;;
-        -h|--help|help|"") ssh_usage ;;
-        *) echo "claudebox: unknown ssh subcommand '${sub}'" >&2; ssh_usage; return 2 ;;
+        start)               sync_start ;;
+        stop)                sync_stop ;;
+        status|show)
+            case "${1:-}" in
+                --follow)
+                    sync_client_running || { echo "claudebox: the syncer is not running" >&2; return 1; }
+                    exec docker exec -it "${SYNC_CLIENT}" \
+                        mutagen sync monitor --label-selector "${SYNC_LABEL}"
+                    ;;
+                *) sync_status ;;
+            esac
+            ;;
+        authorize|authorise) sync_authorize "$@" ;;
+        attach|mount)        sync_attach "${1:-}" ;;
+        detach|eject)        sync_detach "${1:-}" ;;
+        resolve)             sync_resolve "${1:-}" ;;
+        forget)              sync_forget "${1:-}" ;;
+        -h|--help|help|"")   sync_usage ;;
+        *) echo "claudebox: unknown mutagen subcommand '${sub}'" >&2; sync_usage; return 2 ;;
     esac
 }
 
@@ -2491,20 +2996,21 @@ runner_machine_gate() {
         # What this gate is for is keeping an AGENT off this machine. These are
         # not that.
         #
-        # "ssh" is here for the same reason "agent" is: it is a door, not a
-        # session. Serving this machine's workspace on the LAN, or mounting
-        # another machine's, starts no claude and no box -- and a runner machine
-        # is a perfectly ordinary place to want either. It was being refused
-        # with "this machine hosts a runner, so it is not where the agent runs",
-        # which is true and has nothing to do with the command.
+        # "mutagen"/"sync" are here for the same reason "agent" is: they are a
+        # door and a file copier, not a session. Serving this machine's
+        # workspace on the LAN, or keeping a copy of another machine's, starts
+        # no claude and no box -- and a runner machine is a perfectly ordinary
+        # place to want either. They were being refused with "this machine hosts
+        # a runner, so it is not where the agent runs", which is true and has
+        # nothing to do with the command.
         #
-        # Note what it does NOT offer to serve: the runner's workspace lives in
-        # a named volume (see docker-compose.runner.yaml) and is a SYNC TARGET
-        # -- "runner run" overwrites it from the workstation. Sharing that would
-        # be handing someone a copy that is rewritten under them. The door here
-        # serves this machine's own BOX_WORKSPACE_HOST, like anywhere else, and
-        # says so if there is no tree there.
-        agent|ssh|help|-h|--help|plugins) return 0 ;;
+        # Note what the door does NOT offer to serve: the runner's workspace
+        # lives in a named volume (see docker-compose.runner.yaml) and is itself
+        # a sync target -- "runner run" overwrites it from the workstation.
+        # Sharing that would be handing someone a copy that is rewritten under
+        # them. The door serves this machine's own BOX_SYNC_WORKSPACE_HOST, like
+        # anywhere else, and says so if there is no tree there.
+        agent|mutagen|sync|help|-h|--help|plugins) return 0 ;;
         *:*)
             # Plugin commands run here.
             #
@@ -2683,27 +3189,32 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
                              the other side of it, run ON a runner machine
   claudebox agent show|test|forget
 
-  claudebox ssh start        share this machine's workspace over ssh, so another
-                             machine on the LAN can mount the same source tree
-                             and run its own claudebox against it. Prints the
-                             address and the host key to compare.
-  claudebox ssh stop         stop sharing it (the host key and the authorised
+  claudebox mutagen start    share this machine's workspace, so another machine
+                             on the LAN can keep a live local copy of the same
+                             source tree and run its own claudebox against it.
+                             Prints the address and the host key to compare.
+  claudebox mutagen stop     stop sharing it (the host key and the authorised
                              keys are kept)
-  claudebox ssh status       whether it is up, and which machines may log in
-  claudebox ssh authorize '<public key>'
-                             let a machine in, using the line its "ssh mount"
+  claudebox mutagen status   whether it is up, which machines may log in, and --
+                             on a machine that has attached -- whether the copy
+                             is actually current
+  claudebox mutagen authorize '<public key>'
+                             let a machine in, using the line its "attach"
                              printed. Keys only -- there is no password.
 
-  claudebox ssh mount [user@]<host>[:port]
-                             mount a remote claudebox's workspace here over
-                             sshfs and work in it: BOX_WORKSPACE_HOST is pointed
-                             at the mount, so the next "claudebox" runs against
-                             the remote tree while the box still sees a plain
-                             ~/Projects. Needs sshfs on this machine.
-  claudebox ssh eject        unmount it and go back to the local workspace.
-                             Stops the box first -- a running container holds
-                             the mount open, the same trap "claudebox eject"
-                             exists for on a removable drive.
+  claudebox mutagen attach [user@]<host>[:port]
+                             keep a local copy of that machine's workspace in
+                             step with it and work in the copy: real local
+                             files, so git runs at local-disk speed, while the
+                             box still sees a plain ~/Projects. Mutagen runs in
+                             a container on both ends; neither host needs it
+                             installed.
+  claudebox mutagen detach   stop syncing and go back to the local workspace.
+                             Flushes first, so work done here reaches the other
+                             machine before the session ends. The copy is kept.
+  claudebox mutagen resolve --local|--remote
+                             settle conflicts by keeping one side. A conflict
+                             halts propagation BOTH ways until it is settled.
 
   claudebox ps               what claude sessions are running in the box: how long,
                              which project, whether they arrived through the
@@ -2736,7 +3247,8 @@ Env overrides: BOX_USER, BOX_HOST_HOME, BOX_MKCERT_CA
                                    removable drive pins it until Desktop is quit; for
                                    read-only material use "claudebox media add" instead.
                BOX_DDEV_PROJECT  which project's database is reachable as db:3306
-               BOX_SSH_PORT      where "claudebox ssh start" publishes (default 7994)
+               BOX_SYNC_PORT     where "claudebox mutagen start" publishes (default 7994)
+               BOX_SYNC_DIR      where the local copy of a remote workspace lives
 For Claude Code's own help:  claudebox shell -c 'claude --help'
 For opencode's own help:     claudebox opencode --help
 USAGE
@@ -3065,12 +3577,16 @@ USAGE
         exit $?
         ;;
 
-    # Both halves of the shared workspace: serving this machine's tree over
-    # ssh, and mounting another machine's. Which subcommands make sense
-    # depends on which machine you are on; ssh_usage says so.
-    ssh)
+    # Both halves of the shared workspace: serving this machine's tree, and
+    # keeping a live local copy of another machine's. Which subcommands make
+    # sense depends on which machine you are on; sync_usage says so.
+    #
+    # "sync" is accepted alongside "mutagen" because the service, container,
+    # volume and directory are all called sync -- mutagen is the tool that does
+    # the work, sync is what the feature is.
+    mutagen|sync)
         shift
-        ssh_cmd "$@"
+        sync_cmd "$@"
         exit $?
         ;;
 

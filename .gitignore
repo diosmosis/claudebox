@@ -11,11 +11,24 @@
 # the plugins distributed with claudebox and is tracked.
 /plugin-state/
 
-# The client half of "claudebox ssh mount": this machine's key and the host
-# keys it has pinned. Generated per machine, and one of them is a private key.
-/ssh-client/
+# The client half of "claudebox mutagen attach": this machine's ssh key, the
+# host keys it has pinned, the generated ssh config mutagen reads, and the stamp
+# recording what the live session was created against. Generated per machine,
+# and one of them is a private key.
+/sync-client/
 
-# Where a remote claudebox's workspace is mounted by "claudebox ssh mount".
-# Empty except while mounted -- and never a place to put files, since anything
-# written here while nothing is mounted is hidden the moment one is.
+# The local copy of another machine's workspace, kept in step by mutagen.
+#
+# Real files -- unlike the sshfs mountpoint this replaces, it is never empty and
+# never safe to assume is current. Nothing here is a place to put work by hand:
+# it is one end of a two-way reconciler, so anything written here propagates to
+# the other machine, and anything deleted here is deleted there.
+/synced-workspace/
+
+# Left over from the sshfs version this replaced: the old mountpoint, and the
+# old client key directory. They are still on machines that have not migrated
+# yet -- ~/.claudebox/remote-workspace may even still carry a live sshfs mount.
+# Kept ignored so a half-migrated checkout does not show a few thousand
+# untracked files; delete both once "claudebox mutagen attach" is in use.
 /remote-workspace/
+/ssh-client/

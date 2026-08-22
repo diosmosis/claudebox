@@ -57,10 +57,12 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
                                                                  host.docker.internal, both
                                                                  in dind and in the box)
 
-  claudebox-ssh ─── claudebox_edge ──→ LAN ──→ another machine's sshfs mount
-   (sshd, keys only. NOT on inner:                        │
-    it holds the same workspace bind                      └──→ that machine's
-    the box does, and nothing else)                            BOX_WORKSPACE_HOST
+  claudebox-sync ── claudebox_edge ──→ LAN ──→ another machine's syncer
+   (sshd, keys only, mutagen's transport.                 │
+    NOT on inner: it holds the same             claudebox-mutagen ── edge
+    workspace bind the box does, and             (mutagen daemon; keeps a real
+    nothing else)                                 local COPY, which is what
+                                                  BOX_WORKSPACE_HOST points at)
 ```
 
 | Container | Image | Role |
@@ -71,20 +73,22 @@ host daemon. See *ddev exec via a scoped relay* and *Why no ddev CLI* below.
 | `claudebox-ddev-relay` | built from `ddev-relay/Dockerfile` | Holds the host Docker socket; runs `ddev exec` in DDEV containers on the box's behalf. On `inner` only — no egress. See below. |
 | `claudebox-ddev-db` | `alpine/socat` | One fixed TCP forward: `db:3306` on `inner` → `ddev-<project>-db:3306` on `ddev_default`. Lets PHP in the box use a DDEV project's database. See below. |
 | `claudebox-ddev-http` | built from `ddev-http/Dockerfile` | nginx on a fixed address: sets `Host` to the project's hostname, presents the client as `127.0.0.1`, and proxies to the project's web container. This is what `host.docker.internal` resolves to, in dind and in the box. See below. |
-| `claudebox-ssh` | built from `ssh-server/Dockerfile` | An sshd over the **same workspace bind the box gets**, published on the LAN, so another machine can mount this source tree with sshfs and run its own claudebox against it. On `edge` only — it can see the workspace and the internet, and none of the rest of the stack. Created only under the `ssh` profile. See *Sharing the workspace between machines* below. |
+| `claudebox-sync` | built from `sync-server/Dockerfile` | An sshd over the **same workspace bind the box gets**, published on the LAN, so another machine can keep a live local copy of this source tree and run its own claudebox against the copy. Only mutagen's transport — mutagen itself is never installed here; the other machine copies an agent in. On `edge` only. Created under the `sync` profile. |
+| `claudebox-mutagen` | built from `mutagen-client/Dockerfile` | The syncer, on the machine that *borrows* a workspace: a mutagen daemon and an ssh client keeping `~/.claudebox/synced-workspace` in step with a remote door. A container because mutagen takes no per-session ssh options and would otherwise need to write the user's own `~/.ssh/config`. On `edge` only, and never `inner` — it holds a key another machine's door trusts. Created under the `mutagen` profile. |
 | `claudebox-runner-relay` | built from `runner-relay/Dockerfile` | Holds a remote test runner's address, token and certificate fingerprint; forwards five routes to it and nothing else. On `inner` *and* `edge`, which is the only reason the box can reach another machine at all. Idle and harmless when no runner is joined. See below. |
 
 | Network | Kind | Members |
 |---|---|---|
 | `claudebox_inner` | `internal: true` | claudebox, dind, proxy, ddev-relay, ddev-db, ddev-http (`10.99.1.10`), runner-relay |
-| `claudebox_edge` | bridge | proxy, runner-relay, agent-relay, ssh |
+| `claudebox_edge` | bridge | proxy, runner-relay, agent-relay, sync, mutagen |
 | `ddev_default` | external (DDEV's) | proxy, ddev-db, ddev-http |
 
 | Volume | Contents |
 |---|---|
 | `claudebox-home` | Container `$HOME` (`/home/dizzy`), including its own `~/.claude` — except `~/.claude/plans`, which is a host bind (see below) |
 | `claudebox-dind-data` | dind's image store — separate from the host's |
-| `claudebox_ssh-state` | The workspace door's host key and authorized_keys. Only created under the `ssh` profile; deleting it issues a new host key, which every machine that mounted this workspace has pinned |
+| `claudebox_sync-state` | The workspace door's host key, authorized_keys, and the login user's home (where mutagen installs its agent). Only under the `sync` profile; deleting it issues a new host key, which every machine that attached has pinned |
+| `claudebox_mutagen-state` | The syncer's daemon state, session database and agent cache. Only under the `mutagen` profile |
 
 ### Load-bearing decisions
 
@@ -418,7 +422,7 @@ Each of these is doing real work. Changing one breaks something specific.
 
 | Path | Purpose |
 |---|---|
-| `docker-compose.yaml` | The nine services (two of them behind profiles), three networks, four volumes |
+| `docker-compose.yaml` | The ten services (three of them behind profiles), three networks, five volumes |
 | `Dockerfile` | The claudebox image |
 | `entrypoint.sh` | Runs as root at start: installs the mkcert CA, seeds `~/.claude` and opencode's config/credentials, signals readiness |
 | `ddev-shim` | The box's `ddev` (baked to `/usr/local/bin/ddev`); forwards `ddev exec` to the relay |
@@ -436,8 +440,9 @@ Each of these is doing real work. Changing one breaks something specific.
 | `agent-relay/relay.mjs`, `agent-relay/entrypoint.sh`, `agent-relay/open-enrolment.sh` | The inbound agent door on a workstation: its identity, its enrolment window, and the one route it forwards into the box |
 | `agent-relay/enrol.mjs`, `agent-relay/send.mjs` | Run as one-off containers **on a runner machine** — join a workstation, and send it a headless run |
 | `agent-serve.mjs` | Baked into the box as `/usr/local/lib/claudebox/agent-serve.mjs`; the box's side of that door, on the internal network only |
-| `ssh-server/Dockerfile`, `ssh-server/entrypoint.sh`, `ssh-server/sshd_config.template` | The workspace door: an sshd serving the same tree the box works in. The entrypoint settles what the image deliberately does not bake in — which user may log in, and where that user's home is (the workspace, so `sshfs box@host:` needs no path) |
-| `ssh-server/authorize.sh` | Baked in as `claudebox-ssh-authorize`; adds one public key to the door's `authorized_keys`, or lists what is there. What `claudebox ssh authorize` and `claudebox ssh status` reach through `docker exec` |
+| `sync-server/Dockerfile`, `sync-server/entrypoint.sh`, `sync-server/sshd_config.template` | The workspace door: an sshd serving the same tree the box works in, as mutagen's transport. The entrypoint settles what the image does not bake in — which user may log in, which tree is served, and where that user's home is (**not** the workspace: that is where mutagen installs its agent) |
+| `sync-server/authorize.sh`, `sync-server/info.sh` | Baked in as `claudebox-sync-authorize` and `claudebox-sync-info`. The first adds or lists authorised keys; the second is what the borrowing machine asks over ssh — it is both the authentication probe and how the served path is discovered |
+| `mutagen-client/Dockerfile`, `mutagen-client/entrypoint.sh` | The syncer: a pinned mutagen release (binary **and** agent bundle, which must sit beside it) plus an ssh client. The entrypoint generates this machine's key and the `~/.ssh/config` mutagen reads — the whole reason it is a container |
 | `dind-apparmor.sh` | Sourced by both launchers: the AppArmor preflight and postmortem for the rootless dind sidecar |
 | `ui-parity` | Prints everything about an image that a UI test can observe, in diffable form — package versions, font file hashes, fontconfig's resolved settings, ImageMagick's limits |
 | `apparmor/claudebox-dind` | The profile that grants `userns` to the dind sidecar; installed once with `sudo`, on each machine |
@@ -491,21 +496,24 @@ claudebox agent add <host:port> <code>
                            one-offs typed here are answered there
 claudebox agent show|test|forget
 
-claudebox ssh start        share this machine's workspace over ssh on the LAN:
-                           sshd over the same bind the box gets. Prints the
-                           address, the port and the host key to compare
-claudebox ssh stop         stop sharing (host key and authorised keys are kept)
-claudebox ssh status       whether it is up, and which machines may log in
-claudebox ssh authorize '<public key>'
-                           let a machine in, using the line its "ssh mount"
-                           printed. Keys only — there is no password
-claudebox ssh mount [user@]<host>[:port]
-                           ON the other machine: mount that workspace here over
-                           sshfs and point BOX_WORKSPACE_HOST at it, so the next
-                           "claudebox" runs against the remote tree
-claudebox ssh eject        unmount it and go back to the local workspace (stops
-                           the box first — a container holds the mount open)
-claudebox ssh forget       drop the pin and the joined address
+claudebox mutagen start    share this machine's workspace, so another machine
+                           can keep a live local copy of the same source tree
+claudebox mutagen stop     stop sharing (host key and authorised keys are kept)
+claudebox mutagen status   whether it is up, which machines may log in, and --
+                           where attached -- whether the copy is really current
+claudebox mutagen authorize '<public key>'
+                           let a machine in. Keys only; there is no password
+claudebox mutagen attach [user@]<host>[:port]
+                           ON the other machine: keep a local copy in step with
+                           that tree and point BOX_WORKSPACE_HOST at the copy,
+                           so git runs at local-disk speed
+claudebox mutagen detach   stop syncing (flushes first) and restore the local
+                           workspace. The copy is kept
+claudebox mutagen resolve --local|--remote
+                           settle conflicts, which halt propagation both ways
+claudebox mutagen forget [--purge]
+                           drop the pin and the joined address
+                           ("sync" is accepted everywhere "mutagen" is)
 
 claudebox ps               what claude sessions are running in the box: how long,
                            which project, whether they came through the agent
@@ -538,10 +546,12 @@ Settings: `BOX_WORKSPACE` (where the box sees the tree), `BOX_WORKSPACE_HOST`
 a runner machine), and
 `BOX_RUNNER` / `BOX_RUNNER_TOKEN` / `BOX_RUNNER_FINGERPRINT` (written by
 `claudebox runner add`, read by nothing but the relay), and
-`BOX_SSH_SERVE` / `BOX_SSH_PORT` (share this machine's workspace over ssh) with
-`BOX_SSH_REMOTE` / `BOX_SSH_FINGERPRINT` / `BOX_SSH_LOCAL_WORKSPACE_HOST`
-(written by `claudebox ssh mount` on the machine that mounts one — the last is
-what `claudebox ssh eject` puts back).
+`BOX_SYNC_SERVE` / `BOX_SYNC_PORT` (share this machine's workspace) with
+`BOX_SYNC_REMOTE` / `BOX_SYNC_FINGERPRINT` / `BOX_SYNC_REMOTE_PATH` /
+`BOX_SYNC_LOCAL_WORKSPACE_HOST` / `BOX_SYNC_DIR` / `BOX_SYNC_MODE` /
+`BOX_SYNC_IGNORE` / `BOX_SYNC_FLUSH_TIMEOUT` (written by `claudebox mutagen
+attach` on the machine that borrows a workspace; `_LOCAL_WORKSPACE_HOST` is what
+`detach` puts back).
 
 `claudebox-runner` reads the same file with its own allowlist —
 `BOX_USER`/`BOX_UID`/`BOX_GID`, `BOX_DIND_APPARMOR`, `BOX_RUNNER_PORT`,
@@ -1387,11 +1397,11 @@ Now, on a machine where the `claudebox-runner` container is running:
 | `claudebox -p '...'` | sent to the workstation that was joined, and answered in **its** box |
 | `claudebox <plugin>:<cmd>`, `claudebox plugins` | run here, normally |
 | everything else | refuses, and says where to go instead |
-| `claudebox agent ...`, `claudebox ssh ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all, and the second is a door rather than a session |
+| `claudebox agent ...`, `claudebox mutagen ...`, `claudebox help` | still work — the first is how the machine is pointed at a workstation at all, and the second is a door and a file copier rather than a session |
 
-**`claudebox ssh` runs on the runner machine too.** What this gate is for is
+**`claudebox mutagen` runs on the runner machine too.** What this gate is for is
 keeping an *agent* off it; serving this machine's workspace on the LAN, or
-mounting another machine's, starts no claude and no box. It was being refused
+keeping a copy of another machine's, starts no claude and no box. It was being refused
 with "this machine hosts a runner, so it is not where the agent runs" — true,
 and nothing to do with the command. Note what the door does **not** offer to
 serve there: the runner's tree lives in a named volume and is a *sync target*
@@ -1505,220 +1515,253 @@ process arguments are readable by every process on the machine and
 
 ## Sharing the workspace between machines
 
-Two machines, one source tree. `claudebox ssh start` on the machine that has the
-tree brings up `claudebox-ssh` — an sshd over the *same bind the box gets* —
-and publishes it on the LAN. `claudebox ssh mount <host>` on the other machine
-mounts it with sshfs and points `BOX_WORKSPACE_HOST` at the mount, so claudebox
-there runs against this tree while the box still sees a plain `~/Projects`.
+Two machines, one source tree. `claudebox mutagen start` on the machine that has
+the tree brings up `claudebox-sync` — an sshd over the *same bind the box gets* —
+and publishes it on the LAN. `claudebox mutagen attach <host>` on the other
+machine keeps a **live local copy** of that tree in step with it and points
+`BOX_WORKSPACE_HOST` at the copy, so claudebox there runs against real local
+files while the box still sees a plain `~/Projects`.
 
-It exists for the case the removable-drive workspace was already solving badly:
-the tree is the source of truth and it is wanted on two machines. A drive has to
-be carried, ejected in the right order, and is on exactly one machine at a time;
-this is the same tree, live, on both.
+### Why a copy and not a mount
+
+This replaced an sshfs mount, and the reason is git. `git status` does one
+`lstat` per tracked file plus a `readdir` per directory; on a network filesystem
+every cache miss is a round trip, so a 30k-file repo is tens of thousands of
+round trips before git has read a single object. No tuning fixes it — git is
+*designed* to walk the whole tree, which is why it is slow on any network
+filesystem.
+
+Measured here, same 3,004-file repo, same machine, same door, over **loopback** —
+which is the best case sshfs can possibly have, with no network latency at all:
+
+| | sshfs | mutagen copy |
+|---|---|---|
+| `git status`, cold | 2.046s | 0.014s |
+| `git status`, warm | 0.068s | 0.013s |
+
+On a real LAN the cold number gets worse in proportion to round-trip time; the
+copy's does not change, because nothing about it crosses a network. That is the
+whole argument.
 
 ```
-  machine A (has the tree)                    machine B (wants it)
-  ┌────────────────────────────┐              ┌──────────────────────────────┐
-  │ claudebox-ssh  ── edge ────┼──── LAN ─────┤  sshfs (ON THE HOST)         │
-  │   sshd, keys only          │   :7994      │    ~/.claudebox/             │
-  │   home = the workspace     │              │      remote-workspace        │
-  │        │                   │              │            │                 │
-  │   ~/Projects (bind)        │              │   BOX_WORKSPACE_HOST ────┐   │
-  └────────┼───────────────────┘              │                          │   │
-           └── the box on A sees the same     │   claudebox (box) ───────┘   │
-               directory                      │     sees ~/Projects          │
-                                              └──────────────────────────────┘
+  this machine (runs claude)                    the other machine (holds the tree)
+  ┌──────────────────────────────┐              ┌──────────────────────────────┐
+  │ claudebox-mutagen  (edge)    │              │  claudebox-sync   (edge)     │
+  │   mutagen daemon run         │─── LAN ─────▶│    sshd, keys only           │
+  │   as ${BOX_UID}:${BOX_GID}   │   :7994      │    HOME on sync-state vol    │
+  │        │                     │              │      └ .mutagen/agents/…     │
+  │   ~/.claudebox/              │              │         (copied in by us)    │
+  │     synced-workspace  ◀──────┼── sync ──────┼──▶ ${BOX_WORKSPACE} (bind)   │
+  └────────┼─────────────────────┘              └──────────────────────────────┘
+           │ BOX_WORKSPACE_HOST
+           ▼
+     claudebox / dind / ddev-relay   ← ordinary bind of a real local directory
 ```
 
 ### The two halves
 
-| On the machine that HAS the tree | On the machine that wants it |
+| On the machine that HAS the tree | On the machine that borrows it |
 |---|---|
-| `claudebox ssh start` — bring the door up and publish it (`BOX_SSH_PORT`, default 7994) | `claudebox ssh mount [user@]<host>[:port]` — mount it and start using it |
-| `claudebox ssh authorize '<key>'` — let a machine in | `claudebox ssh eject` — unmount and go back to the local workspace |
-| `claudebox ssh status` — up? fingerprint? who may log in? | `claudebox ssh status` — mounted? in use? |
-| `claudebox ssh stop` — stop serving; identity kept | `claudebox ssh forget` — drop the pin and the address |
+| `claudebox mutagen start` — bring the door up and publish it (`BOX_SYNC_PORT`, default 7994) | `claudebox mutagen attach [user@]<host>[:port]` — start syncing and work in the copy |
+| `claudebox mutagen authorize '<key>'` — let a machine in | `claudebox mutagen detach` — stop syncing, restore the local workspace |
+| `claudebox mutagen status` — up? fingerprint? who may log in? | `claudebox mutagen status [--follow]` — connected? current? conflicts? |
+| `claudebox mutagen stop` — stop serving; identity kept | `claudebox mutagen resolve --local\|--remote`, `claudebox mutagen forget [--purge]` |
 
 Joining is `ssh-copy-id` by hand, in the two commands it takes:
 
 ```
-B$ claudebox ssh mount 10.0.0.49:7994      # prints B's public key, refuses
-A$ claudebox ssh authorize 'ssh-ed25519 AAAA... claudebox@B'
-B$ claudebox ssh mount 10.0.0.49:7994      # mounts, pins A's host key
+B$ claudebox mutagen attach 10.0.0.49:7994    # prints B's public key, refuses
+A$ claudebox mutagen authorize 'ssh-ed25519 AAAA... claudebox@B'
+B$ claudebox mutagen attach 10.0.0.49:7994    # seeds the copy, pins A's host key
 ```
+
+`sync` is accepted as an alias for `mutagen` throughout — the service, container,
+volume and directory are all called sync; mutagen is the tool that does the work.
+
+### Mutagen runs only in containers, on both ends
+
+Neither host has mutagen installed, and that is not merely hygiene.
+
+**Mutagen accepts no per-session ssh options.** It shells out to the system
+`ssh`/`scp`, and the identity file, port and known-hosts file must come from an
+ssh config file — the only one it reads being `$HOME/.ssh/config` for whoever it
+runs as. On the host that is the *user's own* ssh config, which claudebox has no
+business writing to. In the sidecar, `$HOME` is ours: the config is generated
+from scratch on every start (`mutagen-client/entrypoint.sh`) and points at
+claudebox's own key and its own pinned `known_hosts`. Nothing under `~/.ssh` is
+read or written.
+
+**The far end needs nothing installed either.** Mutagen `scp`s an agent binary
+into the door container and runs it over ssh. Two consequences worth stating:
+the agent is copied *from the local sidecar*, so the two ends can never be
+version-skewed; and the door's login user needs a writable home, which is why
+that home moved off the workspace (below).
+
+**The borrowing machine needs no host tooling at all** — no mutagen, no sshfs,
+no FUSE, no `user_allow_other`, not even ssh. `ssh-keyscan`, `ssh` and the
+fingerprint checks all run inside the sidecar via `docker exec`.
 
 ### Load-bearing decisions
 
-- **Keys only, and no enrolment code.** Every other door in this stack (the
-  runner, the agent) hands out a bearer token through a short-lived code,
-  because what is behind it is an HTTP API that had to invent an
-  authentication scheme. ssh already has one. So there is no token, no
-  window and no code: the far side's `authorized_keys` is the entire access
-  list, `PasswordAuthentication` is off in `sshd_config`, and the one line
-  that has to travel between the machines is a **public** key, which is safe
-  to paste anywhere. What is lost is the one-command join; what is gained is
-  that a mis-sent enrolment code cannot exist.
+- **The login user's home is NOT the workspace, and this reverses the sshfs
+  design.** Under sshfs the home *was* the tree, so `sshfs host:` needed no
+  path. Mutagen installs its agent at `$HOME/.mutagen/agents/<version>/`, so
+  that arrangement would put a ~20MB binary **inside the source tree** and then
+  sync it out to every machine attached to it, forever, as a file nobody put
+  there. The home is now `${STATE}/home/<user>` on the state volume: writable,
+  persistent (so the agent is copied once, not per reconnect), and outside
+  anything anyone syncs. The served path is published instead, in
+  `${STATE}/served-workspace`, and the client reads it over ssh with
+  `claudebox-sync-info` rather than guessing that both machines use the same
+  `BOX_WORKSPACE`.
 
-- **The host key is pinned on first mount, in claudebox's own `known_hosts`.**
-  `~/.claudebox/ssh-client/` holds this machine's key and the hosts it has
-  pinned — not `~/.ssh`, because claudebox generates that key without being
-  asked and should not be writing into where a person keeps theirs, and
-  because "which machines can reach my workspace" should be answerable from
-  one file. A host that later answers with a different key is refused with
-  both fingerprints printed, not prompted about: this runs from scripts,
-  where there is nobody to answer a prompt.
+- **`StrictModes` went back on** as a direct consequence. It was off because the
+  home was a bind of the host's tree, whose 0775 mode made sshd refuse every
+  login; the home is now 0700 and ours, so the check costs nothing and is
+  restored.
 
-- **A container of its own, not sshd in the box.** Everything the box has is
-  something a login shell would inherit: a Docker client pointed at the dind
-  sidecar, the proxy variables, and a place on `inner`, where the relays
-  holding this machine's runner and agent tokens live. `claudebox-ssh` is on
-  `edge` alone. A session in it can see the workspace and the internet, and
-  cannot see the box, dind, the proxy or either relay.
+- **The empty-alpha hazard, and three guards against it.** This is the danger
+  the sshfs version did not have. `two-way-safe` does **not** treat "deleted
+  here, unmodified there" as a conflict — it is an unambiguous delete. So once a
+  session exists, a local copy that goes missing or is recreated empty
+  propagates **deletions into the other machine's source tree**. The realistic
+  way to get there is `BOX_SYNC_DIR` on a drive that did not mount. Three
+  independent defences:
+  1. **A sentinel** (`.claudebox-sync-root`) written into the copy at attach and
+     in the ignore list, so it never crosses. It can only exist because attach
+     put it there, so its absence is unambiguous, and `require_workspace`
+     refuses on it before the box starts.
+  2. **The door refuses to serve an empty tree** (`sync-server/entrypoint.sh`) —
+     the same hazard seen from the other end, where serving nothing would tell
+     the attached machine that everything was deleted.
+  3. **The copy is bound at the same path inside the container as outside.**
+     Mutagen stores the session's alpha path; with a fixed `/workspace`,
+     changing `BOX_SYNC_DIR` would silently re-point a live session at a
+     *different* host tree. With identical paths the session instead fails to
+     find its root — a failure rather than a catastrophe.
 
-- **The mount is made on the host, not in a container, and that is not a
-  preference.** A bind source is resolved by the Docker **daemon**, so a
-  filesystem that exists only inside some container is not something the box
-  can be given — the same rule that makes the workspace a second mount inside
-  `dind`. So `sshfs` runs on the host at `~/.claudebox/remote-workspace`, and
-  the box is pointed at it with `BOX_WORKSPACE_HOST`, which is the mechanism
-  that already exists for putting the workspace on another drive. Nothing in
-  the box knows or needs to know.
+  Mutagen has its own backstop too (`halted-on-root-emptied`), and the guard
+  reports it rather than working around it.
 
-- **`/etc/fuse.conf` needs `user_allow_other`, once per machine that mounts.**
-  `allow_other` is what lets a process that is not the mounting user cross a
-  FUSE mount, and the Docker daemon — which is root, and which is what
-  resolves the bind source — is exactly such a process. FUSE only honours the
-  option for a non-root user when that file says so. Without it the box fails
-  to start with a permission error naming a path that is plainly there, so
-  `claudebox ssh mount` checks up front and prints the one-line fix rather
-  than letting it surface two commands later.
+- **`.git` IS synced — do not add `--ignore-vcs`.** It is the obvious flag,
+  every mutagen example uses it, and it is exactly wrong here: it would leave
+  `.git` out of the copy, so `git status` in the box would answer "not a git
+  repository". Git running locally is the entire reason this replaced sshfs, and
+  that requires `.git` to be local. The comment at the call site says so, because
+  this is the thing a maintainer will reach for.
 
-- **A machine cannot mount its own workspace door, and the refusal is by
-  fingerprint.** `claudebox ssh mount` compares the host key the far side
-  presents with the local door's, so `127.0.0.1`, the LAN address and this
-  machine's hostname are all recognised as the same door — an address
-  comparison would catch one of the three. Why it is a refusal and not a
-  warning is in *Traps* below: it wedges the Docker daemon hard enough to need
-  a reboot.
+  The cost, which nothing enforces: **do not run git in the served tree on the
+  other machine while a session is attached.** Two gits writing one `.git`
+  through a reconciler that does not understand packfile atomicity will corrupt
+  a repository. It is in `config.example` and in the door's own `status` output.
 
-- **`claudebox ssh eject` stops the box first, for the reason `claudebox
-  eject` does.** A container with the mount bound into it holds the FUSE
-  filesystem in its own namespace: the unmount fails with `Device or resource
-  busy`, or — the worse case this stack has already been bitten by on a
-  removable drive — succeeds while the container reads on. Stop, unmount,
-  then put `BOX_WORKSPACE_HOST` back.
+- **A stale copy is worse than a missing one, so the launch guard proves
+  liveness rather than inspecting the directory.** The sshfs guard could ask
+  "is anything mounted"; a synced copy that stopped syncing is a directory full
+  of plausible source code. Every failure — daemon dead, container gone, session
+  paused, remote unreachable, conflicts halting propagation — produces that same
+  appearance. So `sync_require_current` asks the syncer to prove the copy is
+  current *right now*, and fails closed when it cannot:
+  fatal on a missing sentinel, a missing syncer, a session against a different
+  tree, no session, paused, halted, conflicts, or a flush that does not complete;
+  a loud **warning** (not a refusal) when the remote is merely unreachable but
+  the copy has synced, because working offline is legitimate.
 
-- **A dropped mount is fatal at launch, not a warning.** `require_workspace`
-  refuses to start the box when `BOX_WORKSPACE_HOST` is the sshfs mountpoint
-  and nothing is mounted there. It is the quietest failure in the whole
-  arrangement: an sshfs mount that died leaves an ordinary empty directory,
-  the bind succeeds, and the session comes up seeing no projects with nothing
-  anywhere saying why.
+- **Connectivity is checked before the cycle count.** A session that was paused
+  and resumed, or that reconnected, restarts `SuccessfulCycles` at zero. Reading
+  "0 cycles" as "the first sync never finished" mis-diagnoses a healthy session
+  that has just come back, and buries the real answer when the remote is down.
+
+- **`--symlink-mode=posix-raw`.** The default (`portable`) accepts only relative
+  links that stay inside the sync root, and real trees carry absolute ones in
+  `node_modules` and `vendor`. Mutagen does not *follow* symlinks, so a link
+  pointing outside the tree is still just a link, not a traversal.
+
+- **No default ignores.** Ignoring dependency trees is the main tuning lever and
+  the obvious footgun — a test run that needs `vendor/` finds it missing. Ship
+  `BOX_SYNC_IGNORE` empty and documented; `claudebox strip` is the other half of
+  the answer. It uses `${VAR-default}`, not `${VAR:-default}`, so an explicitly
+  empty setting stays empty.
+
+- **`mutagen sync flush` blocks until a cycle completes, and hangs forever
+  against a disconnected endpoint.** So it is never what waits for the initial
+  seed (polling `sync list` is), and every call is wrapped in `timeout` **inside
+  the container** — a host-side timeout around `docker exec` kills only the
+  client and leaves mutagen waiting.
+
+- **`detach` stops the box only if the box is actually in the copy.** The reason
+  to stop it is that anything written between the flush and the session ending
+  exists on one machine and nothing carries it over. That reasoning applies only
+  to a box working in the copy; a box working elsewhere is a live session with a
+  person attached to it, and killing that to tidy up a sync it is not using
+  would be gratuitous.
 
 ### Traps found while building it
 
+- **`--template` renders Go struct fields, but `{{json .}}` prints protobuf json
+  tags, and they are not the same names.** Probing with
+  `mutagen sync list --template '{{json .}}'` shows `status`, `paused`,
+  `successfulCycles`, `alpha.connected` — and a template written from that
+  output fails with `can't evaluate field status in type
+  synchronization.Session`. The real names are capitalised: `.Status`,
+  `.Paused`, `.SuccessfulCycles`, `.Alpha.Connected`, `.Beta.Connected`,
+  `.Conflicts`. `.Status` also renders the enum's `String()`, so it reads
+  `Watching`, not `watching` — hence case-insensitive matching wherever it is
+  compared. A health check built on the wrong names renders empty for every
+  field and reports healthy forever, which is exactly the failure the guard
+  exists to prevent.
+
+- **From the syncer, `127.0.0.1` is the syncer.** The obvious way to test the
+  feature on one machine is to attach to its own door at `127.0.0.1:7994`, and
+  the syncer is a *container*, so loopback there is the container itself and the
+  door published on the host's port is not on it. It failed as "nothing
+  answered", which names the wrong problem entirely. `attach` now recognises a
+  loopback address and prints the LAN addresses to use instead.
+
 - **A keys-only account is a *locked* account, and sshd without PAM refuses
-  it.** `adduser -D` leaves `!` in the password field, which is what every
-  keys-only account on an ordinary distro carries — they work because their
-  sshd runs with `UsePAM yes`, which skips the locked-account check. Alpine's
-  sshd is built without PAM and does the check itself: `User dizzy not allowed
-  because account is locked`, before the key is ever looked at, with the
-  public key correctly installed and a mount that fails at `read: Connection
-  reset by peer`. The entrypoint gives the account 32 random bytes as a
-  password on every start instead — unusable, since password authentication is
-  off, and not the same thing as unlocking it with an *empty* password, which
-  would leave `PermitEmptyPasswords` as the only thing standing there.
+  it.** `adduser -D` leaves `!` in the password field, which every keys-only
+  account on an ordinary distro carries — they work because their sshd runs
+  `UsePAM yes`, which skips the locked-account check. Alpine's sshd has no PAM
+  and does the check itself: `User dizzy not allowed because account is locked`,
+  before the key is ever read. The entrypoint gives the account 32 unusable
+  random bytes instead — not the same as unlocking it with an *empty* password,
+  which would leave `PermitEmptyPasswords` as the only thing standing there.
 
-- **Mounting a machine's own door wedges dockerd, and it cost a reboot to find
-  out.** It is the obvious way to try the feature without a second machine, and
-  it is the one arrangement that cannot work. The door, the box and `dind` are
-  services in **one compose project** and all three carry the workspace bind, so
-  pointing `BOX_WORKSPACE_HOST` at the local sshfs mount changes the bind source
-  for all of them — and the next launch recreates *the door too*, stopping the
-  sshd that the host's own sshfs mount is talking to. The mount is made with
-  `-o reconnect`, so instead of failing it blocks; the next thing to touch that
-  mountpoint is **dockerd**, resolving the bind source for the box, and it
-  blocks in the kernel holding that container's lock. What that looks like:
-  the box sits in `Created` forever, `docker inspect claudebox` and
-  `docker logs claudebox` hang while `docker ps` and every other container
-  answer normally, and nothing short of a reboot clears it. Two machines cannot
-  reach this state — a `compose up` on the machine that *mounted* the workspace
-  does not touch the machine serving it — so `ssh mount` refuses the loopback
-  by fingerprint rather than trying to survive it.
+- **`openssh-server` does not pull in `openssh-sftp-server`**, and scp on a
+  modern client is SFTP underneath — which is how mutagen installs its agent.
+  Without it, ssh logins work perfectly and the agent copy fails at `subsystem
+  request failed on channel 0`.
 
-- **A mount whose server has gone does not fail, it blocks.** The same
-  `-o reconnect` that carries the mount through a closed lid means a server that
-  is gone for good never returns an error to anything reading the tree. So
-  `claudebox ssh eject` tries a lazy unmount (`fusermount -uz`, `umount -l`)
-  after the ordinary ones: it detaches the mount from the tree without asking
-  the filesystem, which is the difference between a machine that recovers and
-  one that reboots.
-
-- **`openssh-server` does not pull in `openssh-sftp-server`, and sshfs speaks
-  sftp.** Without the package, ssh logins work perfectly and every mount fails
-  with `subsystem request failed on channel 0`.
-
-- **`StrictModes` and a home directory that is the workspace cannot both
-  stand.** The login user's home is the shared tree, so that `sshfs box@host:`
-  with no path lands on it and the other machine never has to know where this
-  one keeps its projects. But `StrictModes` checks the *mode of the home
-  directory* before accepting a login, and an ordinary group-writable tree
-  (0775) makes it refuse everything — fixable only by chmod'ing someone's own
-  projects. So it is off, and what it would have protected is moved out of
-  reach instead: `authorized_keys` lives in the state volume, root-owned,
-  where nobody who logs in can append to it.
-
-- **A setting written to the config file can be silently ignored, and until now
-  nothing said so.** `~/.bashrc` on this machine exports `BOX_WORKSPACE_HOST`,
-  and the environment beating the file is the documented rule — but it makes any
-  command that *writes* a setting able to succeed and change nothing:
-  `ssh mount` saved `BOX_WORKSPACE_HOST` and the next launch read the export
-  instead. Afterwards nothing can tell, because by then the two values are one
-  variable. So the launcher now records which settings the environment took from
-  the file (`BOX_SETTINGS_FROM_ENV`, built where both values are still separate)
-  and `config_set` warns when it writes one of them to a different value. The
-  matching read is `config_get`, which asks the file directly — `ssh eject` has
-  to undo a setting it wrote earlier, and asking the resolved variable would
-  have it conclude there was nothing to undo.
-
-- **`docker inspect <name>` answers about images too.** `ssh_serving` was
-  `docker inspect claudebox-ssh`, and there is an *image* of that name — so on
-  any machine that had ever built it, the door reported itself up with no
-  container anywhere, and `ssh status` then ran `docker exec` against nothing.
-  It is `docker inspect --type container -f '{{.State.Running}}'` now, which is
-  what `runner_hosted_here` already did.
+- **`docker inspect <name>` answers about images too.** `sync_serving` must be
+  `docker inspect --type container -f '{{.State.Running}}'`; the bare form
+  returns success on any machine that has merely *built* the image, so the door
+  reports itself up with no container anywhere.
 
 - **`set -euo pipefail` makes a failed pipeline inside `x="$(a | b)"` end the
-  launcher, silently.** Without `pipefail` the substitution takes `b`'s status
-  and a failing `a` is invisible; with it, `set -e` exits — no message, no exit
-  code anyone sees, just a command that produced nothing. That is exactly how
-  `ssh status` failed once `docker exec` started failing: the whole launcher
-  ended at the assignment. Every such substitution added here now ends in
-  `|| true` and lets the code below decide what an empty value means.
+  launcher, silently** — no message, no exit code anyone sees. Every such
+  substitution here ends in `|| true` and lets the code below decide what an
+  empty value means.
 
-- **`ip -4 -o addr show scope global` is mostly Docker on this host.** The
-  address to type on the other machine came out fifth in a list of five, after
-  four bridges no other machine can reach. Interfaces named `docker*`, `br-*`,
-  `veth*`, `virbr*` are dropped.
-
-### Why this is a built-in and not a plugin
-
-The rule in *If asked to extend this* is that a new launcher command should be a
-plugin, and the exception is a command inseparable from the launch path — "the
-stack, the allowlist, the workspace". This is the workspace: `ssh mount` and
-`ssh eject` are the two things that move `BOX_WORKSPACE_HOST`, and the check
-that refuses to start the box over a mount that has dropped is in
-`require_workspace`, which runs before every session. A plugin could bring a
-container up; it could not put itself in front of the launch.
+- **The loopback deadlock that sshfs had is gone, and the refusal that guarded
+  it is not needed any more.** Under sshfs, the mount and the sshd serving it
+  were services in one compose project: the next launch recreated the door while
+  the host's own mount was live, the mount blocked forever (it was mounted
+  `-o reconnect`), dockerd blocked in the kernel resolving the bind source, and
+  the machine needed a reboot. None of that mechanism survives — the copy and
+  the served tree are two ordinary directories and mutagen never blocks on
+  either. Attaching to this machine's own door is now the supported way to test
+  the feature without a second machine, with one check that still bites: the two
+  trees must not overlap, which would be a sync into itself.
 
 ### What this is not
 
-It is not a way into the box, and not a second front door. `claudebox-ssh`
-forwards nothing (`AllowTcpForwarding no`, no agent forwarding, no tunnels), has
-no route to `inner`, and serves one directory. A machine that mounts the
-workspace can read and write the source tree — which is the entire point, and
-the whole of it. Running claude over that tree still happens in each machine's
-own box, under its own allowlist.
+It is not a way into the box. `claudebox-sync` forwards nothing
+(`AllowTcpForwarding no`, no agent forwarding, no tunnels), has no route to
+`inner`, and serves one directory. `claudebox-mutagen` is on `edge` alone too,
+and deliberately never joins `inner` — it holds an ssh private key that another
+machine's door trusts, and `inner` is where the relays holding this machine's
+runner and agent tokens live. Running claude over the tree still happens in each
+machine's own box, under its own allowlist.
 
 ## Egress allowlist
 
@@ -2666,12 +2709,13 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
   token typed on a command line is in the shell history too. If the plugin needs
   a host the box cannot reach, that is a feature — resist adding it to
   `allowlist.conf` to "make it work", since the fetch is happening on the host.
-- **Share the workspace with another machine** → `claudebox ssh start` here and
-  `claudebox ssh mount` there, not a new bind or a copy of the tree. Note what it
-  does *not* do: the door is a container of its own on `edge` with no route to
-  `inner`, so this is not an exception to the rule below — nothing was published
-  on the `claude` service, and a machine that mounts the workspace still cannot
-  reach the box, dind, the proxy or either relay. See *Sharing the workspace
+- **Share the workspace with another machine** → `claudebox mutagen start` here
+  and `claudebox mutagen attach` there, not a new bind and not a network
+  filesystem (git is the workload, and git walks the whole tree). Note what it
+  does *not* do: the door and the syncer are containers of their own on `edge`
+  with no route to `inner`, so this is not an exception to the rule below —
+  nothing was published on the `claude` service, and a machine that syncs the
+  workspace still cannot reach the box, dind, the proxy or either relay. See *Sharing the workspace
   between machines*.
 - **Let something else reach the box from the LAN** → through `agent-relay`, one
   named route at a time, never by publishing a port on the `claude` service. The

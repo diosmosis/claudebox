@@ -1,0 +1,83 @@
+# claudebox workspace door -- sshd configuration.
+#
+# This sshd exists to be mutagen's transport and nothing else: the other machine
+# logs in, runs claudebox-sync-info, has an agent binary scp'd into its home,
+# and talks to that agent over stdin/stdout. Everything not needed for that is
+# off.
+#
+# @USER@ is substituted by entrypoint.sh with the box user's name, which is a
+# setting (BOX_USER) rather than something this file can know.
+#
+# Keys only, one user, no forwarding. This port is on the LAN, which is the one
+# place in this stack anything is published, so everything not needed to serve a
+# filesystem is off.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+# In the state volume, so the identity survives restarts and rebuilds. The other
+# machine pins its fingerprint on first mount; deleting the volume issues a new
+# one and every mount then refuses until it is re-pinned.
+HostKey /var/lib/claudebox-sync/ssh_host_ed25519_key
+
+# Nobody types a password here and no password exists to type: the box user's
+# account is created locked, and the only way in is a key added with
+# "claudebox ssh authorize". This makes that structural rather than incidental
+# -- with it off, an account that ever acquires a password becomes reachable.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+PubkeyAuthentication yes
+
+# Outside the home directory on purpose, and root-owned. The home directory is
+# writable by whoever logs in -- it has to be, since that is where mutagen
+# installs its agent -- so a list of who may log in that lived inside it would
+# be a list its own readers could extend.
+AuthorizedKeysFile /var/lib/claudebox-sync/authorized_keys
+
+# Only the box user. Root has no shell here and no key, but saying so costs
+# nothing and this is the file someone reads to find out who can get in.
+AllowUsers @USER@
+
+# On, and it was off until the home directory moved.
+#
+# StrictModes checks the ownership and mode of the user's HOME before accepting
+# a login. That was fatal while the home WAS the workspace -- a bind of the
+# host's source tree, whose mode belongs to the host, and an ordinary
+# group-writable 0775 tree made sshd refuse every login with "bad ownership or
+# modes for directory". The only fix from in here would have been to chmod
+# someone else's project tree, so the check was disabled.
+#
+# The home is now ${STATE}/home/<user>: 0700, user-owned, on a volume this
+# image controls (entrypoint.sh makes it so on every start). The reason to turn
+# the check off is gone, so it goes back on.
+StrictModes yes
+
+# A tree and an agent process is all this serves. Forwarding would make the
+# container a way onto whatever it can reach; it is on `edge` alone and never
+# sees `inner`, but `edge` does have a route out.
+AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+MaxAuthTries 3
+MaxSessions 10
+LoginGraceTime 20
+ClientAliveInterval 30
+ClientAliveCountMax 4
+PrintMotd no
+
+# UsePAM is deliberately absent, not set to no: this sshd is Alpine's, built
+# without PAM, and it warns on every start about an option it does not have.
+
+# What scp lands on when mutagen installs its agent -- scp on a modern client is
+# SFTP underneath. internal-sftp rather than the separate binary so there is no
+# second process to find and no path to keep in step. (openssh-client is
+# installed too, for the legacy scp protocol, which runs a binary on the server
+# instead; see the Dockerfile.)
+Subsystem sftp internal-sftp

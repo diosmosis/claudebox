@@ -397,8 +397,15 @@ services:
 
 
   # The workspace door: sshd over the SAME source tree the box works in, so
-  # another machine on this LAN can mount it with sshfs and run its own
-  # claudebox against it. "claudebox ssh start" is what creates it.
+  # another machine on this LAN can keep a live local copy of it and run its own
+  # claudebox against that copy. "claudebox mutagen start" is what creates it.
+  #
+  # This sshd is only mutagen's TRANSPORT. Nothing mutagen-shaped is installed
+  # in it: the other machine scp's an agent binary into this container's home
+  # and talks to it over stdin/stdout, which is what "mutagen is installed on
+  # neither host" comes down to. The agent lands in the login user's home, which
+  # entrypoint.sh keeps on the state volume and emphatically NOT in the
+  # workspace -- see the long note there.
   #
   # Why a container of its own rather than sshd in the box: everything the box
   # has is something a login shell would inherit -- a Docker client pointed at
@@ -413,50 +420,49 @@ services:
   # it cannot see the box, dind, the proxy or the relays.
   #
   # Behind a profile, so it exists only where it is wanted. The launcher passes
-  # --profile ssh when BOX_SSH_SERVE is set; without it this service is not
+  # --profile sync when BOX_SYNC_SERVE is set; without it this service is not
   # created and nothing listens.
-  ssh:
-    container_name: claudebox-ssh
-    image: claudebox-ssh:latest
+  sync:
+    container_name: claudebox-sync
+    image: claudebox-sync:latest
     build:
-      context: ./ssh-server
+      context: ./sync-server
       args:
         USERNAME: ${BOX_USER:-dizzy}
         UID: ${BOX_UID:-1000}
         GID: ${BOX_GID:-1000}
     init: true
-    profiles: ["ssh"]
+    profiles: ["sync"]
     environment:
-      CLAUDEBOX_SSH_STATE: /var/lib/claudebox-ssh
-      # Who sshd lets in, and where that user's home is -- the workspace, so
-      # "sshfs box@host:" with no path lands on the source tree and the other
-      # machine never has to know where this one keeps it. entrypoint.sh applies
-      # both at start; see the note there on why they are not baked into the
-      # image.
-      CLAUDEBOX_SSH_USER: ${BOX_USER:-dizzy}
+      CLAUDEBOX_SYNC_STATE: /var/lib/claudebox-sync
+      # Who sshd lets in, and which tree is served. entrypoint.sh applies both
+      # at start and publishes the served path for the other machine to read
+      # over ssh; see the note there on why neither is baked into the image, and
+      # on why the login user's home is NOT the workspace any more.
+      CLAUDEBOX_SYNC_USER: ${BOX_USER:-dizzy}
       CLAUDEBOX_WORKSPACE: ${BOX_WORKSPACE:-/home/dizzy/Projects}
     ports:
       # On the LAN, which is the point. What protects it is that there is no
       # password to guess: keys only, one user, and the list of keys is added to
-      # from this machine with "claudebox ssh authorize".
-      - "${BOX_SSH_PORT:-7994}:22"
+      # from this machine with "claudebox mutagen authorize".
+      - "${BOX_SYNC_PORT:-7994}:22"
     volumes:
       # The identity -- host key and authorized_keys. A volume, so it survives
       # restarts and rebuilds: delete it to rotate the host key, and every
-      # machine that mounted this workspace has to re-pin before it can mount
-      # again.
-      - ssh-state:/var/lib/claudebox-ssh
+      # machine that attached to this workspace has to re-pin before it can
+      # attach again.
+      - sync-state:/var/lib/claudebox-sync
 
       # The LOCAL tree, at the same container-side path the box uses. Read-write:
       # the other machine is running a claudebox over it, not reading it.
       #
-      # BOX_SSH_WORKSPACE_HOST rather than BOX_WORKSPACE_HOST, and the launcher
-      # derives it: on a machine that has itself mounted someone else's
-      # workspace, BOX_WORKSPACE_HOST is that borrowed tree, and a door that
-      # followed it would hand a third machine a workspace from somewhere else
-      # over two hops -- as well as being recreated by every "ssh mount". This
+      # BOX_SYNC_WORKSPACE_HOST rather than BOX_WORKSPACE_HOST, and the launcher
+      # derives it: on a machine that is itself borrowing someone else's
+      # workspace, BOX_WORKSPACE_HOST is the local COPY of that tree, and a door
+      # that followed it would hand a third machine a workspace from somewhere
+      # else -- with two independent reconcilers writing the same files. This
       # one moves only when the local workspace does.
-      - ${BOX_SSH_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}}:${BOX_WORKSPACE:-/home/dizzy/Projects}
+      - ${BOX_SYNC_WORKSPACE_HOST:-${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}}:${BOX_WORKSPACE:-/home/dizzy/Projects}
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
       interval: 5s
@@ -465,6 +471,96 @@ services:
       start_period: 2s
     networks:
       - edge
+  # The syncer: a mutagen daemon and an ssh client, in a container, because
+  # mutagen is not to be installed on either host.
+  #
+  # It is a container for a specific reason rather than tidiness. Mutagen shells
+  # out to the system ssh and accepts NO per-session ssh options -- no identity
+  # file, no port, no known-hosts file. All of it has to come from an ssh config
+  # file, and the only one it reads is $HOME/.ssh/config for whoever it runs as.
+  # On the host that is the person's own ssh config, which claudebox has no
+  # business writing to. In here HOME is ours.
+  #
+  # `edge` ALONE, and unlike the door that is not merely tidiness: this
+  # container holds an ssh private key that another machine's door trusts, and
+  # `inner` is where the relays holding this machine's runner and agent tokens
+  # live. It has no errand there. No proxy variables either -- mutagen speaks
+  # ssh, not HTTP, and pointing it at Squid would only produce a confusing
+  # failure.
+  #
+  # Behind a profile: the launcher passes --profile mutagen when BOX_SYNC_REMOTE
+  # is set, and explicitly during "claudebox mutagen attach", which is the one
+  # moment that setting does not exist yet.
+  mutagen:
+    container_name: claudebox-mutagen
+    image: claudebox-mutagen:latest
+    build:
+      context: ./mutagen-client
+      args:
+        USERNAME: ${BOX_USER:-dizzy}
+        UID: ${BOX_UID:-1000}
+        GID: ${BOX_GID:-1000}
+    init: true
+    profiles: ["mutagen"]
+    # Unlike everything else in this stack, this container going away is not
+    # visible: the box keeps running over a local directory that still looks
+    # exactly right and is quietly no longer being updated. require_workspace is
+    # what catches that; restarting is the cheap half of the defence.
+    restart: unless-stopped
+    # Files mutagen writes into the copy land through a bind, so their ownership
+    # is the host's ownership. Running as anything else produces a workspace the
+    # box cannot write to.
+    user: "${BOX_UID:-1000}:${BOX_GID:-1000}"
+    environment:
+      CLAUDEBOX_MUTAGEN_STATE: /var/lib/claudebox-mutagen
+      CLAUDEBOX_SYNC_CLIENT_DIR: /var/lib/claudebox-sync-client
+      # Where the door is. entrypoint.sh turns these three into ~/.ssh/config,
+      # which is the only place mutagen will look. Changing them recreates this
+      # container, which is correct -- the config is generated at start.
+      CLAUDEBOX_SYNC_HOST: ${BOX_SYNC_REMOTE_HOST:-}
+      CLAUDEBOX_SYNC_PORT: ${BOX_SYNC_REMOTE_PORT:-7994}
+      CLAUDEBOX_SYNC_USER: ${BOX_SYNC_REMOTE_USER:-${BOX_USER:-dizzy}}
+      # Only the comment on the generated key, so an authorized_keys list over
+      # there says which machine each line belongs to.
+      CLAUDEBOX_SYNC_LABEL: ${BOX_SYNC_LABEL:-}
+      HOME: /var/lib/claudebox-mutagen/home
+    volumes:
+      # Daemon state, the session database, and the cache of agent binaries
+      # mutagen installs on remotes. A volume: the sessions have to survive a
+      # restart, or every reboot would mean a fresh full scan.
+      - mutagen-state:/var/lib/claudebox-mutagen
+
+      # This machine's ssh identity and its pinned known_hosts. A HOST bind
+      # rather than a volume, because it is an identity other machines have
+      # authorised: "docker volume prune" must not be a way to make every door
+      # on the LAN stop letting this machine in.
+      - ./sync-client:/var/lib/claudebox-sync-client
+
+      # The local copy -- real files on this machine's disk, which is the whole
+      # point of syncing rather than mounting: git runs here at local-disk
+      # speed.
+      #
+      # Bound at the SAME path inside the container as outside, and that is
+      # load-bearing rather than cosmetic. Mutagen stores the session's alpha
+      # path. If the container path were a fixed /workspace, changing
+      # BOX_SYNC_DIR would silently re-point a live session at a DIFFERENT host
+      # tree, and mutagen would reconcile the new one against the remote --
+      # which for a new empty directory means propagating the deletion of
+      # everything. With the paths identical, the same change makes the session
+      # unable to find its root: a failure instead of a catastrophe.
+      - ${BOX_SYNC_DIR:-/home/dizzy/.claudebox/synced-workspace}:${BOX_SYNC_DIR:-/home/dizzy/.claudebox/synced-workspace}
+    healthcheck:
+      # That the daemon answers on its IPC socket, which is the thing that
+      # matters -- a container that is "up" with a wedged daemon is exactly the
+      # state that leaves the copy stale while looking fine.
+      test: ["CMD-SHELL", "mutagen sync list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - edge
+
   # One fixed TCP forward, from the box to a running DDEV project's database.
   #
   # It exists because a Matomo UI-test fixture is a single PHP process that needs
@@ -557,8 +653,12 @@ volumes:
   agent-state:
 
   # The workspace door's identity -- host key and the list of keys allowed in.
-  # Only created when the ssh profile is used.
-  ssh-state:
+  # Only created when the sync profile is used.
+  sync-state:
+
+  # The syncer's daemon state, session database, and cache of the agent binaries
+  # it installs on remotes. Only created when the mutagen profile is used.
+  mutagen-state:
 
   box-home:
     name: claudebox-home

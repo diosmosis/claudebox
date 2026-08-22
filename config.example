@@ -111,35 +111,70 @@
 # unaffected and stays on 443. Change this only if 8080 collides.
 #BOX_RUNNER_ROUTER_HTTP_PORT=8080
 
-# --- the workspace over ssh -------------------------------------------------
+# --- the workspace over mutagen ---------------------------------------------
 #
 # Two machines, one source tree. On the machine that HAS the tree, "claudebox
-# ssh start" brings up a container running sshd over the same bind the box gets
-# and publishes it on the LAN; on the other, "claudebox ssh mount <host>" mounts
-# it with sshfs and points BOX_WORKSPACE_HOST at the mount, so claudebox there
-# runs against this tree while the box still sees a plain ~/Projects.
+# mutagen start" brings up a container running sshd over the same bind the box
+# gets and publishes it on the LAN. On the other, "claudebox mutagen attach
+# <host>" keeps a live local COPY of that tree in step with it and points
+# BOX_WORKSPACE_HOST at the copy, so claudebox there runs against real local
+# files while the box still sees a plain ~/Projects.
 #
-# Keys only -- there is no password, and no token. A machine joins by having its
-# public key added over here with "claudebox ssh authorize", which is the line
-# its own "claudebox ssh mount" prints.
-
-# On the machine that SERVES the workspace. Written by "claudebox ssh start",
-# which also brings the door up -- easier than setting it here and starting by
-# hand.
-#BOX_SSH_SERVE=1
-#BOX_SSH_PORT=7994
-
-# On the machine that MOUNTS one -- set by "claudebox ssh mount". The address
-# joined, and the host key fingerprint pinned there; a machine that later
-# answers with a different key is refused rather than prompted about.
+# A copy rather than a mount, because git is the workload: "git status" walks
+# the whole tree, which over a network filesystem is tens of thousands of round
+# trips. On a local copy it is tens of thousands of local stats.
 #
-# Edit these by re-running "claudebox ssh mount" rather than by hand; the
-# fingerprint has to match the far side's current host key exactly.
-#BOX_SSH_REMOTE=dizzy@192.168.1.10:7994
-#BOX_SSH_FINGERPRINT=SHA256:...
+# Mutagen runs in a container on both ends -- neither machine has it installed.
+# Keys only: a machine joins by having its public key added over there with
+# "claudebox mutagen authorize", which is the line its own "attach" prints.
+#
+# ONE RULE THIS DEPENDS ON, and nothing enforces it: while a machine is
+# attached, do not run git in the served tree on the other machine. .git is
+# synced (it has to be -- git running locally is the entire point), and two
+# gits writing one .git through a reconciler that does not understand packfile
+# atomicity will corrupt the repository.
 
-# What BOX_WORKSPACE_HOST was before the mount took it over. Written by
-# "claudebox ssh mount" and read by "claudebox ssh eject", which is the only
-# thing that puts the local workspace back -- so this is not a setting to write
-# by hand.
-#BOX_SSH_LOCAL_WORKSPACE_HOST=/home/dizzy/Projects
+# On the machine that SERVES the workspace. Written by "claudebox mutagen
+# start", which also brings the door up -- easier than setting it here and
+# starting by hand.
+#BOX_SYNC_SERVE=1
+#BOX_SYNC_PORT=7994
+
+# On the machine that BORROWS one -- set by "claudebox mutagen attach". The
+# address joined, the host key fingerprint pinned there, and the tree that door
+# serves (learned over ssh, not guessed). A machine that later answers with a
+# different key is refused rather than prompted about.
+#
+# Edit these by re-running "claudebox mutagen attach" rather than by hand.
+#BOX_SYNC_REMOTE=dizzy@192.168.1.10:7994
+#BOX_SYNC_FINGERPRINT=SHA256:...
+#BOX_SYNC_REMOTE_PATH=/home/dizzy/Projects
+
+# What BOX_WORKSPACE_HOST was before the copy took it over. Written by attach
+# and read by detach, which is the only thing that puts the local workspace
+# back -- so this is not a setting to write by hand.
+#BOX_SYNC_LOCAL_WORKSPACE_HOST=/home/dizzy/Projects
+
+# Where the copy lives. Real files, so size it accordingly -- and do NOT put it
+# on a removable drive: a directory that is empty because the drive did not
+# mount is precisely the case the sync's safety marker exists to catch, and
+# being caught is much better than being in it. Changing this while attached is
+# a detach-then-attach, not an edit.
+#BOX_SYNC_DIR=/home/dizzy/.claudebox/synced-workspace
+
+# How the two trees are reconciled. two-way-safe (the default) refuses to
+# resolve anything that would lose data and halts on conflicts instead;
+# two-way-resolved makes this machine win them automatically.
+#BOX_SYNC_MODE=two-way-safe
+
+# Paths not to sync, space separated. Empty by default. Ignoring dependency
+# trees is the main tuning lever -- they are the bulk of the file count, and
+# native modules built on one machine are not necessarily valid on the other --
+# but a test run that needs vendor/ will find it missing, so this is a choice
+# rather than a default. "claudebox strip" is the other half of the answer.
+#BOX_SYNC_IGNORE="node_modules/ vendor/ .DS_Store"
+
+# How long a forced sync cycle may take before the launcher gives up on proving
+# the copy is current and refuses to start the box. Raise it for a large tree.
+#BOX_SYNC_FLUSH_TIMEOUT=30
+
