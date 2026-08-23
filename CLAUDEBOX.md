@@ -413,7 +413,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | opencode | 1.18.14 | installed via `npm i -g opencode-ai`; a Bun binary, so it ignores `NODE_OPTIONS` |
 | Proxy | Squid 5.7 on `debian:bookworm-slim` | |
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
-| Host Docker | Docker Desktop on Linux, 29.6.2 | socket at `~/.docker/desktop/docker.sock` |
+| Host Docker | Docker Engine (`docker-ce`) 29.7.2 on Ubuntu 24.04, rootful | socket at `/var/run/docker.sock`, context `default`. Was Docker Desktop; the traps below that name Desktop are what that cost, kept because a host can move back |
 | DDEV | v1.25.3 | `performance_mode: none`, so plain bind mounts |
 | Also in the box | git (+ `git-lfs`, filters registered system-wide), ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
 | Fonts | DejaVu / Liberation / Noto Color Emoji taken from `ubuntu:24.04`, plus CI's Arial, Verdana and Courier New | matched to the `ubuntu-24.04` runners so screenshot baselines compare; see the traps |
@@ -560,9 +560,13 @@ one role or the other and the settings that matter differ.
 
 ### What the launcher does on each run
 
-1. Checks the host workspace: exists, non-empty, on Docker Desktop's
-   file-sharing list (also before `rebuild`, not before `stop` — a drive can be
-   gone by then and `compose down` does not care).
+1. Checks the host workspace: exists, non-empty, and — only when the active
+   context is Docker Desktop's socket — on Desktop's file-sharing list. On a
+   native dockerd, which is what this host runs now, that last part is skipped:
+   dockerd binds host paths directly and shares nothing, and Desktop's settings
+   file outlives Desktop on a host that has moved off it. (Also before
+   `rebuild`, not before `stop` — a drive can be gone by then and `compose down`
+   does not care.)
 2. Creates `ddev_default` if absent (DDEV reuses it as-is).
 3. Regenerates `docker-compose.override.yaml`: always the `~/.claudebox/plans →
    ~/.claude/plans` bind (after `mkdir`ing the host side), plus the optional host
