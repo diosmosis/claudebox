@@ -230,7 +230,9 @@ not work and is not meant to.
 
 ## Installed tools
 
-git, ripgrep, jq, curl, wget, less, nano, rsync, zip/unzip, php-cli 8.2 (curl,
+git (with `git lfs`, its filters registered in `/etc/gitconfig` so clones of an
+LFS repo fetch real content rather than pointer files), ripgrep, jq, curl, wget,
+less, nano, rsync, zip/unzip, php-cli 8.2 (curl,
 gd, mbstring, mysql, xml, zip), composer, node 22, docker CLI + buildx + compose,
 imagemagick (`compare`/`identify`, which screenshot assertions need).
 

@@ -101,6 +101,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         composer \
         curl \
         git \
+        git-lfs \
         gnupg \
         imagemagick \
         jq \
@@ -123,6 +124,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
         zip \
     && rm -rf /var/lib/apt/lists/*
+
+# git-lfs is only a binary until its filters are registered in a git config;
+# without that, cloning an LFS repo yields pointer files instead of content.
+# --system writes /etc/gitconfig, which is part of the image: registering it in
+# the user's ~/.gitconfig instead would land in the HOME volume, where
+# entrypoint.sh seeds that file from the host's copy and a host without LFS
+# would leave the box without it.
+RUN git lfs install --system --skip-repo
 
 # Docker CLI only -- no daemon. It talks to the rootless dind sidecar over TCP,
 # so the box can start containers without any access to the host's Docker.

@@ -415,7 +415,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
 | Host Docker | Docker Desktop on Linux, 29.6.2 | socket at `~/.docker/desktop/docker.sock` |
 | DDEV | v1.25.3 | `performance_mode: none`, so plain bind mounts |
-| Also in the box | git, ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
+| Also in the box | git (+ `git-lfs`, filters registered system-wide), ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
 | Fonts | DejaVu / Liberation / Noto Color Emoji taken from `ubuntu:24.04`, plus CI's Arial, Verdana and Courier New | matched to the `ubuntu-24.04` runners so screenshot baselines compare; see the traps |
 
 ## Files
@@ -828,7 +828,7 @@ regressions. This is what the `base` stage in `Dockerfile` exists for.
 
 | Stage | Contents |
 |---|---|
-| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, Xvfb, PHP + extensions, node, composer, the docker CLI, ImageMagick's raised limits, the box user |
+| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, Xvfb, PHP + extensions, node, composer, git + git-lfs, the docker CLI, ImageMagick's raised limits, the box user |
 | `claudebox` | `base` + the agents, the shims, the language servers, `box-CLAUDE.md` |
 
 `runner/Dockerfile` is `FROM claudebox-base:latest`, and the rule for what may
@@ -1834,7 +1834,7 @@ Currently allowed: `api.anthropic.com`, `claude.ai`, `claude.com`,
 `storage.googleapis.com`, `raw.githubusercontent.com`, `registry.npmjs.org`,
 `.ddev.site`, `.docker.io`, `production.cloudflare.docker.com`,
 `production.cloudfront.docker.com`, `*.github.com`, `*.githubusercontent.com`,
-`*.github.io`, `*.debian.org`, `*.alpinelinux.org`, `*.wordpress.org`,
+`*.github.io`, `github-cloud.s3.amazonaws.com` (git-lfs objects), `*.debian.org`, `*.alpinelinux.org`, `*.wordpress.org`,
 `*.woocommerce.com`, `*.packagist.org`, `getcomposer.org`, and for opencode
 `opencode.ai`, `*.opencode.ai`, `models.dev`.
 
