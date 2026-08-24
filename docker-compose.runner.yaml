@@ -143,6 +143,19 @@ services:
       # set BOX_DIND_APPARMOR=unconfined.
       - apparmor=${BOX_DIND_APPARMOR:-claudebox-dind}
       - systempaths=unconfined
+    # A ceiling on everything the sidecar runs -- the daemon, and every
+    # container a test starts inside it. Without one a runaway process (a PHP
+    # test that leaks, a browser that never exits) grows until the HOST is out
+    # of memory and the OOM killer picks a victim anywhere on the machine,
+    # including the runner or the user's desktop. With it the kill stays inside
+    # this cgroup, which is the process that actually went wrong.
+    #
+    # memswap_limit is the combined memory+swap ceiling, NOT a separate swap
+    # allowance: setting it equal to mem_limit is how you say "no swap". A
+    # runner that swaps does not fail, it just gets slow enough to look hung,
+    # and swap thrash on the host is worse than an early OOM in here.
+    mem_limit: 12g
+    memswap_limit: 12g
     devices:
       - /dev/fuse
       - /dev/net/tun

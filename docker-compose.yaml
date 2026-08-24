@@ -232,6 +232,18 @@ services:
       # right: set BOX_DIND_APPARMOR=unconfined for that case.
       - apparmor=${BOX_DIND_APPARMOR:-claudebox-dind}
       - systempaths=unconfined
+    # A ceiling on everything this sidecar runs -- the daemon itself, and every
+    # container the box starts through it. Without one a nested container that
+    # leaks (a test suite, a browser that never exits) grows until the HOST is
+    # out of memory and the OOM killer picks a victim anywhere on the machine,
+    # the box included. With it the kill stays inside this cgroup, which holds
+    # the process that actually went wrong.
+    #
+    # memswap_limit is the combined memory+swap ceiling, NOT a separate swap
+    # allowance: equal to mem_limit is how you say "no swap". Kept the same
+    # 12g as the runner sidecar (docker-compose.runner.yaml) on purpose.
+    mem_limit: 12g
+    memswap_limit: 12g
     devices:
       - /dev/fuse
       - /dev/net/tun
