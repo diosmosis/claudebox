@@ -247,9 +247,25 @@ come from the CI action. Don't "fix" a screenshot diff by installing more fonts;
 check first whether word positions match, which means the font is right and only
 its rendering differs.
 
-Headless Chromium's shared libraries are installed, so a Puppeteer browser
-downloaded into a project's `node_modules` runs here. There is no browser in the
-image itself, and Chromium needs `--no-sandbox` in this container.
+Chromium and a matching `chromedriver` are on PATH, so you can drive a browser
+yourself without a project to host one — open a page to check a change rendered,
+read the console on a dev server, take a screenshot. It needs `--no-sandbox` in
+this container (there is no user namespace for it to drop into):
+
+```bash
+chromium --headless --no-sandbox --disable-gpu --screenshot=/tmp/out.png <url>
+```
+
+For a headful run use `xvfb-run`. Traffic goes out through Squid like everything
+else, so a page can only load what the allowlist permits.
+
+The shared libraries for a headless Chromium are installed too, which is a
+separate thing: they are what lets a Puppeteer build downloaded into a project's
+`node_modules` run. Keep using that build for a suite with screenshot baselines
+— they belong to the browser that produced them, and the system Chromium is a
+different version. Puppeteer never looks at PATH, so it picks the right one on
+its own; a suite whose tooling probes PATH for a browser should pin its binary
+explicitly.
 
 Debian and npm mirrors are allowlisted, so `apt-get install` and `npm i -g` do
 work — but the image is rebuilt from the Dockerfile and anything you install this

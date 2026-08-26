@@ -145,11 +145,15 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && rm -rf /var/lib/apt/lists/*
 
 # Shared libraries a headless Chromium needs, for Puppeteer-driven test suites
-# (Matomo's tests/UI). The browser itself is NOT installed: Puppeteer downloads
-# its own pinned build into the project's node_modules from
-# storage.googleapis.com, which is on the allowlist. Only the runtime
-# dependencies of that download are baked in here, plus one font family so text
-# renders as glyphs rather than boxes.
+# (Matomo's tests/UI). These serve a browser this image does not ship: Puppeteer
+# downloads its own pinned build into the project's node_modules from
+# storage.googleapis.com, which is on the allowlist, and that build arrives as a
+# bare binary with nothing to satisfy its links. Only the runtime dependencies
+# of that download are baked in here, plus one font family so text renders as
+# glyphs rather than boxes.
+#
+# A system browser IS installed further down, and does not replace any of this:
+# apt satisfies its own dependencies, a Puppeteer-downloaded build cannot.
 #
 # Chromium still needs --no-sandbox in this container (no user namespaces for it
 # to drop into); Matomo already sets that in tests/UI/config.dist.js.
@@ -188,6 +192,52 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxshmfence1 \
         libxss1 \
         libxtst6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# A browser on PATH, so an agent can drive one directly.
+#
+# Distinct in purpose from the libraries above, which exist so a project's OWN
+# pinned Puppeteer build runs. This is a browser for work with no project behind
+# it: opening a page to see whether a change rendered, reading the console on a
+# local dev server, taking a screenshot. Installing a browser into some
+# node_modules first is the wrong shape for that, and often not possible at all
+# in a tree that has no node project in it.
+#
+# In base rather than the claudebox stage, and by this file's own rule -- a
+# browser is about as observable as a thing can get, so both images take it off
+# the same layers. Note this STRENGTHENS the parity guarantee rather than
+# straining it: box and runner get a byte-identical binary, so anything that
+# does reach for this browser renders the same in both places.
+#
+# chromium-driver is the matching ChromeDriver, built from the same source
+# package, so its version cannot drift from the browser's -- which is the usual
+# cause of "session not created: This version of ChromeDriver only supports
+# Chrome version N". Worth the few MB to not have that failure mode at all.
+#
+# chromium-sandbox is deliberately left out: the container gives Chromium no
+# user namespace to drop into, so it needs --no-sandbox exactly as the
+# Puppeteer-downloaded build does, and the setuid helper would sit there
+# unusable. Matomo already passes that flag in tests/UI/config.dist.js.
+#
+# What is deliberately NOT set here: CHROME_BIN or PUPPETEER_EXECUTABLE_PATH. A
+# suite's screenshot baselines belong to the browser build that produced them,
+# and pointing a project at this one instead would silently re-render every
+# baseline it has. Puppeteer resolves its browser from its own cache and never
+# consults PATH, so it is unaffected either way; tooling that DOES probe PATH
+# for a system browser (some WebdriverIO configurations do) will now find one
+# where it previously found nothing, so a baseline-sensitive suite should pin
+# its binary explicitly rather than take whatever is installed.
+#
+# This costs roughly half a gigabyte in the image -- by some way the largest
+# single thing in it. That is the price of the browser being there when it is
+# wanted rather than downloaded per project, and it is paid once per rebuild.
+#
+# Traffic is not a special case: Chromium reads http_proxy/https_proxy from the
+# environment on Linux when no desktop session is present, so it exits through
+# Squid and the allowlist applies to it like everything else.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium \
+        chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
 # A virtual X server, for suites that drive a HEADFUL browser.

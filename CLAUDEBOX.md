@@ -415,7 +415,7 @@ Each of these is doing real work. Changing one breaks something specific.
 | Nested daemon | `docker:dind-rootless` | server 29.6.2 |
 | Host Docker | Docker Engine (`docker-ce`) 29.7.2 on Ubuntu 24.04, rootful | socket at `/var/run/docker.sock`, context `default`. Was Docker Desktop; the traps below that name Desktop are what that cost, kept because a host can move back |
 | DDEV | v1.25.3 | `performance_mode: none`, so plain bind mounts |
-| Also in the box | git (+ `git-lfs`, filters registered system-wide), ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
+| Also in the box | git (+ `git-lfs`, filters registered system-wide), ripgrep, jq, curl, php-cli 8.2 (incl. `mysqli`/`pdo_mysql`, `gd`), composer, docker CLI + compose plugin, Chromium + matching `chromedriver` (on PATH, needs `--no-sandbox`), headless-Chromium shared libs, Xvfb (`xvfb-run`, for suites that drive a headful browser), imagemagick (`compare`/`identify`, for screenshot assertions) | ImageMagick's resource limits are raised to CI's values |
 | Fonts | DejaVu / Liberation / Noto Color Emoji taken from `ubuntu:24.04`, plus CI's Arial, Verdana and Courier New | matched to the `ubuntu-24.04` runners so screenshot baselines compare; see the traps |
 
 ## Files
@@ -832,7 +832,7 @@ regressions. This is what the `base` stage in `Dockerfile` exists for.
 
 | Stage | Contents |
 |---|---|
-| `base` | Fonts and the fontconfig rules that select them, Chromium's shared libraries, Xvfb, PHP + extensions, node, composer, git + git-lfs, the docker CLI, ImageMagick's raised limits, the box user |
+| `base` | Fonts and the fontconfig rules that select them, Chromium + `chromedriver` and Chromium's shared libraries, Xvfb, PHP + extensions, node, composer, git + git-lfs, the docker CLI, ImageMagick's raised limits, the box user |
 | `claudebox` | `base` + the agents, the shims, the language servers, `box-CLAUDE.md` |
 
 `runner/Dockerfile` is `FROM claudebox-base:latest`, and the rule for what may
