@@ -55,8 +55,16 @@ domain and its subdomains.
 
 You cannot change the allowlist from in here. If a host you need is missing, stop
 and ask the user to run `claudebox allow <domain>` on the host — it hot-reloads,
-no rebuild. Never route around the proxy or disable TLS verification to "make it
-work"; that is the isolation boundary, not an obstacle.
+no rebuild. For a host you need once rather than forever, ask for `claudebox
+allow --for 15m <domain>` instead: that entry is withdrawn again once the domain
+has gone fifteen minutes without a request, so say which you are asking for and
+why. Never route around the proxy or disable TLS verification to "make it work";
+that is the isolation boundary, not an obstacle.
+
+A temporary entry stays open for as long as it is in use, so a long download
+will not have the ground pulled out from under it — but if a step of yours fails
+with a 403 after a long gap, check the allowlist again before assuming the host
+was never allowed.
 
 DDEV projects are reachable at `https://<project>.ddev.site` and the mkcert root
 CA is already trusted, so certificates validate.

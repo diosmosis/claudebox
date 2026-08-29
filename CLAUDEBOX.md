@@ -473,8 +473,13 @@ claudebox rebuild          rebuild images (needed after Dockerfile/entrypoint ed
 claudebox stop             stop the stack (volumes survive)
 claudebox allow <domain>   append to the allowlist and hot-reload the proxy
                            quote wildcards: claudebox allow '*.example.com'
+claudebox allow --for <d> <domain>
+                           allow it only while it is in use: withdrawn once the
+                           domain has gone <d> without a request. <d> is 15m,
+                           2h, 90s, or a bare number of minutes. --temp uses
+                           BOX_ALLOW_TEMP_IDLE (15m)
 claudebox reload           re-apply allowlist.conf after editing it by hand
-claudebox allowed          show the allowlist
+claudebox allowed          show the allowlist, with the time left on temporaries
 claudebox denied           show what the proxy has blocked
 
 claudebox runner add <host:port> <code>
@@ -1828,6 +1833,56 @@ remount when they disagree — see the stale bind mount trap below. Every launch
 checks this too, so a session cannot start against a list the proxy is not
 actually using.
 
+### Temporary entries
+
+`claudebox allow --for 15m <domain>` allows a domain **only for as long as it is
+being used**. The entry goes into a generated block at the end of
+`allowlist.conf`, marked `claudebox-temp`, and a small host-side process
+(`allow-reaper`) withdraws it once the domain has gone the whole window without
+a single request. `--temp` is the same thing with the default window,
+`BOX_ALLOW_TEMP_IDLE`, 15m out of the box.
+
+The window is **idle time, not a countdown**. A deadline has to be guessed up
+front: guess short and it expires in the middle of the install it was opened
+for, guess long and it is a permanent entry with extra steps. "Nobody is using
+it any more" is the property that actually matters, and it needs no guess — a
+one-off fetch closes its hole a quarter of an hour later, and a two-hour
+`composer install` keeps the same 15m entry open the whole time.
+
+- **What counts as use** is any line in the proxy's own access log naming a host
+  the entry covers — so `--for 15m '*.example.com'` is kept alive by traffic to
+  `cdn.example.com`, using the same matching rules the expander applies. A
+  denied request counts too: a denial for a domain still in the block means the
+  proxy has not caught up with the list, not that nobody wants it.
+- **State lives in `allowlist.conf` itself**, one `# temporary: since=… idle=…`
+  comment per entry, rather than in a file beside it. The list the proxy reads
+  is then the only place a domain can be allowed, with no second file to
+  disagree with it — and because each line carries when it was last active, the
+  expiry is still computable after a reboot has killed the reaper. `claudebox
+  allow`, `reload`, `allowed` and every launch reap first, so an entry cannot
+  outlive its window just because nothing was watching.
+- **The reaper exits by itself** once the block is empty, so nothing runs on a
+  machine that is not currently using the feature, and one `flock` keeps there
+  from being two. Its log is `~/.claudebox/.allow-reaper.log`.
+- **One blind spot, measured rather than assumed:** Squid writes a tunnel's log
+  line when the tunnel *closes*, so a single `CONNECT` held open for longer than
+  the whole window looks idle for as long as it is downloading. That turns out
+  to be survivable — Squid evaluates `http_access` when a request arrives and
+  not again afterwards, so `squid -k reconfigure` does not touch a transfer
+  already in flight (a 58s download through a mid-flight `claudebox reload`
+  completed with all 329,756 bytes). What the withdrawal costs is the *next*
+  request, which is denied and shows up in `claudebox denied`. Anything that
+  fetches more than one thing — every package manager — logs each fetch as it
+  completes and keeps its entry alive normally.
+- **Promotion works**: running plain `claudebox allow <domain>` on a domain that
+  is currently temporary moves it out of the block and into the list proper.
+  Going the other way is a hand edit — `--for` on an already-permanent domain
+  refuses rather than quietly adding a second, weaker copy.
+- The block is **generated**. Edit the list above it, not the block; the next
+  reap rewrites it. It is written in place over the same inode for the reason in
+  the stale bind mount trap below — a `mv` would leave the proxy holding the old
+  file.
+
 Required entries come from <https://code.claude.com/docs/en/network-config> —
 **treat that page as the source of truth and re-check it when Claude Code
 updates**, since a new required host shows up as a confusing runtime failure
@@ -2707,8 +2762,9 @@ ddev delete -Oy && cd ~ && rm -rf ~/Projects/smoketest
 ## If asked to extend this
 
 - **Add a domain** → `claudebox allow <domain>`, or edit `allowlist.conf` and
-  reload. Never disable the allowlist wholesale to "make something work"; find
-  the host with `claudebox denied`.
+  reload. For a host wanted once rather than forever, `claudebox allow --for 15m
+  <domain>` opens a hole that closes itself. Never disable the allowlist
+  wholesale to "make something work"; find the host with `claudebox denied`.
 - **Add a tool to the box** → `Dockerfile`, then `claudebox rebuild`.
 - **Add a launcher command** → a plugin (`cp -r plugins/example
   plugins/<name>`, see *Plugins*), not a new arm in the launcher's dispatch. It

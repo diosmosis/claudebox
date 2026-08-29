@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Expire the temporary entries "claudebox allow --for" writes into
+# allowlist.conf, once each has gone unused for its idle window.
+#
+# Started detached by claudebox, never by hand -- but harmless to run directly,
+# and the one way to watch what it is doing:
+#
+#   ~/.claudebox/allow-reaper        run in the foreground
+#   tail -f ~/.claudebox/.allow-reaper.log     what the detached one has done
+#
+# It exits by itself once the managed block is empty, so nothing is left running
+# on a machine that is not currently using the feature. Everything it knows is
+# in allowlist.conf, so a machine that reboots mid-window loses only the timer:
+# the next claudebox command reaps whatever went quiet while it was down.
+set -uo pipefail
+
+BOX_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+ALLOWLIST="${BOX_DIR}/allowlist.conf"
+PROXY=claudebox-proxy
+
+# shellcheck source=allow-temp.sh
+. "${BOX_DIR}/allow-temp.sh"
+
+log() { printf '%s allow-reaper: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+# One reaper per machine. Holding the lock for the process's whole life is what
+# makes that true without a pid file to go stale: a second copy cannot take it,
+# and the kernel drops it the moment this one dies however it dies.
+if command -v flock >/dev/null 2>&1 && : >> "${ALLOW_REAPER_LOCK}" 2>/dev/null; then
+    # Only the fd on this exec -- see allow_lock in allow-temp.sh for what a
+    # stray "2>/dev/null" here would do to the rest of the run.
+    exec 9>>"${ALLOW_REAPER_LOCK}"
+    if ! flock -n 9; then
+        exit 0
+    fi
+fi
+printf '%s\n' "$$" > "${ALLOW_REAPER_PID}"
+trap 'rm -f -- "${ALLOW_REAPER_PID}"' EXIT
+
+# Keep the log from growing without bound over a long-lived machine. Small
+# enough that it is only ever the recent history, which is all it is for.
+if [ -f "${ALLOW_REAPER_LOG}" ] && [ "$(wc -c < "${ALLOW_REAPER_LOG}" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    tail -c 65536 "${ALLOW_REAPER_LOG}" > "${ALLOW_REAPER_LOG}.trim" 2>/dev/null \
+        && mv -f -- "${ALLOW_REAPER_LOG}.trim" "${ALLOW_REAPER_LOG}"
+fi
+
+log "started; watching $(allow_temp_entries | wc -l) temporary entries"
+
+# A reload that failed leaves the file correct and the proxy wrong -- the domain
+# is out of the allowlist but still reachable, which is the one outcome this
+# whole feature exists to prevent. So the retry is not optional: keep going
+# until it takes, even after the block is empty and there is nothing else left
+# to watch.
+pending_reload=0
+
+while :; do
+    allow_lock
+    allow_temp_reap || true
+    allow_unlock
+    if [ -n "${ALLOW_TEMP_DROPPED}" ]; then
+        log "expired: ${ALLOW_TEMP_DROPPED}"
+        pending_reload=1
+    fi
+
+    if [ "${pending_reload}" -eq 1 ]; then
+        # Through claudebox rather than "docker exec ... allowlist reload" so
+        # this takes the same path "claudebox allow" does, including the stale
+        # bind-mount check that a reload on its own would silently sail past.
+        if "${BOX_DIR}/claudebox" reload >>"${ALLOW_REAPER_LOG}" 2>&1; then
+            pending_reload=0
+        else
+            log "proxy reload failed; retrying in ${ALLOW_REAPER_TICK}s"
+        fi
+    fi
+
+    if [ "${pending_reload}" -eq 0 ] && [ -z "$(allow_temp_entries)" ]; then
+        log "nothing left to watch; exiting"
+        break
+    fi
+
+    sleep "${ALLOW_REAPER_TICK}"
+done

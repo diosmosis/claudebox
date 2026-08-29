@@ -14,6 +14,8 @@
 #   claudebox media rm <n>    drop a staged entry
 #
 #   claudebox allow <domain>  permit a domain and reload the proxy
+#   claudebox allow --for 15m <domain>
+#                             permit it only while it is in use
 #   claudebox reload          re-apply allowlist.conf after a manual edit
 #   claudebox allowed         show the egress allowlist
 #   claudebox denied          show requests the proxy has blocked
@@ -60,6 +62,13 @@ DIND_APPARMOR_DIR="${BOX_DIR}"
 DIND_APPARMOR_CONTAINER=claudebox-dind
 # shellcheck source=dind-apparmor.sh
 . "${BOX_DIR}/dind-apparmor.sh"
+
+# Temporary egress -- "claudebox allow --for 15m <domain>" and the reaper that
+# takes it away again. Sourced rather than inlined because the reaper is a
+# separate process and has to agree with this one about the file format down to
+# the byte. Functions only; it reads ALLOWLIST, PROXY and BOX_DIR, all set above.
+# shellcheck source=allow-temp.sh
+. "${BOX_DIR}/allow-temp.sh"
 
 # The half of this launcher that plugin commands also need: path translation,
 # the flags a session is attached with, and the small vocabulary a plugin talks
@@ -109,6 +118,7 @@ BOX_SETTINGS=(
     BOX_SYNC_REMOTE BOX_SYNC_FINGERPRINT BOX_SYNC_REMOTE_PATH
     BOX_SYNC_LOCAL_WORKSPACE_HOST BOX_SYNC_DIR
     BOX_SYNC_MODE BOX_SYNC_IGNORE BOX_SYNC_FLUSH_TIMEOUT
+    BOX_ALLOW_TEMP_IDLE
     BOX_PLUGIN_PATH
 )
 if [ -f "${BOX_CONFIG}" ]; then
@@ -189,6 +199,11 @@ export BOX_USER="${BOX_USER:-$(id -un)}"
 export BOX_UID="${BOX_UID:-$(id -u)}"
 export BOX_GID="${BOX_GID:-$(id -g)}"
 export BOX_MKCERT_CA="${BOX_MKCERT_CA:-$(mkcert -CAROOT 2>/dev/null || echo "${HOME}/.local/share/mkcert")/rootCA.pem}"
+
+# How long a domain opened with "claudebox allow --temp" may go unused before
+# the reaper withdraws it. "--for <duration>" overrides it per domain; this is
+# only the default for the times nobody wants to think about a number.
+export BOX_ALLOW_TEMP_IDLE="${BOX_ALLOW_TEMP_IDLE:-${ALLOW_TEMP_IDLE_DEFAULT}}"
 
 # Where "claudebox <plugin>:<command>" looks, colon-separated, earliest wins.
 #
@@ -3247,8 +3262,18 @@ claudebox -- run a coding agent in an isolated container over ~/Projects
   claudebox allow <domain>   permit a domain and reload the egress proxy
                              wildcards work, but quote them:
                                claudebox allow '*.example.com'
+  claudebox allow --for <d> <domain>
+                             permit it only for as long as it is being used:
+                             the entry is withdrawn once the domain has gone <d>
+                             without a single request. <d> is 15m, 2h, 90s, or a
+                             bare number of minutes.
+                               claudebox allow --for 30m files.example.com
+                             --temp uses the default window (BOX_ALLOW_TEMP_IDLE,
+                             15m). Running plain "allow" on the same domain
+                             afterwards makes it permanent.
   claudebox reload           re-apply allowlist.conf after editing it by hand
-  claudebox allowed          show the egress allowlist
+  claudebox allowed          show the egress allowlist, with the time left on
+                             any temporary entries
   claudebox denied           show requests the proxy has blocked
 
   claudebox media add <path> copy material off a drive into the box's /media
@@ -3408,7 +3433,39 @@ USAGE
         exit 0
         ;;
 
-    allowed)  exec grep -vE '^\s*(#|$)' "${ALLOWLIST}" ;;
+    allowed)
+        # Reap first: a list that shows a domain the proxy is about to withdraw
+        # is worse than no list. If that drops one, the proxy has to be told --
+        # this is a read-only-looking command that can change something, and
+        # saying nothing would leave the domain reachable until the next reload.
+        if allow_temp_sync; then
+            reload_proxy >/dev/null || true
+        fi
+
+        # The permanent half, exactly as it has always printed: the file's own
+        # lines, comments and all, minus the ones that are only a comment.
+        allow_temp_permanent | grep -vE '^\s*(#|$)' || true
+
+        temp_entries="$(allow_temp_entries)"
+        if [ -n "${temp_entries}" ]; then
+            now="$(date +%s)"
+            while IFS=$'\t' read -r temp_dom temp_since temp_idle; do
+                [ -n "${temp_dom}" ] || continue
+                temp_left=$((temp_idle - (now - temp_since)))
+                if [ "${temp_left}" -lt 0 ]; then
+                    temp_left=0
+                fi
+                # Same shape as the rest of the list -- a domain with a comment
+                # after it -- so anything reading this still reads one entry per
+                # line and the extra is legible rather than structural.
+                printf '%-31s # temporary: %s left of a %s idle window\n' \
+                    "${temp_dom}" \
+                    "$(allow_duration_human "${temp_left}")" \
+                    "$(allow_duration_human "${temp_idle}")"
+            done <<< "${temp_entries}"
+        fi
+        exit 0
+        ;;
 
     eject)
         # Release a removable workspace, in the one order that actually works.
@@ -3676,27 +3733,150 @@ USAGE
         ;;
 
     allow)
-        domain="${2:-}"
-        if [ -z "${domain}" ]; then
-            echo "usage: claudebox allow <domain>    (quote wildcards: '*.example.com')" >&2
+        shift
+        # --for/--temp make the entry temporary: it goes into the managed block
+        # at the end of allowlist.conf and is withdrawn once the domain has gone
+        # unused for its idle window. See allow-temp.sh for why the window is
+        # measured in idle time rather than counted down from now.
+        temp_idle=""
+        while [ $# -gt 0 ]; do
+            case "${1}" in
+                --for)
+                    if [ $# -lt 2 ]; then
+                        echo "claudebox: --for needs a duration (15m, 2h, 90s)" >&2
+                        exit 2
+                    fi
+                    temp_idle="$(allow_duration_secs "${2}")" || {
+                        echo "claudebox: '${2}' is not a duration (try 15m, 2h, 90s)" >&2
+                        exit 2
+                    }
+                    shift 2
+                    ;;
+                --for=*)
+                    temp_idle="$(allow_duration_secs "${1#*=}")" || {
+                        echo "claudebox: '${1#*=}' is not a duration (try 15m, 2h, 90s)" >&2
+                        exit 2
+                    }
+                    shift
+                    ;;
+                --temp|-t)
+                    temp_idle="$(allow_duration_secs "${BOX_ALLOW_TEMP_IDLE}")" || {
+                        echo "claudebox: BOX_ALLOW_TEMP_IDLE='${BOX_ALLOW_TEMP_IDLE}' is not a duration" >&2
+                        exit 2
+                    }
+                    shift
+                    ;;
+                # So a domain that starts with a dash is still reachable.
+                --) shift; break ;;
+                -*)
+                    echo "claudebox: unknown option '${1}'" >&2
+                    echo "usage: claudebox allow [--for <duration>|--temp] <domain>" >&2
+                    exit 2
+                    ;;
+                *) break ;;
+            esac
+        done
+
+        domain="${1:-}"
+        if [ -z "${domain}" ] || [ $# -gt 1 ]; then
+            {
+                echo "usage: claudebox allow [--for <duration>|--temp] <domain>"
+                echo "       quote wildcards:  claudebox allow '*.example.com'"
+                echo "       --for 15m         allow it until it has gone 15m unused"
+                echo "       --temp            the same, with the default window (${BOX_ALLOW_TEMP_IDLE})"
+            } >&2
             exit 2
         fi
+
+        # Permanent entries are compared and stored exactly as typed, as they
+        # always have been. A temporary one is normalised first: it is written
+        # into a generated block and matched against access-log hostnames here
+        # rather than only inside squid, so it has to be in the same shape the
+        # container would have reduced it to.
+        if [ -n "${temp_idle}" ]; then
+            domain="${domain,,}"
+            case "${domain}" in
+                *[!a-z0-9.*_-]*)
+                    echo "claudebox: '${domain}' is not a domain pattern" >&2
+                    exit 2
+                    ;;
+            esac
+            if [ -z "${domain//[.*]/}" ]; then
+                echo "claudebox: refusing '${domain}': it would allow every host" >&2
+                exit 2
+            fi
+            if [ "${temp_idle}" -lt "${ALLOW_TEMP_IDLE_MIN}" ]; then
+                echo "claudebox: the shortest window is $(allow_duration_human "${ALLOW_TEMP_IDLE_MIN}");" >&2
+                echo "claudebox: below that it would expire before the first request arrives" >&2
+                exit 2
+            fi
+        fi
+
+        # Expire anything already overdue before deciding what this domain's
+        # state is -- otherwise a stale entry makes "already allowed" true for a
+        # domain that is about to stop being.
+        allow_temp_sync >/dev/null || true
+
         # Compare literally, not as a regex: entries may contain "*", which
         # grep -E reads as a repetition operator and rejects outright at the
-        # start of a pattern.
-        entries="$(sed 's/#.*//' "${ALLOWLIST}" | tr -s '[:space:]' '\n' | grep -v '^$' || true)"
+        # start of a pattern. Only the permanent half of the file counts here;
+        # a temporary entry is exactly the thing that may need replacing.
+        entries="$(allow_temp_permanent | sed 's/#.*//' | tr -s '[:space:]' '\n' | grep -v '^$' || true)"
+        already_permanent=0
         if printf '%s\n' "${entries}" | grep -qxF -- "${domain}"; then
-            echo "claudebox: ${domain} is already allowed" >&2
-        else
-            printf '%s\n' "${domain}" >> "${ALLOWLIST}"
-            echo "claudebox: allowed ${domain}" >&2
+            already_permanent=1
         fi
-        reload_proxy
-        exit $?
+
+        allow_lock
+        if [ -n "${temp_idle}" ]; then
+            if [ "${already_permanent}" -eq 1 ]; then
+                allow_unlock
+                echo "claudebox: ${domain} is permanently allowed; nothing to time out" >&2
+                echo "claudebox: remove it from allowlist.conf first to make it temporary" >&2
+                exit 0
+            fi
+            allow_temp_add "${domain}" "${temp_idle}"
+            allow_unlock
+            if [ "${ALLOW_TEMP_REFRESHED}" -eq 1 ]; then
+                echo "claudebox: ${domain} window reset to $(allow_duration_human "${temp_idle}") idle" >&2
+            else
+                echo "claudebox: allowed ${domain} until it has gone $(allow_duration_human "${temp_idle}") unused" >&2
+            fi
+        else
+            # Making a temporary entry permanent is a promotion, not a second
+            # copy: leave it in the block and it would be withdrawn from a list
+            # it is also permanently on, and the reload would look like it had
+            # failed.
+            promoted=0
+            if allow_temp_remove "${domain}"; then
+                promoted=1
+            fi
+            if [ "${already_permanent}" -eq 1 ]; then
+                allow_unlock
+                echo "claudebox: ${domain} is already allowed" >&2
+            else
+                printf '%s\n' "${domain}" >> "${ALLOWLIST}"
+                allow_unlock
+                if [ "${promoted}" -eq 1 ]; then
+                    echo "claudebox: allowed ${domain} permanently; it no longer times out" >&2
+                else
+                    echo "claudebox: allowed ${domain}" >&2
+                fi
+            fi
+        fi
+
+        reload_proxy || exit $?
+        # Only after the proxy has the entry: a reaper started earlier could
+        # withdraw it between the write and the reload.
+        allow_reaper_ensure || true
+        exit 0
         ;;
 
     reload)
-        # For edits made directly to allowlist.conf.
+        # For edits made directly to allowlist.conf. Expiring first so a hand
+        # edit and an overdue temporary entry are applied in the same pass,
+        # rather than the reload putting the overdue one back into force.
+        allow_temp_sync >/dev/null || true
         reload_proxy
         exit $?
         ;;
@@ -3779,6 +3959,14 @@ if ! allowlist_in_sync; then
     if resync_allowlist; then
         docker exec "${PROXY}" allowlist reload >/dev/null 2>&1 || true
     fi
+fi
+
+# Temporary entries expire on wall-clock idle time, and the machine may have
+# been off for a week -- so a session must never start against a window that ran
+# out while nothing was watching it. This also restarts the reaper for whatever
+# is still live, which is what makes the feature survive a reboot.
+if allow_temp_sync; then
+    docker exec "${PROXY}" allowlist reload >/dev/null 2>&1 || true
 fi
 
 write_ddev_hosts

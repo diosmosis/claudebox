@@ -32,3 +32,14 @@
 # untracked files; delete both once "claudebox mutagen attach" is in use.
 /remote-workspace/
 /ssh-client/
+
+# The temporary-egress reaper's own scratch: its lock, its pid and its log.
+# One short-lived host process per machine, started by "claudebox allow --for";
+# nothing here is state, only a record of what it has withdrawn.
+/.allow-reaper.lock
+/.allow-reaper.pid
+/.allow-reaper.log
+# ("claudebox allow --for" also stages each rewrite in an allowlist.conf.XXXXXX
+# beside the file, because the real one must be written over in place -- see the
+# stale bind mount trap. They are removed immediately; this is for the crash.)
+/allowlist.conf.*
