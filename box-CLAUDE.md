@@ -35,6 +35,41 @@ and run `claudebox rebuild`.
 - Nothing else of the host is visible. `~` is a container-private volume.
 - Plans written to `~/.claude/plans` land in `~/.claudebox/plans` on the host.
 
+## Git
+
+`~/Projects` is sometimes not a bind of the host's tree but a **two-way synced
+copy** of a *different machine's* workspace. A file named `.claudebox-sync-root`
+at the root of `~/Projects` is what says so, and it names the machine and path it
+is a copy of. Check for it before reasoning about anything git-shaped that looks
+wrong; nothing else in here distinguishes the two cases, and they behave
+differently in exactly one way that matters.
+
+Both machines' git write into one `.git` through a reconciler. Reads are fine —
+and `GIT_OPTIONAL_LOCKS=0` is set for you, so `git status` and `git diff` no
+longer rewrite `.git/index` as a side effect of refreshing its stat cache, which
+is what used to collide with the other machine's writes and leave the index
+frozen. Their output is unchanged and trustworthy.
+
+**Do not run commands that write the index or the object store without asking
+the user first** — `git add`, `commit`, `stash`, `checkout`, `switch`, `restore`,
+`merge`, `rebase`, `reset`, `pull`, `fetch`. They take locks that
+`GIT_OPTIONAL_LOCKS` does not suppress, and on a synced copy a write here races
+the same file on the other machine. The failure is not a lost edit you would
+notice: the two versions become an unresolvable sync conflict, both trees stop
+propagating that path, and `claudebox` then refuses to start the box at all
+until a human clears it. Commits are normally made on the other machine anyway.
+Ask, and say why; if the workspace is a plain bind (no sentinel) the objection
+does not apply and you can say that too.
+
+If `git status` still reports staged changes that make no sense — files shown as
+both deleted and untracked, deletions of files that are clearly present — do not
+work around it and do not "fix" it with `git reset` or `git read-tree`. It means
+the index diverged anyway. Report it, name `.git/index` and the sync as the
+suspected cause, and let the user run `claudebox mutagen status` on the host.
+Meanwhile prefer what is computed from commits and content, which stays correct
+regardless: `git log`, `git show`, `git diff <ref>`, `git diff HEAD`,
+`git cat-file`.
+
 ## Network: default-deny egress
 
 There is no route off the internal network. Everything outbound goes through a

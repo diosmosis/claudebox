@@ -1937,6 +1937,65 @@ sync_session_exists() {
     [ -n "$(sync_field '.Identifier')" ]
 }
 
+# The paths that are in conflict, one per line.
+#
+# A count alone is close to useless. "3 conflicts" sends you to `mutagen sync
+# list --long` inside a container whose name is not printed anywhere, and the
+# paths are the whole diagnosis: .git/index in every one of them means something
+# completely different from three source files, and only one of those is the
+# user's problem to think about.
+#
+# Not sync_field: that splices its argument inside one {{...}}, and this needs
+# its own range with a newline action, which would have to be smuggled in by
+# closing and reopening the braces. The direct call is the honest form.
+# .Root is the conflicting path -- singular, even though a conflict also carries
+# the per-side change lists; the root is what names the file.
+sync_conflict_paths() {
+    docker exec "${SYNC_CLIENT}" mutagen sync list \
+        --label-selector "${SYNC_LABEL}" \
+        --template '{{range .}}{{range .Conflicts}}{{.Root}}{{"\n"}}{{end}}{{end}}' \
+        2>/dev/null || true
+}
+
+# How many, counted off the same list rather than a second template.
+#
+# This used to be `sync_field '{{if .Conflicts}}{{len .Conflicts}}...'`, which
+# could never work: sync_field splices its argument INSIDE a {{...}} of its own,
+# so an argument carrying its own braces produced `{{{{if ...}}}}` and mutagen
+# rejected the template outright. sync_field sends errors to /dev/null and
+# returns true, so the failure surfaced as an empty string, and `${conflicts:-0}`
+# turned that into a confident "0". Every conflict check in this file was
+# therefore dead: status always reported none, and sync_require_current never
+# refused a start over one. Counting lines needs no template of its own and
+# cannot fail that way again.
+sync_conflict_count() {
+    local paths
+    paths="$(sync_conflict_paths)"
+    if [ -z "${paths}" ]; then
+        echo 0
+        return 0
+    fi
+    printf '%s\n' "${paths}" | wc -l | tr -d ' '
+}
+
+# Print them, indented, capped -- a session that has gone badly wrong can have
+# thousands, and burying the advice underneath them helps nobody.
+#
+# sed -n '1,20p' rather than head -20, deliberately: this runs under `set -o
+# pipefail`, and head closing the pipe early would SIGPIPE the printf feeding it,
+# failing the pipeline and taking the whole launcher down over a cosmetic cap.
+# sed reads its input to the end.
+sync_print_conflicts() {
+    local paths total
+    paths="$(sync_conflict_paths)"
+    [ -n "${paths}" ] || return 0
+    total="$(printf '%s\n' "${paths}" | wc -l | tr -d ' ')"
+    printf '%s\n' "${paths}" | sed -n '1,20p' | sed 's/^/                  /'
+    if [ "${total:-0}" -gt 20 ]; then
+        printf '                  ... and %s more\n' "$(( total - 20 ))"
+    fi
+}
+
 # Ask the door who it is and what it serves, in one round trip, before anything
 # is created.
 #
@@ -2334,12 +2393,32 @@ sync_create_session() {
     # .bin/ layouts are absolute. posix-raw copies the target verbatim. Mutagen
     # does not FOLLOW symlinks, so a link pointing outside the tree is still
     # just a link, not a traversal.
+    #
+    # git's lock files, which are the one part of .git that must NOT cross.
+    #
+    # They exist to say "a git process on THIS machine is mid-write", and they
+    # are meaningless anywhere else. Carried to the other machine, an index.lock
+    # left behind for the seconds a commit takes makes that machine's git refuse
+    # to run at all -- "Another git process seems to be running in this
+    # repository" -- naming a process that is not on it and a lock nothing there
+    # can clear. Worse, they are created and deleted constantly, so they are
+    # also a steady source of the both-sides-changed conflicts that halt a path
+    # in two-way-safe.
+    #
+    # Not the index itself: the box is kept from writing that
+    # (GIT_OPTIONAL_LOCKS=0, see docker-compose.yaml), which leaves the serving
+    # machine its only writer, so it propagates cleanly one-way and the copy
+    # gets a real index rather than none. Ignoring it here instead would mean
+    # each side keeping its own, and a fresh copy would have NO index -- git
+    # then calls every tracked file untracked, which is worse than a stale one.
     docker exec "${SYNC_CLIENT}" mutagen sync create \
         --name "${SYNC_SESSION}" \
         --label "${SYNC_LABEL}" \
         --sync-mode "${BOX_SYNC_MODE}" \
         --symlink-mode posix-raw \
         --ignore "/${SYNC_SENTINEL}" \
+        --ignore "**/.git/*.lock" \
+        --ignore "**/.git/**/*.lock" \
         "${ignores[@]}" \
         "${SYNC_DIR}" \
         "claudebox-door:${served}"
@@ -2589,7 +2668,7 @@ sync_attached_status() {
     acon="$(sync_field '.Alpha.Connected')"
     bcon="$(sync_field '.Beta.Connected')"
     cycles="$(sync_field '.SuccessfulCycles')"
-    conflicts="$(sync_field '{{if .Conflicts}}{{len .Conflicts}}{{else}}0{{end}}')"
+    conflicts="$(sync_conflict_count)"
 
     if [ "${paused}" = "true" ]; then
         printf 'session:          PAUSED -- not syncing\n'
@@ -2600,6 +2679,9 @@ sync_attached_status() {
             "$([ "${bcon}" = "true" ] && echo connected || echo DISCONNECTED)"
     fi
     printf 'conflicts:        %s\n' "${conflicts:-0}"
+    if [ "${conflicts:-0}" != "0" ]; then
+        sync_print_conflicts
+    fi
 
     if [ "${BOX_WORKSPACE_HOST}" = "${SYNC_DIR}" ]; then
         printf 'in use:           yes -- claudebox runs against it\n'
@@ -2610,35 +2692,255 @@ sync_attached_status() {
     if [ "${conflicts:-0}" != "0" ]; then
         {
             echo
-            echo "claudebox: propagation is HALTED in both directions until these are settled."
+            echo "claudebox: propagation of THESE PATHS is halted in both directions until they"
+            echo "claudebox: are settled. The rest of the tree keeps syncing, which is why this"
+            echo "claudebox: can sit unnoticed."
             echo "claudebox:   claudebox mutagen resolve --local    keep this machine's version"
             echo "claudebox:   claudebox mutagen resolve --remote   keep the other machine's"
         } >&2
     fi
 }
 
+# Run a command on the door, over the syncer's own ssh identity.
+#
+# The same transport mutagen uses, for the same reason sync_probe uses it: the
+# key and the known_hosts that authorise this machine live in that container and
+# nowhere else, so the host is not required to have openssh at all.
+sync_door_sh() {
+    docker exec "${SYNC_CLIENT}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        claudebox-door "${1}"
+}
+
+# The same, with this side's stdin piped through to the remote command.
+sync_door_sh_stdin() {
+    docker exec -i "${SYNC_CLIENT}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        claudebox-door "${1}"
+}
+
+# Where a sync-relative path lives on one side.
+sync_side_path() {
+    if [ "${1}" = alpha ]; then
+        printf '%s/%s' "${SYNC_DIR}" "${2}"
+    else
+        printf '%s/%s' "${BOX_SYNC_REMOTE_PATH}" "${2}"
+    fi
+}
+
+# What is at a path on one side: "<kind>|<mode>|<size>", or "missing".
+#
+# %F rather than a test per kind, so a directory or symlink is NAMED in the
+# refusal instead of being quietly mishandled. Replicating either is not a
+# matter of copying bytes, and guessing is how a conflict resolution turns into
+# a deleted directory tree. The size is what the copy is checked against.
+sync_side_stat() {
+    local side="${1}" p
+    p="$(sync_side_path "${side}" "${2}")"
+    if [ "${side}" = alpha ]; then
+        stat -c '%F|%a|%s' -- "${p}" 2>/dev/null || echo missing
+    else
+        sync_door_sh "stat -c '%F|%a|%s' -- '${p}' 2>/dev/null || echo missing" \
+            2>/dev/null || echo missing
+    fi
+}
+
+# Make the loser's copy of one path identical to the winner's.
+#
+# Temp file, VERIFY, then rename -- on whichever side is being written. The
+# verification is the point: a copy is a `cat` down an ssh pipe, and a pipe that
+# dies half way through leaves a short file that looks like a perfectly good
+# one. Renaming that over the loser's only remaining copy would destroy the very
+# data this command exists to preserve, and it would do it while reporting
+# success. Nothing is renamed until its size matches the source.
+#
+# The mode is carried across explicitly too, because `cat >` into a new file
+# takes the receiving shell's umask and would quietly drop the executable bit
+# off a script.
+sync_replicate_path() {
+    local winner="${1}" loser="${2}" rel="${3}"
+    local wstat lstat wkind wmode wsize lkind wpath lpath ldir ltmp got
+
+    wstat="$(sync_side_stat "${winner}" "${rel}")"
+    lstat="$(sync_side_stat "${loser}" "${rel}")"
+    wkind="${wstat%%|*}"; wmode="$(printf '%s' "${wstat}" | cut -d'|' -f2)"
+    wsize="${wstat##*|}"
+    lkind="${lstat%%|*}"
+
+    case "${wkind}" in
+        "regular file"|"regular empty file"|missing) ;;
+        *) printf '  SKIPPED %s\n          the winning side has a %s there, not a file\n' \
+               "${rel}" "${wkind}" >&2; return 1 ;;
+    esac
+    case "${lkind}" in
+        "regular file"|"regular empty file"|missing) ;;
+        *) printf '  SKIPPED %s\n          the losing side has a %s there, not a file\n' \
+               "${rel}" "${lkind}" >&2; return 1 ;;
+    esac
+
+    wpath="$(sync_side_path "${winner}" "${rel}")"
+    lpath="$(sync_side_path "${loser}" "${rel}")"
+    ldir="$(dirname -- "${lpath}")"
+    ltmp="${ldir}/.claudebox-resolve.$$"
+
+    if [ "${wkind}" = missing ]; then
+        # The winner deleted it; the deletion is the thing to replicate.
+        if [ "${loser}" = alpha ]; then
+            rm -f -- "${lpath}"
+        else
+            sync_door_sh "rm -f -- '${lpath}'" >/dev/null
+        fi
+        printf '  deleted %s\n' "${rel}" >&2
+        return 0
+    fi
+
+    # Staged, checked, then moved into place -- in three steps rather than one
+    # chained remote command, so the check is this script's and not a remote
+    # shell expansion built out of a path string.
+    if [ "${loser}" = alpha ]; then
+        mkdir -p -- "${ldir}"
+        if ! sync_door_sh "cat -- '${wpath}'" > "${ltmp}"; then
+            rm -f -- "${ltmp}"
+            printf '  FAILED  %s\n          could not read it from the other machine\n' \
+                "${rel}" >&2
+            return 1
+        fi
+        got="$(stat -c '%s' -- "${ltmp}" 2>/dev/null || echo -1)"
+        if [ "${got}" != "${wsize}" ]; then
+            rm -f -- "${ltmp}"
+            printf '  FAILED  %s\n          got %s bytes, expected %s -- left untouched\n' \
+                "${rel}" "${got}" "${wsize}" >&2
+            return 1
+        fi
+        chmod "${wmode}" -- "${ltmp}"
+        mv -f -- "${ltmp}" "${lpath}"
+    else
+        if ! sync_door_sh_stdin "mkdir -p -- '${ldir}' && cat > '${ltmp}'" \
+                < "${wpath}" >/dev/null; then
+            sync_door_sh "rm -f -- '${ltmp}'" >/dev/null 2>&1 || true
+            printf '  FAILED  %s\n          could not write it to the other machine\n' \
+                "${rel}" >&2
+            return 1
+        fi
+        got="$(sync_door_sh "stat -c '%s' -- '${ltmp}' 2>/dev/null || echo -1" \
+            2>/dev/null | tr -d '\r')"
+        if [ "${got}" != "${wsize}" ]; then
+            sync_door_sh "rm -f -- '${ltmp}'" >/dev/null 2>&1 || true
+            printf '  FAILED  %s\n          wrote %s bytes, expected %s -- left untouched\n' \
+                "${rel}" "${got}" "${wsize}" >&2
+            return 1
+        fi
+        sync_door_sh "chmod ${wmode} '${ltmp}' && mv -f -- '${ltmp}' '${lpath}'" \
+            >/dev/null
+    fi
+    printf '  copied  %s\n' "${rel}" >&2
+}
+
 # Settle conflicts by declaring one side the winner.
 #
-# two-way-safe halts BOTH directions on a conflict rather than losing anything,
-# so without this the only way out is hand-editing files in a directory the user
-# would have to be told the name of. It works by flipping the session to a
-# one-way-safe reconciliation from the winning side for a single cycle, then
-# putting it back.
+# two-way-safe halts a conflicting path in BOTH directions rather than losing
+# anything, so without this the only way out is hand-editing files in a
+# directory the user would have to be told the name of.
+#
+# What this used to do, and why it could never work: it mapped --local/--remote
+# to alpha/beta, printed the choice, and then ran `mutagen sync reset`, which
+# ignores the side entirely. reset clears the session's ANCESTOR -- the record
+# of what the two endpoints last agreed on. For the conflict that actually
+# happens here, both sides independently CREATING a file (what git's
+# write-temp-then-rename does to .git/index, since the rename changes the inode
+# and mutagen reads that as a delete plus a create), the ancestor is already
+# empty for that path. Clearing it changes nothing: the next scan finds the same
+# two differing files and the conflict returns. Both flags did the same nothing,
+# while reporting success.
+#
+# What it does now: copy the winner's version of each conflicting path over the
+# loser's, so the two sides agree and there is nothing left to reconcile.
+# Mutagen has no per-path conflict resolution and no way to reconfigure a live
+# session, so this is done by hand, over the transport the syncer already has.
+#
+# The session is PAUSED while that happens, for correctness rather than speed: a
+# scan catching a half-written file could stage and propagate the partial
+# version, and the temporary files this writes live inside the synced tree,
+# where an unpaused mutagen would carry them to the other machine as real files.
 sync_resolve() {
-    local side="${1:-}"
+    local side="${1:-}" winner loser paths count reply rc=0
+
     if ! sync_client_running || ! sync_session_exists; then
         echo "claudebox: nothing is syncing here" >&2
         return 1
     fi
     case "${side}" in
-        --local)  side=alpha ;;
-        --remote) side=beta ;;
+        --local)  winner=alpha; loser=beta ;;
+        --remote) winner=beta;  loser=alpha ;;
         *) echo "usage: claudebox mutagen resolve --local | --remote" >&2; return 2 ;;
     esac
-    echo "claudebox: resolving conflicts in favour of ${side}..." >&2
-    docker exec "${SYNC_CLIENT}" mutagen sync reset --label-selector "${SYNC_LABEL}" 2>&1 | tail -2 || true
-    echo "claudebox: reset. The next cycle reconciles from scratch; 'claudebox mutagen" >&2
-    echo "claudebox: status' shows whether anything is still in conflict." >&2
+    if [ -z "${BOX_SYNC_REMOTE_PATH}" ]; then
+        echo "claudebox: the remote path is not recorded; re-attach before resolving" >&2
+        return 1
+    fi
+
+    paths="$(sync_conflict_paths)"
+    if [ -z "${paths}" ]; then
+        echo "claudebox: no conflicts to resolve" >&2
+        return 0
+    fi
+    count="$(printf '%s\n' "${paths}" | wc -l | tr -d ' ')"
+
+    # A path carrying a single quote or a newline would break out of the quoting
+    # the remote commands are built with. Refusing the whole run is the only
+    # safe answer -- a partially resolved set is worse than an unresolved one,
+    # and the alternative is constructing a shell command from a string this
+    # code did not choose.
+    if printf '%s\n' "${paths}" | grep -q "'"; then
+        echo "claudebox: a conflicting path contains a single quote; refusing to build" >&2
+        echo "claudebox: remote commands around it. Settle that path by hand." >&2
+        return 1
+    fi
+
+    {
+        if [ "${winner}" = alpha ]; then
+            echo "claudebox: this will overwrite ${count} path(s) on ${BOX_SYNC_REMOTE:-the other machine}"
+            echo "claudebox: with this machine's copy:"
+        else
+            echo "claudebox: this will overwrite ${count} path(s) in ${SYNC_DIR}"
+            echo "claudebox: with ${BOX_SYNC_REMOTE:-the other machine}'s copy:"
+        fi
+    } >&2
+    sync_print_conflicts
+
+    if [ ! -t 0 ]; then
+        echo "claudebox: refusing to resolve conflicts non-interactively." >&2
+        return 1
+    fi
+    printf 'claudebox: overwrite them? [y/N] ' >&2
+    read -r reply
+    case "${reply}" in
+        y|Y|yes|YES) ;;
+        *) echo "claudebox: nothing changed" >&2; return 1 ;;
+    esac
+
+    echo "claudebox: pausing the sync while the files are replaced..." >&2
+    docker exec "${SYNC_CLIENT}" mutagen sync pause \
+        --label-selector "${SYNC_LABEL}" >/dev/null 2>&1 || true
+
+    while IFS= read -r rel; do
+        [ -n "${rel}" ] || continue
+        sync_replicate_path "${winner}" "${loser}" "${rel}" || rc=1
+    done <<< "${paths}"
+
+    echo "claudebox: resuming..." >&2
+    docker exec "${SYNC_CLIENT}" mutagen sync resume \
+        --label-selector "${SYNC_LABEL}" >/dev/null 2>&1 || true
+    docker exec "${SYNC_CLIENT}" mutagen sync flush \
+        --label-selector "${SYNC_LABEL}" >/dev/null 2>&1 || true
+
+    count="$(sync_conflict_count)"
+    if [ "${count}" = "0" ]; then
+        echo "claudebox: all conflicts settled." >&2
+    else
+        echo "claudebox: ${count} conflict(s) remain:" >&2
+        sync_print_conflicts
+        rc=1
+    fi
+    return "${rc}"
 }
 
 sync_forget() {
@@ -2788,13 +3090,15 @@ sync_require_current() {
             ;;
     esac
 
-    conflicts="$(sync_field '{{if .Conflicts}}{{len .Conflicts}}{{else}}0{{end}}')"
+    conflicts="$(sync_conflict_count)"
     if [ "${conflicts:-0}" != "0" ]; then
         {
             echo "claudebox: the sync has stopped on ${conflicts} conflict(s) -- the same files were"
             echo "claudebox: changed on both machines and neither version is safe to discard."
-            echo "claudebox: Nothing is being propagated in EITHER direction until they are"
-            echo "claudebox: settled, so both trees are drifting."
+            echo "claudebox: These PATHS are not propagated in either direction until they are"
+            echo "claudebox: settled, so the two copies of them drift apart. Everything else in"
+            echo "claudebox: the tree carries on syncing normally."
+            sync_print_conflicts
             echo "claudebox:   claudebox mutagen status             lists them"
             echo "claudebox:   claudebox mutagen resolve --local    keep this machine's version"
             echo "claudebox:   claudebox mutagen resolve --remote   keep the other machine's"
@@ -3197,9 +3501,11 @@ runner_machine_gate() {
         exit 1
     fi
 
-    # Which project, on the other machine. --project names it outright;
-    # otherwise it is the directory below the workspace root that the current
-    # directory sits in, which is the same tree layout both machines use.
+    # Which project, on the other machine. --project names it outright, as a
+    # path relative to the workspace root (matomo/plugins/Foo is fine);
+    # otherwise it is the current directory's path below the workspace root,
+    # which is the same tree layout both machines use -- so the run starts in
+    # the same subdirectory there as it would here.
     #
     # This is OURS, not claude's: it is consumed here and never forwarded.
     local project="" rest=() skip=""
@@ -3220,7 +3526,6 @@ runner_machine_gate() {
         case "${PWD}" in
             "${BOX_WORKSPACE_HOST}"/*)
                 project="${PWD#"${BOX_WORKSPACE_HOST}"/}"
-                project="${project%%/*}"
                 ;;
         esac
     fi
@@ -3233,9 +3538,14 @@ runner_machine_gate() {
         } >&2
         exit 2
     fi
-    case "${project}" in
-        */*|.|..|-*)
-            echo "claudebox: '${project}' is not a project name (one directory under the workspace)" >&2
+    # Trailing slashes are harmless (tab completion leaves them); strip them so
+    # the name printed and sent is the plain path.
+    while [ "${project}" != "${project%/}" ]; do project="${project%/}"; done
+    # A cheap early refusal for what the workstation would refuse anyway:
+    # agent-serve.mjs's projectDir is the real containment check.
+    case "/${project}/" in
+        //|*/./*|*/../*|//*|*//*|/-*)
+            echo "claudebox: '${project}' is not a project (a relative path to a directory under the workspace)" >&2
             exit 2 ;;
     esac
 

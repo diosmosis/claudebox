@@ -750,6 +750,43 @@ Both sets of box notes are the **same file**: `box-CLAUDE.md`, copied to two
 paths at build time. Everything in it describes the container rather than the
 reader, and two copies would drift.
 
+### opencode scopes sessions to a git remote, not to the workspace
+
+Both agents start in the same directory, but they disagree about what that
+directory *is*. Claude Code's workspace is the directory. opencode resolves a
+**project** by walking up for a VCS root and identifying it by the repository's
+remote, which has two consequences at `~/Projects`:
+
+| where opencode starts | project | `worktree` | directories recorded |
+|---|---|---|---|
+| inside a repo with a remote | hash of the remote | the repo | yes |
+| inside a repo with no remote | `global` | the repo | **no** |
+| `~/Projects`, which is not a repo | `global` | `/` | **no** |
+
+The workspace root is a container of repositories rather than a repository, so
+a session started there lands in the catch-all `global` project. That project is
+never given directories to remember — `Project.saveProjectDirectory` returns
+early for it — which is why `/move` there offers **"No project directories
+found"** however many subdirectories are sitting in front of it. The session's
+directory is still `~/Projects`, and reads, writes and searches are all rooted
+there; only opencode's own project record says `/`.
+
+Nothing in the box can change this. The id comes from `git remote`, so even a
+`git init` at the workspace root would leave the project `global` — and it would
+put a `.git` at the top of a synced tree, which is the case the mutagen rule
+exists to prevent. **Start opencode inside the repository you mean to work on**
+and both agents agree again:
+
+```bash
+cd ~/Projects/matomo && claudebox opencode    # real project, /move works
+```
+
+What opencode currently believes, without starting the TUI:
+
+```bash
+claudebox opencode debug scrap                # known projects and their worktrees
+```
+
 opencode has no managed-policy path of its own, hence the baked config.
 `OPENCODE_CONFIG` names an *additional* config rather than a replacement, so a
 global `~/.config/opencode/opencode.json` seeded from the host still loads

@@ -34,6 +34,39 @@ services:
       CLAUDEBOX_WORKSPACE: ${BOX_WORKSPACE:-/home/dizzy/Projects}
       CLAUDEBOX_WORKSPACE_HOST: ${BOX_WORKSPACE_HOST:-${BOX_WORKSPACE:-/home/dizzy/Projects}}
 
+      # Keep git in here from writing .git/index as a side effect.
+      #
+      # `git status` and `git diff` refresh the index's stat cache and save it
+      # back -- and they save it by writing a temp file and renaming it over the
+      # old one, so the inode changes. Mutagen reads that as a delete followed
+      # by a create, not a modification. When the serving machine's git does the
+      # same thing, both endpoints have "created" a file the common ancestor
+      # does not have, and two-way-safe cannot resolve that in either direction.
+      # The ancestor stays <non-existent>, so it never heals: the copy's index
+      # freezes at the moment of the conflict while HEAD keeps moving, and
+      # `git status` starts reporting staged changes that exist on neither
+      # machine. sync_require_current also refuses to start the box on any
+      # conflict, so this ends as a hard block, not just a wrong answer.
+      #
+      # A syncer rewrites mtimes constantly, which is exactly what invalidates
+      # that stat cache -- so on a synced workspace this fires on essentially
+      # every git command, rather than rarely.
+      #
+      # GIT_OPTIONAL_LOCKS=0 makes git skip any sub-operation needing a lock it
+      # does not strictly need, which is precisely this write. Output is
+      # unchanged -- the refresh still happens, in memory. Measured on a 9340
+      # file repo with every mtime churned before every run, the worst case this
+      # has: 180-198ms against 219-320ms for the default. It is FASTER, because
+      # writing a 1.2MB index costs more than re-lstat'ing the entries. So this
+      # is set unconditionally rather than only when attached to a sync; there
+      # is no local-workspace case it costs anything.
+      #
+      # It does not cover deliberate index writes -- add, commit, stash,
+      # checkout, rebase take non-optional locks and are unaffected. Those are a
+      # genuine two-machine divergence and SHOULD conflict; box-CLAUDE.md tells
+      # the agent not to run them on a synced workspace without asking.
+      GIT_OPTIONAL_LOCKS: "0"
+
       # "docker" in the box drives the sidecar daemon, never the host's.
       DOCKER_HOST: tcp://dind:2375
 
